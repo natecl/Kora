@@ -1,0 +1,11 @@
+{
+  "runtime": "Hermes Agent",
+  "repository": "https://github.com/NousResearch/hermes-agent",
+  "target_commit": "68518c1f9bca11d9f5dbdf59ecf7e024cce057ba",
+  "inspected_on": "2026-08-26",
+  "license": "MIT",
+  "license_url": "https://github.com/NousResearch/hermes-agent/blob/main/LICENSE",
+  "bootstrap_interface": "hermes -z / --oneshot",
+  "target_interface": "Agent Client Protocol (ACP) over stdio",
+  "notes": "Oneshot is allowed only inside Kora-gated isolation because Hermes auto-bypasses approvals in this mode. ACP is the persistent interactive target."
+}

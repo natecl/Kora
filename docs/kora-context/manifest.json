@@ -1,8 +1,8 @@
 {
   "schema_version": "1.0",
   "context_pack": "kora-core",
-  "version": "1.0",
-  "approved_on": "2026-08-26",
+  "version": "1.1",
+  "approved_on": "2026-08-27",
   "authority_order": [
     "latest_explicit_user_instruction",
     "active_mission_and_authority",

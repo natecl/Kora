@@ -2,7 +2,7 @@
 
 ## Architectural objective
 
-Build one persistent, cloud-resident AI coworker that can understand a founder's product context, agree on one mission, create and operate a personalized internal workforce, communicate naturally, request authority at consequential boundaries, and produce verifiable progress without requiring the user's Mac to remain online.
+Build one persistent, cloud-resident AI coworker that can learn a person's professional role and context, agree on one mission, create and operate a personalized internal workforce, communicate naturally, request authority at consequential boundaries, and produce verifiable progress without requiring the user's computer to remain online. The first specialization is an AI-native founder coworker, but no authoritative domain contract may depend on founder-specific concepts.
 
 The architecture must make Kora feel like one coherent person while enforcing goal alignment and safety outside the model.
 
@@ -18,6 +18,26 @@ The architecture must make Kora feel like one coherent person while enforcing go
 8. Kora stops rather than inventing unrelated work when the mission is blocked.
 9. Persistent memory and mission state do not depend on a single model context window.
 10. Model routing, compaction, retries, and compute infrastructure remain invisible.
+
+## Accepted implementation slice
+
+The accepted repository slice is a Kora-owned work cycle, not whole-product
+release readiness. At canonical code commit
+`1754168ed09692ed1b5a611ad6b06a220b42543b`, the Sol High review verdict is
+**ACCEPT**. The implementation passes 27 focused acceptance/regression tests
+and 168 tests in the full suite. The proof is an offline dogfood mission: an
+empty repository plus a founder brief becomes a functional, zero-dependency
+waitlist MVP with bounded verification and durable evidence. Desktop, phone,
+cloud-fleet, connector, external-action, and production-runtime readiness are
+not implied. No P0/P1/P2 findings were identified in the implemented verified
+work-cycle slice.
+
+The proven boundary includes durable missions, task attempts, permissions,
+evidence, leases, fencing, crash recovery, exact semantic authority,
+budget reservation/settlement, private generalized workforce/model routing,
+closed public projections, descriptor-bound workspace execution, and bounded
+Git evidence for tracked, ignored, untracked, empty-directory, and nested
+`.git` state.
 
 ## High-level system
 
@@ -191,17 +211,21 @@ For every planned consequential action, Kora must be able to answer internally:
 
 The mission controller is a durable state machine outside any individual model session.
 
-Core states:
+The implemented `MissionService` uses these durable mission states:
 
-- `INGESTING`
-- `ALIGNING_CONTEXT`
-- `AWAITING_MISSION_APPROVAL`
+- `PROPOSED`
+- `ALIGNED`
 - `ACTIVE`
-- `AWAITING_USER`
-- `READY_FOR_REVIEW`
-- `AWAITING_EXTERNAL_ACTION_APPROVAL`
-- `PAUSED`
-- `COMPLETE`
+- `WAITING_FOR_USER`
+- `VERIFYING`
+- `COMPLETED`
+- `STOPPED`
+- `FAILED`
+
+`WAITING` and `COMPLETE` remain compatibility aliases in the domain enum.
+Higher-level product labels such as context ingestion, approval review, and
+external-action approval are future projections over these semantic states,
+not additional implemented states.
 
 The controller owns:
 
@@ -221,6 +245,7 @@ The compiler converts user knowledge into Kora's private execution system.
 
 Inputs:
 
+- User role charter, professional domain, responsibilities, and non-responsibilities.
 - Best-practice and instruction files.
 - Existing agent definitions and skills.
 - Style and quality rules.
@@ -230,7 +255,9 @@ Inputs:
 
 Outputs:
 
+- Mission-specific worker-role envelopes compiled from required capabilities rather than fixed job titles.
 - Task-specific worker instructions.
+- Task classification, quality floor, risk level, and private model-route policy.
 - Tool and connector selection.
 - Review rubrics.
 - Escalation policies.
@@ -287,7 +314,9 @@ The tree describes Kora's competence, not her workforce implementation. A user m
 
 ### 8. invisible model router
 
-The router selects models based on capability, reliability, latency, context size, and cost. Users never choose or see models.
+The router selects the best model and worker configuration for each bounded task. It considers capability, task-specific empirical quality, reliability, tool compatibility, context size, latency, privacy, and expected total cost. Users never choose or see models.
+
+The optimization target is **expected cost per accepted outcome**, not the lowest token price. Expected cost includes generation, retrieved context, tool calls, retries, review, latency-sensitive infrastructure, and the probability that a route fails its quality gate. Every task carries a quality floor and risk class derived from the mission, acceptance criteria, and authority boundary.
 
 Routing policy and provider substitution are Kora-owned. Hermes supplies only
 the replaceable provider/model execution layer behind the adapter; a Hermes
@@ -302,6 +331,19 @@ Logical workloads may include:
 - Research and browser operation.
 - Voice calls and transcription.
 - Independent evaluation.
+
+For each task attempt, Kora:
+
+1. Classifies the task, required capabilities, risk, context, quality floor, and evidence requirements.
+2. Selects the least expensive route predicted to satisfy those constraints.
+3. Assigns it to a bounded worker in Kora's private workforce.
+4. Evaluates the result against task-specific acceptance criteria using independent checks where appropriate.
+5. Retries, repairs, or escalates to a stronger route when evidence is insufficient.
+6. Records private route outcomes so future choices improve without turning runtime telemetry into semantic authority.
+
+Economic controls include context minimization, semantic caching, artifact reuse, batching, bounded parallelism, early stopping after acceptance, and model cascades. Kora must not use a cheaper route when doing so materially increases the risk of intent drift, unsafe action, unsupported claims, destructive effects, or expensive rework.
+
+The workforce is hierarchical, dynamically compiled, and disposable. Kora plans and owns the mission; task workers perform capabilities within explicit envelopes; and no worker may create an overarching goal, grant authority, or declare mission completion. Founder-oriented roles such as builder or growth researcher are only one specialization. Role names and capabilities are data derived from the role charter and mission, never fixed control-plane types. Workforce topology and route decisions remain private execution state.
 
 Routing policies must support automatic fallback and provider substitution. Kora should report a provider problem only if it changes timing, quality, cost, or requires help.
 
@@ -346,7 +388,10 @@ Bounded mandates additionally include:
 - External-action ceiling.
 - Escalation conditions.
 
-No model can directly manufacture, widen, or persist a permission grant.
+No model can directly manufacture, widen, or persist a permission grant. The
+implemented preflight and authorization path requires exact agreement among
+the mission, grant, action, resource scope, limits, and idempotency key; a
+capability or connector response alone is never semantic authority.
 
 ### 11. connector broker
 
@@ -438,7 +483,24 @@ It must not expose:
 - Raw private execution traces.
 - Secrets embedded in source documents.
 
+Public projections are closed allowlists owned by Kora. They may expose
+semantic status, user-relevant summaries, evidence references, and bounded
+artifact digests, but never provider/model identity, prompts, tokens, private
+worker topology, route details, or raw runtime text.
+
 ## Core execution sequence
+
+### Accepted work-cycle sequence
+
+The current implementation can run one bounded, offline dogfood cycle. A
+founder brief in an empty repository is turned into a functional waitlist MVP
+by a deterministic runtime fixture; Kora captures the workspace identity,
+binds execution to the descriptor, checks exact authority, reserves and settles
+the private route budget, leases and fences the attempt, verifies the result,
+and persists evidence before finalization. The verifier bounds and hashes
+tracked, ignored, untracked, empty-directory, and nested-`.git` state without
+following symlinks. This is an implementation proof, not a claim that the
+full product mission is ready for deployment or outreach.
 
 ### Onboarding to active mission
 
@@ -470,7 +532,7 @@ It must not expose:
 1. Kora attempts safe retries and mission-consistent alternatives.
 2. If user action is required, Kora explains the request and affected path.
 3. Kora continues only non-conflicting work that directly advances the mission.
-4. If no such work exists, Kora enters `AWAITING_USER` and stops execution.
+4. If no such work exists, Kora enters `WAITING_FOR_USER` and stops execution.
 5. If appropriate and unanswered, Kora calls once.
 6. Work resumes from preserved state after the user responds.
 
@@ -528,6 +590,18 @@ This matrix converts the relevant parts of Allie Miller's post into explicit pro
 
 ## Recommended build slices
 
+The repository's accepted work-cycle slice is narrower than the product
+sequence below. The next live-runtime slice is a **NOT-YET-IMPLEMENTED Codex
+App Server adapter**. It must preserve Kora's durable mission, permission,
+evidence, memory, and routing contracts regardless of transport.
+
+For dogfood/testing, the planned adapter uses the founder's ChatGPT-managed
+Codex subscription authentication. Codex owns and refreshes those credentials;
+tokens never enter Kora durable state or public projections. Kora may privately
+observe plan and rate-limit state. Production uses company-owned API keys and
+provider accounts with metering, budgets, and billing, never a personal Codex
+subscription.
+
 ### Slice 0: intent-fidelity dogfood
 
 - Establish a pinned Hermes runtime adapter and preserve upstream license notices.
@@ -574,7 +648,10 @@ This matrix converts the relevant parts of Allie Miller's post into explicit pro
 
 ## Architecture acceptance tests
 
-The v1 architecture is valid only if it can demonstrate:
+The v1 architecture is valid only if it can eventually demonstrate the
+following. These are whole-product target gates, not a claim that the current
+repository has passed every item. The current accepted proof is the bounded
+work-cycle slice described above.
 
 1. A user completes onboarding in ten minutes or less.
 2. Kora identifies duplicate or conflicting context before acting.
@@ -594,3 +671,8 @@ The v1 architecture is valid only if it can demonstrate:
 16. Internal provider or worker failure is absorbed unless it materially affects the user.
 17. The system prevents broad destructive local actions even when requested by a model.
 18. Replacing or upgrading the pinned Hermes runtime does not change Kora's mission, authority, context, or user-facing identity contracts.
+19. Kora can delegate one mission across multiple private worker roles while remaining the only user-visible coworker and authority owner.
+20. The router selects different model configurations for materially different task classes without exposing model or token configuration to the user.
+21. A cheap route that fails its quality gate is automatically escalated, and the final result meets the same acceptance criteria as a direct premium route.
+22. Routing optimization lowers measured cost per accepted outcome without a material reduction in acceptance rate, evidence completeness, or user-rated quality.
+23. A non-founder role charter can compile a different private workforce and complete a domain-appropriate test mission without changing Kora's mission, authority, routing, memory, or evidence schemas.

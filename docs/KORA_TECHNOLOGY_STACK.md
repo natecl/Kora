@@ -2,12 +2,14 @@
 
 **Status:** Accepted decision; staged for implementation
 **Decision date:** 2026-08-26
-**Base commit:** `78dace0`
+**Reviewed code commit:** `1754168ed09692ed1b5a611ad6b06a220b42543b`
+**Current review:** 2026-08-27
 **Scope:** V1 through the hosted beta
 
 This is Kora's canonical technology-stack decision. It chooses implementation
-boundaries and migration gates; it does not claim that a selected component is
-already implemented. The product and system invariants remain authoritative in
+boundaries and migration gates. It distinguishes the accepted local work-cycle
+implementation from staged hosted components; it does not claim that every
+selected component is implemented. The product and system invariants remain authoritative in
 [`KORA_V1_PRD.md`](../KORA_V1_PRD.md) and
 [`KORA_TECHNICAL_ARCHITECTURE.md`](../KORA_TECHNICAL_ARCHITECTURE.md).
 
@@ -20,11 +22,15 @@ the right current store for the single-controller Portion 1. A
 `MissionStore` protocol and unit-of-work boundary must come before a move to
 managed PostgreSQL, with Supabase Postgres as the preferred beta provider.
 
-Kora owns an `ExecutionCoordinator` now and keeps Hermes behind
-`RuntimeAdapter`. Temporal Cloud is adopted only at the first real durability
-trigger. Temporal executes attempts and schedules recovery; it never owns
-Kora's mission truth, permissions, evidence, provenance, or completion. Agent
-frameworks are worker implementation details, not the control plane.
+Kora owns the `ExecutionCoordinator`, durable attempts, leases, fencing,
+recovery, evidence, and permission checks in the accepted local work-cycle
+slice, and keeps Hermes behind `RuntimeAdapter`. The private workforce compiler
+and model router reserve and settle bounded route budgets while hiding provider,
+model, and worker details. Temporal Cloud is adopted only when hosted timers,
+signals, process-independent execution, or distributed recovery become real; it
+never owns Kora's mission truth, permissions, evidence, provenance, or
+completion. Agent frameworks are worker implementation details, not the control
+plane.
 
 The Mac client is native Swift with SwiftUI and AppKit. Phone availability is a
 cloud communication gateway using Twilio SMS/MMS and voice; iMessage is only a
@@ -36,8 +42,8 @@ self-hosted ClickHouse.
 
 | Horizon | Decision |
 |---|---|
-| **Adopt now** | Python 3.11 compatibility, framework-independent domain/service layer, `MissionStore` and `ExecutionCoordinator` boundaries, SQLite for Portion 1, Hermes through `RuntimeAdapter`, FastAPI/Pydantic at the next API slice, native Swift desktop direction, and Kora-owned semantic events/evidence. |
-| **Design for** | Supabase-managed PostgreSQL, SQLAlchemy 2 Core, psycopg3, Alembic, Temporal Cloud, external-action outbox, distributed leases/fencing, OpenTelemetry, cloud sandboxes, Twilio continuity, direct connectors, and a small Swift local bridge. |
+| **Adopt now** | Python 3.11 compatibility, framework-independent domain/service layer, `MissionStore` and `ExecutionCoordinator` boundaries, SQLite for the accepted local slice, durable attempts with local leases/fencing/recovery, private workforce compilation and deterministic model routing with budget reservation/settlement, Hermes through `RuntimeAdapter`, FastAPI/Pydantic at the next API slice, native Swift desktop direction, and Kora-owned semantic events/evidence. |
+| **Design for** | Supabase-managed PostgreSQL, SQLAlchemy 2 Core, psycopg3, Alembic, Temporal Cloud, external-action outbox, hosted/distributed leases and fencing, OpenTelemetry, cloud sandboxes, Twilio continuity, direct connectors, and a small Swift local bridge. |
 | **Defer** | Language rewrites; LangGraph or Mastra as the mission engine; OpenAI Agents SDK as the product orchestrator; Tauri or Electron; iMessage as a cloud primitive; Kubernetes, Kafka, Redis, a separate vector database, self-hosted ClickHouse, and multiple overlapping durability systems. |
 
 ## Ownership boundaries
@@ -51,6 +57,13 @@ self-hosted ClickHouse.
 - **ExecutionCoordinator:** selects eligible Kora tasks, performs authority
   preflight, creates attempts, invokes a runtime adapter, validates results,
   and records evidence or escalation.
+- **WorkforceCompiler/ModelRouter:** compiles bounded, profession-agnostic
+  worker envelopes and chooses a private provider/model/tool route for each
+  attempt using capability, quality, reliability, context, latency, privacy,
+  and expected cost. Reservations enforce concurrency and budget limits;
+  settlement records actual cost without exposing route identity. These private
+  components cannot create goals or bypass `ExecutionCoordinator` authority and
+  evidence gates.
 - **RuntimeAdapter/Hermes/agent SDKs:** execute bounded work and return
   untrusted results. Runtime sessions, prompts, model/provider identity,
   internal worker topology, and harness approvals are never Kora authority.
@@ -88,9 +101,9 @@ requirement and a separately approved migration.
 
 ### SQLite now, PostgreSQL at the cloud trigger
 
-SQLite remains the source of truth for the current single-controller Portion 1.
-Use foreign keys, WAL, busy timeouts, explicit transactions, expected
-revisions, and the existing append-only audit pattern. SQLite WAL permits
+SQLite remains the source of truth for the accepted local Portion 1 slice. Use
+foreign keys, WAL, busy timeouts, explicit transactions, expected revisions,
+leases/fencing, crash recovery, and the existing append-only audit pattern. SQLite WAL permits
 readers and writers to proceed together, but it still has one writer and
 requires all processes to share a host. See the [SQLite WAL
 documentation](https://www.sqlite.org/wal.html).
@@ -121,17 +134,47 @@ them.
 
 ### Kora coordinator first
 
-Build Kora's `ExecutionCoordinator` around the existing runtime contracts. It
-must claim a task, create an attempt, bind the attempt to mission scope and
-authority, invoke Hermes, validate structured output, attach evidence, and
-recover safely after interruption. Add an external-action outbox,
-idempotency records, leases, and reconciliation before relying on distributed
-workers.
+The accepted `ExecutionCoordinator` already claims a task, creates a durable
+attempt, binds it to mission scope and authority, reserves a private route,
+invokes a runtime adapter, validates structured output, attaches evidence, and
+recovers safely after interruption. Lease expiry, fencing, stop invalidation,
+unknown outcomes, and atomic finalization are Kora-owned. External-action
+outbox/reconciliation and hosted distributed workers remain later extensions.
+
+### Private workforce and economic routing
+
+Kora owns one invisible, personalized workforce above the runtime adapter.
+Workers are bounded attempts, not durable identities or sources of authority.
+Do not hardcode professional roles into domain types. The founder specialization
+may initially compile planner/researcher, builder, reviewer, evaluator, and
+operator workers, but role definitions are versioned data derived from the
+user's role charter and mission. A different professional specialization must
+compile different roles without changing the control-plane schema. Add a role
+only when a measured mission requires a distinct capability or evidence policy.
+
+Every work envelope should include a private task class, required capabilities,
+quality floor, risk class, context budget, evidence requirements, retry budget,
+and maximum concurrency. The current router uses deterministic policy,
+reservations, and settlement; route observations remain private and do not
+become semantic authority.
+
+The economic objective is total model and infrastructure cost per accepted
+result. Use smaller models for low-risk extraction, classification, formatting,
+and bounded transformations when they pass the same output contract. Use
+stronger reasoning or specialist models for ambiguous planning, consequential
+judgment, difficult coding, failed repairs, and independent review. A failed
+quality gate triggers repair or escalation rather than silently accepting a
+cheaper result.
+
+Track route quality, acceptance, retries, latency, and cost internally by task
+class. Model names, token accounting, routing policies, and workforce topology
+remain hidden from the user; only material effects on timing, cost, quality, or
+required authority become Kora conversations.
 
 ### Temporal Cloud at the first durability trigger
 
 Adopt [Temporal Cloud](https://docs.temporal.io/) when any of the following is
-real:
+real beyond the local coordinator's current recovery guarantees:
 
 - a mission or attempt must outlive a process or deployment;
 - Kora waits hours or days for an owner approval;
@@ -168,10 +211,18 @@ design the coordinator so Temporal can wrap it later.
   decision.
 
 Hermes remains the replaceable initial execution harness behind
-`RuntimeAdapter`. Later, pin a tagged Hermes release and immutable image
-digest. Evaluate OpenHands only if Hermes fails concrete vertical-slice gates
-for mission-scoped execution, Kora authority/stop enforcement, structured
-results, and safe workspace behavior; use the same adapter contract.
+`RuntimeAdapter`. For founder dogfood/testing, the next live-runtime slice is a
+**NOT-YET-IMPLEMENTED Codex App Server adapter** using the founder's
+ChatGPT-managed Codex subscription authentication. Codex owns and refreshes
+those credentials; tokens never enter Kora durable state or public projections,
+although Kora may privately observe plan/rate-limit state. Production uses
+company-owned API keys/provider accounts with metering, budgets, and billing,
+never a personal Codex subscription. The transport switch must preserve Kora's
+durable mission, permission, evidence, memory, and routing contracts. Later,
+pin a tagged Hermes release and immutable image digest. Evaluate OpenHands only
+if Hermes fails concrete vertical-slice gates for mission-scoped execution,
+Kora authority/stop enforcement, structured results, and safe workspace
+behavior; use the same adapter contract.
 
 ## macOS client
 
@@ -277,16 +328,13 @@ must have Kora-owned budgets, per-mission limits, and an explicit stop path.
 
 ## Consequences for the current repository
 
-This decision requires no source, test, dependency, or implementation changes
-by itself. The next implementation slice should:
-
-1. preserve the current domain state machines and Hermes adapter contracts;
-2. add `MissionStore`/unit-of-work protocols before a second database;
-3. add Kora-owned attempts, leases, outbox, idempotency, causation, scope
-   version, and evidence-verification records;
-4. implement `ExecutionCoordinator` and the crash/recovery acceptance tests;
-5. add FastAPI/Pydantic only at the API boundary; and
-6. add a SQLite/PostgreSQL contract suite before selecting a hosted database.
+The accepted code slice already preserves the domain state machines and Hermes
+adapter contracts, persists Kora-owned attempts/leases/fences/evidence, runs
+the coordinator and crash/recovery checks, and exercises private generalized
+workforce/model routing with budget settlement. The next implementation slice
+is the NOT-YET-IMPLEMENTED Codex App Server adapter. FastAPI/Pydantic, a
+SQLite/PostgreSQL contract suite, hosted distributed recovery, external-action
+outbox/reconciliation, and production authentication remain future work.
 
 The accepted stack is therefore a staged platform decision, not evidence that
 PostgreSQL, Temporal, the desktop app, phone gateway, cloud sandboxes, or

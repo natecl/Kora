@@ -6,7 +6,22 @@ Kora is a persistent, model-agnostic AI coworker for AI-native solo founders and
 
 The founder should be able to close their laptop and work on something else. Kora keeps the product moving at approximately the founder's quality, communicates like a capable human coworker, and involves the founder only when their judgment, authority, access, taste, or physical action is genuinely required.
 
+The founder coworker is Kora's first specialization and market wedge, not a founder-specific product architecture. Kora's identity, role charter, mission system, authority model, workforce compiler, memory, routing, and evidence contracts must remain profession-agnostic so the same Kora can become a finance, operations, research, administrative, creative, or other professional coworker by learning a different role and context rather than requiring a different product core.
+
 Kora is the product. Models, subagents, routing, prompts, tokens, VMs, and internal workflows remain invisible.
+
+## Implementation status
+
+The current repository proves an accepted Kora-owned work-cycle slice, not
+whole-product release readiness. At canonical code commit
+`1754168ed09692ed1b5a611ad6b06a220b42543b`, the Sol High review verdict is
+**ACCEPT**; 27 focused acceptance/regression tests and 168 full-suite tests
+pass, with no P0/P1/P2 findings in the implemented verified work-cycle slice.
+The dogfood proof starts with an empty repository and a founder brief and
+ends with a functional, zero-dependency waitlist MVP, bounded verification, and
+durable mission, attempt, permission, and evidence state. The complete mission
+below remains the product target, not a claim that deployment, outreach, phone,
+desktop, cloud-fleet, connector, or production-runtime surfaces are ready.
 
 ## Positioning
 
@@ -76,15 +91,19 @@ Kora may broadly discover and ingest user-approved computer context and connecte
 
 Kora may create and coordinate a personalized internal workforce, but the user never sees individual models, agents, prompts, routing, token usage, or internal traces. Kora owns the result.
 
-### 7. Consent at consequential boundaries
+### 7. Quality-constrained token economics
+
+Kora chooses the worker, model, tools, context, and review depth that best fit each task. She minimizes the expected total compute cost of producing an accepted result, including retries and review, rather than minimizing tokens at the expense of quality. Cheap routes handle bounded work only when they are predicted to meet the task's quality floor; uncertain, consequential, or failed work escalates automatically to stronger routes and independent evaluation.
+
+### 8. Consent at consequential boundaries
 
 Spending, public identity, outreach, external commitments, important taste decisions, production changes, and destructive actions require approval unless the user has granted a sufficiently specific standing permission.
 
-### 8. Natural interaction over workflow configuration
+### 9. Natural interaction over workflow configuration
 
 Internal checkpoints, state machines, routing, evaluation, and retries stay hidden. The user experiences conversations, calls, previews, decisions, and results.
 
-### 9. Open-source first
+### 10. Open-source first
 
 Kora should reuse, wrap, and contribute to proven open-source infrastructure wherever that infrastructure is not the product's differentiation. The team should not rebuild model adapters, agent loops, tool systems, skills formats, memory search, messaging gateways, schedulers, sandbox backends, or generic connector plumbing when mature implementations can be safely adopted.
 
@@ -101,6 +120,15 @@ Kora's proprietary work should concentrate on the persistent coworker experience
 The planned runtime-pinning target is a tagged Hermes release plus an immutable container image digest. The current exact-commit/container lock supports the bootstrap spike and is not a reason to couple Kora's control plane to Hermes. OpenHands is not a co-equal runtime choice or current dependency; it may be evaluated only as a gated fallback if Hermes fails the concrete vertical-slice gates for mission-scoped execution, Kora authority/stop enforcement, structured results, and safe workspace execution through the same adapter contract.
 
 Open-source-first does not mean bypassing safety, blindly inheriting upstream behavior, or exposing implementation complexity. Every dependency remains pinned, reviewed, isolated behind an adapter, attributed according to its license, and subject to Kora's own permission and safety boundaries.
+
+For founder dogfood/testing, the next live-runtime slice is a
+**NOT-YET-IMPLEMENTED Codex App Server adapter** using the founder's
+ChatGPT-managed Codex subscription authentication. Codex owns and refreshes
+those credentials; tokens never enter Kora durable state or public projections.
+Kora may privately observe plan and rate-limit state. Production uses
+company-owned API keys and provider accounts with metering, budgets, and billing,
+never a personal Codex subscription. Changing transports must not change
+Kora's durable mission, permission, evidence, memory, or routing contracts.
 
 ## Core experience
 
@@ -180,6 +208,10 @@ Kora does not judge whether the startup idea is worthy. If she discovers concret
 ### Autonomous execution
 
 Kora creates her own private, personalized AI workforce using the user's knowledge and working preferences. Existing agent files and workflows are treated as evidence about the user, not machinery Kora must preserve.
+
+Kora is the workforce's manager and sole user-facing owner. She derives bounded worker roles from the user's role charter, mission, domain, knowledge, tools, authority, and evidence requirements; selects the best available model and tool configuration for each task; delegates work; reconciles results; and replaces or escalates workers when evidence is insufficient. A founder mission might compile researcher, builder, reviewer, evaluator, and operator workers, while another profession compiles different roles without changing Kora's core. No worker may create goals, widen authority, or mark its own work complete.
+
+Routing optimizes expected cost per accepted outcome. Kora may use smaller or cheaper models, reduce retrieved context, cache stable artifacts, batch compatible work, and limit parallelism when doing so preserves the required quality and reliability. She must spend more compute when the task's risk, ambiguity, novelty, or failed verification justifies it. Token savings never override acceptance criteria, authority boundaries, or independent evaluation.
 
 For the first mission, Kora should be able to:
 
@@ -322,6 +354,11 @@ Kora maintains an invisible persistent cloud workspace containing:
 
 The cloud computer is never presented as a remote desktop or infrastructure product. Users see Kora, conversations, the Kanban board, previews, and results.
 
+Public projections are closed Kora-owned views. They may show semantic status,
+user-relevant summaries, decisions, permissions, evidence, and bounded artifact
+digests, but never provider/model identity, prompts, tokens, private worker
+topology, route details, or raw runtime text.
+
 ### Local safety boundary
 
 Broad computer access means broad reading and discovery, not unrestricted execution.
@@ -339,6 +376,9 @@ Broad computer access means broad reading and discovery, not unrestricted execut
 Preventing catastrophic local damage is a system invariant, not a model instruction.
 
 ## Definition of done for a mission
+
+This is the full product mission target. The accepted repository slice is the
+smaller offline dogfood proof described in **Implementation status**.
 
 Kora may claim the initial MVP mission is complete only when:
 
@@ -368,6 +408,9 @@ Kora may claim the initial MVP mission is complete only when:
 - PRD acceptance-criteria pass rate.
 - User corrections per consequential decision.
 - Percentage of work accepted without rework.
+- Model and infrastructure cost per accepted task and per accepted mission milestone.
+- Percentage of tasks completed on the first route without quality-driven escalation.
+- Quality-gate pass rate by private task class and route.
 - Time from onboarding to meaningful work.
 - Time from mission approval to usable preview.
 - Trust to grant Kora another mission.
@@ -393,8 +436,16 @@ Launch with one premium monthly product around $250 to $300. Users buy Kora, not
 - Perfectly imitating the user's taste on day one.
 - Rebuilding commodity agent-harness infrastructure that can be safely reused from proven open-source projects.
 
+The next live-runtime adapter, always-on scheduling, cloud workspace/VM fleet,
+desktop/mobile/iMessage/voice/connectors, external actions, and the full
+skill-tree/self-learning UX remain future work. Kora's founder-first wedge is a
+starting point for a generalized professional coworker, never a decision to
+shrink the product to a coding agent.
+
 ## Long-term direction
 
 Kora learns the user's tacit operating behavior through decisions, corrections, outcomes, and granted authority. Over time, she reproduces more of the user's judgment, taste, prioritization, and working style while preserving explicit consent at consequential boundaries.
 
 The long-term vision is one persistent AI familiar per person: a stable relationship and operating model that survives changes in models, tools, and underlying workforces.
+
+Kora should eventually be capable of serving any professional role that can be expressed through a role charter, objectives, knowledge, tools, authority boundaries, quality standards, and evidence. New professions should be added as role and skill specializations, not forks of the Kora control plane.

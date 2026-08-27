@@ -38,6 +38,13 @@ The persistent ACP smoke returned the same structured completion contract. ACP
 permissions are denied unless Kora's external authority layer selects an
 explicit option.
 
+This spike is now the replaceable harness beneath an accepted Kora-owned
+work-cycle proof, not a whole-product release signal. The dogfood fixture starts
+with an empty repository and a founder brief and produces a functional,
+zero-dependency waitlist MVP. Kora owns the durable mission, attempt,
+permission, evidence, lease/fence, recovery, budget settlement, and closed
+public projection around that execution.
+
 The pinned container was built from the locked Python base digest and Hermes
 commit, then verified with:
 
@@ -77,7 +84,15 @@ authority, evidence and evaluation, and cloud-workspace policy.
 Hermes memory, scheduler, approvals, and self-improvement state are never
 authoritative. The adapter may expose a runtime result or permission request,
 but Kora validates it and persists any authoritative state in Kora-owned
-records.
+records. The next live-runtime slice is a **NOT-YET-IMPLEMENTED Codex App
+Server adapter**. For founder dogfood/testing it is intended to use the
+founder's ChatGPT-managed Codex subscription authentication; Codex owns and
+refreshes credentials, tokens never enter Kora durable state or public
+projections, and Kora may privately observe plan/rate-limit state. Production
+uses company-owned API keys/provider accounts with metering, budgets, and
+billing, never a personal Codex subscription. The transport switch must not
+alter Kora's durable mission, permission, evidence, memory, or routing
+contracts.
 
 ## Critical finding
 
@@ -112,18 +127,21 @@ adapter contract.
 - Material ambiguity has a structured `KORA_NEEDS_USER` result.
 - Completion requires a structured `KORA_TASK_COMPLETE` result.
 - Model and provider metadata are dropped from Kora-facing results.
+- Effect-bearing execution uses a descriptor-bound workspace cwd and a live
+  execution fence rather than trusting a mutable path alone.
 
 ## Next engineering slice
 
-1. Exercise the Kora-owned mission store and semantic permission records with a
-   real read/write task against a disposable sample repository.
-2. Connect the persistent task lifecycle to `RuntimeAdapter` without allowing
-   Hermes state to become mission or authority state.
-3. Attach diff, tests, and artifacts as completion evidence and run an
-   independent review.
-4. After the vertical slice is credible, validate the tagged Hermes release and
-   immutable image digest; evaluate OpenHands only if Hermes fails the gates
-   above.
+1. Implement the **NOT-YET-IMPLEMENTED Codex App Server adapter** behind the
+   same `RuntimeAdapter` and Kora-owned contracts for founder dogfood/testing.
+2. Preserve exact semantic authority, descriptor-bound cwd, fenced recovery,
+   budget reservation/settlement, evidence verification, and closed public
+   projections across the transport switch.
+3. Validate a tagged Hermes release plus immutable image digest through live
+   evaluation; evaluate OpenHands only if Hermes fails the concrete gates above.
+4. Later add the always-on daemon/scheduler, cloud workspace/VM fleet,
+   desktop/mobile/iMessage/voice/connectors, external actions, and the full
+   skill-tree/self-learning UX.
 
 ## Reproduce the spike
 

@@ -26,6 +26,22 @@ Kora's control plane.
 
 Hermes is currently released under the [MIT License](https://github.com/NousResearch/hermes-agent/blob/main/LICENSE), which permits commercial use, modification, distribution, and sublicensing as long as the copyright and license notice are preserved. The license and dependency tree must be rechecked against the exact release selected for Kora.
 
+## Runtime and authentication decision
+
+The current Hermes path is for dogfood/testing behind Kora's adapter boundary.
+The next live-runtime slice is a **NOT-YET-IMPLEMENTED Codex App Server
+adapter** using the founder's ChatGPT-managed Codex subscription
+authentication. Codex owns and refreshes those credentials; tokens never enter
+Kora durable state or public projections. Kora may privately observe plan and
+rate-limit state, but it does not expose or persist subscription tokens.
+
+Production uses company-owned API keys and provider accounts with metering,
+budgets, and billing, never a personal Codex subscription. Switching between
+Hermes, Codex App Server, or another adapter must not alter Kora's durable
+mission, permission, evidence, memory, or routing contracts. Hermes remains a
+replaceable initial execution harness and never Kora's foundation or source of
+truth.
+
 ## What to reuse from Hermes
 
 | Hermes capability | Kora use | Integration policy |
@@ -186,21 +202,39 @@ the system level.
 
 ## Build sequence
 
-### 1. Harness spike
+The harness spike and Kora-owned local control-plane proof are accepted for the
+current work-cycle slice. The sequence below records what follows; it is not a
+claim of whole-product release readiness.
 
-- Run one product-development task through `RuntimeAdapter` using Hermes's
-  provider/model, tool, skill, subagent, MCP, session, and sandbox execution
-  primitives.
-- Record which Kora requirements can be satisfied without modifying Hermes.
-- Create the first `HermesRuntimeAdapter` contract.
+### 1. Harness spike (accepted bootstrap)
 
-### 2. Kora control plane
+- The current spike runs a bounded product-development task through
+  `RuntimeAdapter` using Hermes's provider/model, tool, skill, subagent, MCP,
+  session, and sandbox execution primitives.
+- The result records which Kora requirements can be satisfied without
+  modifying Hermes.
+- The `HermesRuntimeAdapter` contract is the replaceable boundary.
 
-- Add context receipt, mission state, authority policy, event log, and stop conditions outside Hermes.
-- Prove the runtime cannot change these records directly.
-- Translate one mission task into a Hermes job and collect structured evidence.
+### 2. Kora control plane (accepted local slice)
 
-### 3. Runtime hardening and fallback gate
+- Mission state, authority policy, event log, stop conditions, durable attempts,
+  leases/fencing, recovery, and evidence live outside Hermes.
+- The accepted dogfood proof shows that the runtime cannot change those records
+  directly and that one founder brief in an empty repository becomes a verified
+  functional waitlist MVP.
+- Context receipt, broad context ingestion, and the user-facing product
+  surfaces remain future work.
+
+### 3. Next live-runtime adapter
+
+- Implement the **NOT-YET-IMPLEMENTED Codex App Server adapter** behind the
+  same `RuntimeAdapter` boundary for founder dogfood/testing.
+- Preserve Kora's exact semantic authority, durable attempts and recovery,
+  evidence gate, private workforce/model routing, and closed projections.
+- Keep founder subscription authentication separate from production's
+  company-owned API keys, provider accounts, metering, budgets, and billing.
+
+### 4. Runtime hardening and fallback gate
 
 - Select and validate a tagged Hermes release plus an immutable container image
   digest.
@@ -208,25 +242,25 @@ the system level.
 - If Hermes fails those gates, evaluate OpenHands only as a gated fallback
   behind the same adapter and Kora-owned state/authority contracts.
 
-### 4. Personalized skills
+### 5. Personalized skills
 
 - Ingest the user's existing Markdown instructions and workflows.
 - Compile them into adapter-compatible private execution skills.
 - Generate separate user-readable Kora skill documents with provenance and version history.
 - Verify that a user correction changes later work without exposing runtime prompts.
 
-### 5. Cloud continuity
+### 6. Cloud continuity
 
 - Place the pinned runtime inside Kora's persistent logical cloud workspace.
 - Keep the restricted Mac bridge separate.
 - Verify productive work continues while the user's Mac is offline.
 
-### 6. Product surfaces
+### 7. Product surfaces
 
 - Implement onboarding, Kora profile, skill tree, semantic Kanban, messages, calls, previews, and approvals over the control-plane APIs.
 - Remove all runtime-specific language and configuration from the user experience.
 
-### 7. Upstream discipline
+### 8. Upstream discipline
 
 - Identify generic changes worth contributing to Hermes.
 - Maintain attribution and third-party notices.
@@ -244,3 +278,8 @@ The open-source strategy succeeds when:
 6. Generic improvements can be contributed upstream without publishing Kora's proprietary control plane.
 7. Every shipped dependency has a recorded source, version, license, and security review.
 8. A tagged Hermes release and immutable container digest pass the concrete vertical-slice gates, or OpenHands passes them only after Hermes fails and only behind the same adapter contract.
+9. The accepted local work-cycle proof begins with an empty-repository founder
+   brief and produces a verified functional waitlist MVP without exposing
+   provider, model, worker, prompt, token, or raw runtime details.
+10. A transport change cannot alter Kora's durable mission, permission,
+    evidence, memory, or routing contracts.

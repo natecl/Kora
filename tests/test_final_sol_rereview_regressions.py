@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import kora.verification.verifier as verifier_module
 from kora.runtime import (
     Capability,
     ExecutionFenceTicket,
@@ -561,6 +562,101 @@ class FinalSolRereviewRegressionTests(unittest.TestCase):
                     after_result.change_fingerprint,
                     mutation_result.change_fingerprint,
                 )
+
+    def test_authorized_command_cannot_hide_nested_git_mutation_under_ignored_tree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="kora-rereview-nested-git-") as directory:
+            root = Path(directory)
+            workspace = _git_repository(root / "workspace", ignored_name="ignored/")
+            ignored = workspace / "ignored"
+            ignored.mkdir()
+            (ignored / "keep").write_text("keep\n", encoding="utf-8")
+            verifier = WorkspaceVerifier(cloud_root=root)
+
+            def request(
+                commands: tuple[VerificationCommand, ...],
+            ) -> WorkspaceVerificationRequest:
+                return WorkspaceVerificationRequest(
+                    workspace=workspace,
+                    commands=commands,
+                    require_changes=False,
+                    execution_authorized=True,
+                    execution_capability=True,
+                    execution_granted=True,
+                    require_execution_authority=True,
+                    live_fence_validator=lambda: True,
+                )
+
+            before = verifier.verify(request(()))
+            self.assertTrue(before.accepted)
+            self.assertIsNotNone(before.change_fingerprint)
+
+            unchanged = _python_command(
+                "authorized unchanged ignored tree control",
+                "from pathlib import Path; "
+                "assert Path('ignored/keep').read_text(encoding='utf-8') == 'keep\\n'",
+            )
+            unchanged_result = verifier.verify(request((unchanged,)))
+            with self.subTest(case="unchanged-tree-control"):
+                self.assertTrue(unchanged_result.accepted)
+                self.assertEqual(
+                    unchanged_result.change_fingerprint,
+                    before.change_fingerprint,
+                )
+
+            create_nested_git = _python_command(
+                "authorized nested git mutation",
+                "from pathlib import Path; Path('ignored/.git').mkdir()",
+            )
+            mutation_result = verifier.verify(request((create_nested_git,)))
+            with self.subTest(case="nested-git-mutation-rejected"):
+                self.assertFalse(mutation_result.accepted)
+                self.assertTrue((ignored / ".git").is_dir())
+                self.assertTrue(mutation_result.checks[0].passed)
+                self.assertIsNotNone(mutation_result.change_fingerprint)
+                self.assertNotEqual(
+                    mutation_result.change_fingerprint,
+                    before.change_fingerprint,
+                )
+
+    def test_tracked_sibling_does_not_consume_untracked_byte_budget(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kora-rereview-tracked-sibling-") as directory:
+            root = Path(directory)
+            workspace = _git_repository(root / "workspace")
+            sibling_directory = workspace / "siblings"
+            sibling_directory.mkdir()
+            tracked = sibling_directory / "tracked.bin"
+            tracked.touch()
+            os.truncate(tracked, verifier_module._UNTRACKED_BYTE_LIMIT + 1)
+            self.assertGreater(
+                tracked.stat().st_size,
+                verifier_module._UNTRACKED_BYTE_LIMIT,
+            )
+            _git(workspace, "add", "siblings/tracked.bin")
+            _git(
+                workspace,
+                "-c",
+                "user.name=Kora Test",
+                "-c",
+                "user.email=kora@example.test",
+                "commit",
+                "-qm",
+                "large tracked sibling",
+            )
+            untracked = sibling_directory / "untracked.txt"
+            untracked.write_text("tiny\n", encoding="utf-8")
+
+            result = WorkspaceVerifier(cloud_root=root).verify(
+                WorkspaceVerificationRequest(
+                    workspace=workspace,
+                    commands=(),
+                    require_changes=True,
+                )
+            )
+            self.assertTrue(result.accepted)
+            self.assertIsNotNone(result.change_fingerprint)
+            self.assertTrue(untracked.exists())
 
 
 if __name__ == "__main__":

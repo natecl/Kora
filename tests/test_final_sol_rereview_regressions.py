@@ -658,6 +658,108 @@ class FinalSolRereviewRegressionTests(unittest.TestCase):
             self.assertIsNotNone(result.change_fingerprint)
             self.assertTrue(untracked.exists())
 
+    def test_nested_git_entry_under_tracked_parent_cannot_bypass_snapshot(self) -> None:
+        for entry_kind in ("directory", "file"):
+            with self.subTest(entry_kind=entry_kind):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"kora-rereview-tracked-parent-{entry_kind}-"
+                ) as directory:
+                    root = Path(directory)
+                    workspace = _git_repository(root / "workspace")
+                    source = workspace / "src"
+                    source.mkdir()
+                    (source / "tracked").write_text("tracked\n", encoding="utf-8")
+                    _git(workspace, "add", "src/tracked")
+                    _git(
+                        workspace,
+                        "-c",
+                        "user.name=Kora Test",
+                        "-c",
+                        "user.email=kora@example.test",
+                        "commit",
+                        "-qm",
+                        "tracked source fixture",
+                    )
+                    (source / "u").write_text("u\n", encoding="utf-8")
+                    verifier = WorkspaceVerifier(cloud_root=root)
+
+                    def request(
+                        commands: tuple[VerificationCommand, ...],
+                    ) -> WorkspaceVerificationRequest:
+                        return WorkspaceVerificationRequest(
+                            workspace=workspace,
+                            commands=commands,
+                            require_changes=True,
+                            execution_authorized=True,
+                            execution_capability=True,
+                            execution_granted=True,
+                            require_execution_authority=True,
+                            live_fence_validator=lambda: True,
+                        )
+
+                    before = verifier.verify(request(()))
+                    self.assertTrue(before.accepted)
+                    self.assertIsNotNone(before.change_fingerprint)
+
+                    root_git_marker = workspace / ".git" / "kora-root-metadata-test"
+                    root_git_marker.write_text("root metadata\n", encoding="utf-8")
+                    root_git_result = verifier.verify(request(()))
+                    with self.subTest(component="root-git-outside-content"):
+                        self.assertTrue(root_git_result.accepted)
+                        self.assertEqual(
+                            root_git_result.change_fingerprint,
+                            before.change_fingerprint,
+                        )
+
+                    unchanged = _python_command(
+                        "authorized unchanged tracked-parent control",
+                        "from pathlib import Path; "
+                        "assert Path('src/tracked').read_text(encoding='utf-8') == 'tracked\\n'; "
+                        "assert Path('src/u').read_text(encoding='utf-8') == 'u\\n'",
+                    )
+                    unchanged_result = verifier.verify(request((unchanged,)))
+                    with self.subTest(component="unchanged-tree-control"):
+                        self.assertTrue(unchanged_result.accepted)
+                        self.assertEqual(
+                            unchanged_result.change_fingerprint,
+                            before.change_fingerprint,
+                        )
+
+                    nested = source / ".git"
+                    if entry_kind == "directory":
+                        create_nested = _python_command(
+                            "authorized nested git directory mutation",
+                            "from pathlib import Path; Path('src/.git').mkdir()",
+                        )
+                    else:
+                        create_nested = _python_command(
+                            "authorized nested git file mutation",
+                            "from pathlib import Path; "
+                            "Path('src/.git').write_text('nested git\\n', encoding='utf-8')",
+                        )
+
+                    mutation_result = verifier.verify(request((create_nested,)))
+                    reported_paths = subprocess.run(
+                        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                        cwd=workspace,
+                        capture_output=True,
+                        check=True,
+                    ).stdout
+                    with self.subTest(component="git-omits-nested-entry"):
+                        self.assertNotIn(b"src/.git", reported_paths)
+                    with self.subTest(component="nested-git-mutation-rejected"):
+                        self.assertFalse(mutation_result.accepted)
+                        if entry_kind == "directory":
+                            self.assertTrue(nested.is_dir())
+                        else:
+                            self.assertTrue(nested.is_file())
+                        self.assertTrue(mutation_result.checks[0].passed)
+                        self.assertIsNotNone(mutation_result.change_fingerprint)
+                        self.assertNotEqual(
+                            mutation_result.change_fingerprint,
+                            before.change_fingerprint,
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-FROM python:3.13-slim
+FROM python:3.13-slim@sha256:7e3a6aca9d74f93cca21a91d86a8dad8c34749afd5b4a98ee481c9c47b9f5ed4
 
 ARG HERMES_REPOSITORY=https://github.com/NousResearch/hermes-agent.git
 ARG HERMES_COMMIT=68518c1f9bca11d9f5dbdf59ecf7e024cce057ba
@@ -26,6 +26,7 @@ RUN git clone --filter=blob:none "${HERMES_REPOSITORY}" . \
 RUN uv sync --frozen --extra acp --no-dev
 
 ENV PATH="/opt/hermes/.venv/bin:${PATH}"
+ENV HERMES_HOME="/tmp/hermes"
 ENV HERMES_ACP_SKIP_CONFIGURED_MCP=1
 
 WORKDIR /workspace

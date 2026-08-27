@@ -9,9 +9,11 @@ The spike verified:
 - Hermes Agent is available locally.
 - Hermes ACP imports and health checks succeed.
 - Hermes one-shot produces clean machine-readable output and usage accounting.
+- Hermes ACP supports a persistent Kora-owned session and permission callback.
 - A Kora adapter can restrict work by mission, workspace, toolset, capability, and isolation mode.
 - Runtime model and provider details can be removed from Kora-facing results.
 - Kora can require structured completion or escalation responses.
+- The exact Hermes commit runs successfully in Kora's pinned, read-only container.
 
 The live adapter smoke returned:
 
@@ -30,6 +32,21 @@ The live adapter smoke returned:
 
 No model or provider identity is present in the Kora-facing result.
 
+The persistent ACP smoke returned the same structured completion contract. ACP
+permissions are denied unless Kora's external authority layer selects an
+explicit option.
+
+The pinned container was built from the locked Python base digest and Hermes
+commit, then verified with:
+
+```bash
+docker run --rm --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+  kora-hermes:68518c1f acp --check
+```
+
+Result: `Hermes ACP check OK`.
+
 ## Upstream pin
 
 - Repository: <https://github.com/NousResearch/hermes-agent>
@@ -37,7 +54,10 @@ No model or provider identity is present in the Kora-facing result.
 - License: MIT
 - Pinned metadata: [KORA_RUNTIME_LOCK.json](./KORA_RUNTIME_LOCK.json)
 
-The already installed local Hermes used for the initial live smoke was version `0.20.5` at upstream revision `987064ca`. The inspected target pin is newer. Production work should install and test the exact target pin in an isolated Kora runtime image rather than depending on the developer's global Hermes installation.
+The already installed local Hermes used for the initial live smoke was version
+`0.20.5` at upstream revision `987064ca`. The inspected target pin is newer and
+has now been installed and tested in Kora's isolated runtime image. Kora does
+not depend on the developer's global Hermes installation.
 
 ## Critical finding
 
@@ -69,12 +89,10 @@ One-shot is sufficient for the bootstrap spike. Hermes ACP over stdio is the pre
 
 ## Next engineering slice
 
-1. Build an ACP transport behind the same adapter contract.
-2. Run the exact pinned Hermes commit in a disposable cloud container.
-3. Replace the static toolset table with capability manifests discovered from the pinned runtime and reviewed into a Kora allowlist.
-4. Add a Kora mission-state store and permission broker outside Hermes.
-5. Execute a real read/write task against a disposable sample repository.
-6. Attach diff, tests, and artifacts as completion evidence.
+1. Replace the static toolset table with capability manifests discovered from the pinned runtime and reviewed into a Kora allowlist.
+2. Add a Kora mission-state store and permission broker outside Hermes.
+3. Execute a real read/write task against a disposable sample repository.
+4. Attach diff, tests, and artifacts as completion evidence.
 
 ## Reproduce the spike
 
@@ -83,4 +101,7 @@ uv sync --no-editable
 uv run --no-sync python -m unittest discover -s tests -v
 uv run --no-sync kora-hermes-spike health
 uv run --no-sync kora-hermes-spike smoke --workspace "$PWD"
+uv run --no-sync kora-hermes-spike acp-smoke --workspace "$PWD"
+docker build -t kora-hermes:68518c1f -f infra/hermes/Dockerfile .
+docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m kora-hermes:68518c1f acp --check
 ```

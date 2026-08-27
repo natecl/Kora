@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from kora.mission import (
     ArtifactKind,
+    AuthorizationRequest,
     AttemptStatus,
     AssumptionStatus,
     CheckpointType,
@@ -411,7 +412,11 @@ class MissionControlTests(unittest.TestCase):
             lease_owner="worker",
             fencing_token=claimed.fencing_token,
         )
-        succeeded = self.service.succeed_attempt(verifying.attempt_id)
+        succeeded = self.service.succeed_attempt(
+            verifying.attempt_id,
+            lease_owner="worker",
+            fencing_token=verifying.fencing_token,
+        )
         self.assertEqual(succeeded.status, AttemptStatus.SUCCEEDED)
         with self.assertRaises(InvalidTransitionError):
             self.service.fail_attempt(succeeded.attempt_id, error_summary="too late")
@@ -574,6 +579,10 @@ class MissionControlTests(unittest.TestCase):
                     )
                 with self.assertRaises(InvalidTransitionError):
                     reopened.claim_attempt(persisted.attempt_id, "worker-again")
+                with self.assertRaises(InvalidTransitionError):
+                    reopened.reconcile_unknown(
+                        persisted.attempt_id, AttemptStatus.VERIFYING
+                    )
                 failed = reopened.reconcile_unknown(
                     persisted.attempt_id,
                     AttemptStatus.FAILED,
@@ -643,6 +652,187 @@ class MissionControlTests(unittest.TestCase):
                 "worker",
                 lease_seconds=0,
             )
+
+    def test_verifying_attempt_requires_live_fence_and_supports_heartbeat(self) -> None:
+        self._activate()
+        at = datetime(2026, 1, 5, tzinfo=UTC)
+        task = self.service.add_task("mission-1", "Fenced verification", task_id="verify-fence")
+        attempt = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "verify-fence-key",
+            worker_role_id="role",
+            route_id="route",
+            attempt_id="verify-fence-attempt",
+            created_at=at,
+        )
+        running = self.service.claim_attempt(
+            attempt.attempt_id,
+            "worker",
+            lease_expires_at=at + timedelta(seconds=5),
+            at=at,
+        )
+        with self.assertRaises(ValidationError):
+            self.service.begin_attempt_verification(
+                running.attempt_id,
+                at=at + timedelta(seconds=1),
+            )
+        with self.assertRaises(ConflictError):
+            self.service.begin_attempt_verification(
+                running.attempt_id,
+                lease_owner="worker",
+                fencing_token=running.fencing_token + 1,
+                at=at + timedelta(seconds=1),
+            )
+        verifying = self.service.begin_attempt_verification(
+            running.attempt_id,
+            lease_owner="worker",
+            fencing_token=running.fencing_token,
+            at=at + timedelta(seconds=1),
+        )
+        ticket = self.service.issue_execution_fence_ticket(
+            verifying.attempt_id,
+            cancellation_identity="mission-1:verify-fence",
+            at=at + timedelta(seconds=2),
+        )
+        self.assertEqual(
+            (ticket.attempt_id, ticket.lease_owner, ticket.fencing_token),
+            (verifying.attempt_id, "worker", verifying.fencing_token),
+        )
+        renewed = self.service.renew_lease(
+            verifying.attempt_id,
+            "worker",
+            verifying.fencing_token,
+            lease_expires_at=at + timedelta(seconds=10),
+            at=at + timedelta(seconds=3),
+        )
+        self.assertEqual(renewed.status, AttemptStatus.VERIFYING)
+        with self.assertRaises(ConflictError):
+            self.service.renew_lease(
+                verifying.attempt_id,
+                "worker",
+                verifying.fencing_token - 1,
+                at=at + timedelta(seconds=4),
+            )
+        with self.assertRaises(ConflictError):
+            self.service.fail_attempt(
+                verifying.attempt_id,
+                error_summary="The lease expired before verification finished.",
+                lease_owner="worker",
+                fencing_token=verifying.fencing_token,
+                at=at + timedelta(seconds=11),
+            )
+        expired = self.service.mark_expired_attempt_unknown(
+            verifying.attempt_id,
+            reason="The lease expired before verification finished.",
+            expected_revision=renewed.revision,
+            at=at + timedelta(seconds=11),
+        )
+        self.assertEqual(expired.status, AttemptStatus.UNKNOWN)
+        with self.assertRaises(InvalidTransitionError):
+            self.service.reconcile_unknown(expired.attempt_id, AttemptStatus.VERIFYING)
+
+    def test_waiting_mission_invalidates_live_attempt_fence(self) -> None:
+        self._activate()
+        at = datetime(2026, 1, 6, tzinfo=UTC)
+        task = self.service.add_task("mission-1", "Waiting work", task_id="waiting-work")
+        attempt = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "waiting-key",
+            worker_role_id="role",
+            route_id="route",
+            attempt_id="waiting-attempt",
+            created_at=at,
+        )
+        running = self.service.claim_attempt(
+            attempt.attempt_id,
+            "worker",
+            lease_expires_at=at + timedelta(seconds=30),
+            at=at,
+        )
+        ticket = self.service.issue_execution_fence_ticket(
+            running.attempt_id,
+            cancellation_identity="waiting-cancel",
+            at=at + timedelta(milliseconds=1),
+        )
+        self.assertIs(
+            self.service.validate_execution_fence_ticket(
+                ticket,
+                cancellation_identity="waiting-cancel",
+                at=at + timedelta(milliseconds=2),
+            ),
+            ticket,
+        )
+        waiting = self.service.wait_for_user("mission-1", at=at + timedelta(seconds=1))
+        interrupted = self.service.get_attempt(attempt.attempt_id)
+        self.assertEqual(waiting.state, MissionState.WAITING_FOR_USER)
+        self.assertEqual(interrupted.status, AttemptStatus.INTERRUPTED)
+        self.assertEqual(interrupted.fencing_token, running.fencing_token + 1)
+        self.assertIsNone(interrupted.lease_owner)
+        self.assertIsNone(interrupted.lease_expires_at)
+        with self.assertRaises(ConflictError):
+            self.service.validate_execution_fence_ticket(ticket, at=at + timedelta(seconds=2))
+        with self.assertRaises(ConflictError):
+            self.service.succeed_attempt(
+                attempt.attempt_id,
+                lease_owner="worker",
+                fencing_token=running.fencing_token,
+                at=at + timedelta(seconds=2),
+            )
+        with self.assertRaises(ConflictError):
+            self.service.renew_lease(
+                attempt.attempt_id,
+                "worker",
+                running.fencing_token,
+                at=at + timedelta(seconds=2),
+            )
+
+    def test_created_attempt_can_be_recovered_after_reopen(self) -> None:
+        at = datetime(2026, 1, 7, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "created-recovery.sqlite3"
+            first = MissionService(path)
+            mission = first.create_mission(
+                "Created recovery", "Recover durable work", "Work is claimed",
+                mission_id="created-recovery-mission", created_at=at,
+            )
+            first.align_mission(mission.mission_id, at=at)
+            first.activate_mission(mission.mission_id, at=at)
+            task = first.add_task(mission.mission_id, "Recoverable task", task_id="created-task")
+            created = first.create_attempt(
+                mission.mission_id,
+                task.task_id,
+                "created-recovery-key",
+                worker_role_id="role",
+                route_id="route",
+                attempt_id="created-recovery-attempt",
+                created_at=at,
+            )
+            first.close()
+
+            reopened = MissionService(path)
+            try:
+                claimed = reopened.resume_created_attempt(
+                    created.attempt_id,
+                    "recovery-worker",
+                    lease_expires_at=at + timedelta(seconds=20),
+                    at=at + timedelta(seconds=1),
+                )
+                self.assertEqual(claimed.status, AttemptStatus.RUNNING)
+                self.assertEqual(claimed.fencing_token, 1)
+                self.assertEqual(claimed.lease_owner, "recovery-worker")
+                reopened.stop_mission(
+                    mission.mission_id,
+                    reason="Recovery was stopped.",
+                    at=at + timedelta(seconds=2),
+                )
+                self.assertEqual(
+                    reopened.get_attempt(created.attempt_id).status,
+                    AttemptStatus.INTERRUPTED,
+                )
+            finally:
+                reopened.close()
 
     def test_invalid_multi_write_escalation_rolls_back_everything(self) -> None:
         self._activate()
@@ -919,6 +1109,21 @@ class MissionControlTests(unittest.TestCase):
                 self.assertEqual(persisted_evidence.verification_method, "independent test")
                 self.assertEqual(
                     (persisted_grant.actions_used, persisted_grant.spent_cents), (1, 25)
+                )
+                persisted_use = reopened.store.list_permission_uses(
+                    mission.mission_id, grant.grant_id
+                )[0]
+                self.assertEqual(
+                    persisted_use.authorization_request,
+                    AuthorizationRequest(
+                        mission_id=mission.mission_id,
+                        grant_id=grant.grant_id,
+                        action=PermissionAction.SPEND,
+                        resource="budget:persistent",
+                        action_count=1,
+                        spent_cents=25,
+                        idempotency_key="persist-use",
+                    ),
                 )
             finally:
                 reopened.close()
@@ -1328,16 +1533,16 @@ class MissionControlTests(unittest.TestCase):
             action_count=2,
             spent_cents=60,
         )
-        repeated = self.service.authorize_action(
-            "mission-1",
-            grant.grant_id,
-            PermissionAction.SPEND,
-            grant.resource,
-            idempotency_key="authorize-budget-1",
-            action_count=1,
-            spent_cents=1,
-        )
-        self.assertEqual(repeated, first)
+        with self.assertRaises(ConflictError):
+            self.service.authorize_action(
+                "mission-1",
+                grant.grant_id,
+                PermissionAction.SPEND,
+                grant.resource,
+                idempotency_key="authorize-budget-1",
+                action_count=1,
+                spent_cents=1,
+            )
         second = self.service.authorize_action(
             "mission-1",
             grant.grant_id,
@@ -1372,6 +1577,408 @@ class MissionControlTests(unittest.TestCase):
             {key for event in events for key in event.payload},
             {"mode", "action_count", "spent_cents"},
         )
+
+    def test_authorization_batch_preflight_and_exact_replay_are_atomic(self) -> None:
+        self._activate()
+        once = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.SEND_MESSAGE,
+            "user:batch-partner",
+            "Send the approved batch invitation",
+            grant_id="batch-once",
+            approved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        standing = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.SPEND,
+            "budget:batch",
+            "Use the approved batch budget",
+            mode=PermissionMode.BOUNDED_INDEFINITE,
+            scope="batch budget only",
+            max_actions=3,
+            budget_limit_cents=100,
+            grant_id="batch-standing",
+            approved_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        first_request = AuthorizationRequest(
+            mission_id="mission-1",
+            grant_id=once.grant_id,
+            action=PermissionAction.SEND_MESSAGE,
+            resource=once.resource,
+            idempotency_key="batch-once-key",
+        )
+        second_request = AuthorizationRequest(
+            mission_id="mission-1",
+            grant_id=standing.grant_id,
+            action=PermissionAction.SPEND,
+            resource=standing.resource,
+            action_count=2,
+            spent_cents=60,
+            idempotency_key="batch-standing-key",
+        )
+        uses_before = len(self.store.list_permission_uses("mission-1"))
+        events_before = len(self.store.list_events("mission-1"))
+        self.assertEqual(
+            self.service.preflight_authorizations((first_request, second_request)),
+            (once, standing),
+        )
+        self.assertEqual(len(self.store.list_permission_uses("mission-1")), uses_before)
+        self.assertEqual(len(self.store.list_events("mission-1")), events_before)
+
+        authorized = self.service.authorize_actions(
+            (first_request, second_request),
+            used_at=datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        self.assertEqual(len(authorized), 2)
+        self.assertEqual(
+            self.store.get_permission_grant(standing.grant_id).actions_used, 2
+        )
+        self.assertEqual(
+            self.store.get_permission_grant(standing.grant_id).spent_cents, 60
+        )
+        self.assertEqual(len(self.store.list_permission_uses("mission-1")), 2)
+
+        replay_grant = self.service.preflight_authorizations(
+            first_request,
+            at=datetime(2026, 1, 2, 1, tzinfo=UTC),
+        )[0]
+        self.assertEqual(replay_grant.consumed_at, authorized[0].consumed_at)
+        uses_after_replay = self.store.list_permission_uses("mission-1")
+        events_after_replay = self.store.list_events("mission-1")
+        self.assertEqual(
+            self.service.authorize_actions(first_request),
+            (self.store.get_permission_grant(once.grant_id),),
+        )
+        self.assertEqual(self.store.list_permission_uses("mission-1"), uses_after_replay)
+        self.assertEqual(self.store.list_events("mission-1"), events_after_replay)
+
+        changed_requests = (
+            replace(first_request, action_count=2),
+            replace(first_request, spent_cents=1),
+            replace(first_request, resource="user:other-partner"),
+            replace(first_request, action=PermissionAction.PUBLISH),
+            AuthorizationRequest(
+                mission_id="mission-1",
+                grant_id=standing.grant_id,
+                action=PermissionAction.SPEND,
+                resource=standing.resource,
+                idempotency_key=first_request.idempotency_key,
+            ),
+        )
+        for changed in changed_requests:
+            with self.subTest(binding=changed.binding):
+                with self.assertRaises(ConflictError):
+                    self.service.preflight_authorizations(changed)
+                with self.assertRaises(ConflictError):
+                    self.service.authorize_actions(changed)
+
+        extra = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.DEPLOY,
+            "staging/batch",
+            "Deploy the approved batch preview",
+            mode=PermissionMode.BOUNDED_INDEFINITE,
+            scope="batch preview only",
+            max_actions=1,
+            grant_id="batch-extra",
+        )
+        valid_new = AuthorizationRequest(
+            mission_id="mission-1",
+            grant_id=extra.grant_id,
+            action=PermissionAction.DEPLOY,
+            resource=extra.resource,
+            idempotency_key="batch-valid-new",
+        )
+        invalid_new = AuthorizationRequest(
+            mission_id="mission-1",
+            grant_id=standing.grant_id,
+            action=PermissionAction.SPEND,
+            resource="budget:not-batch",
+            idempotency_key="batch-invalid-new",
+        )
+        extra_before = self.store.get_permission_grant(extra.grant_id)
+        uses_before_failed_batch = self.store.list_permission_uses("mission-1")
+        with self.assertRaises(ConflictError):
+            self.service.authorize_actions((valid_new, invalid_new))
+        self.assertEqual(self.store.get_permission_grant(extra.grant_id), extra_before)
+        self.assertEqual(
+            self.store.list_permission_uses("mission-1"), uses_before_failed_batch
+        )
+        self.assertIsNone(self.store.get_permission_use(valid_new.idempotency_key))
+
+        rollback_a = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.PUBLISH,
+            "staging/rollback-a",
+            "Publish the approved rollback preview",
+            mode=PermissionMode.BOUNDED_INDEFINITE,
+            scope="rollback preview only",
+            max_actions=1,
+            grant_id="batch-rollback-a",
+        )
+        rollback_b = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.PUBLISH,
+            "staging/rollback-b",
+            "Publish the approved second rollback preview",
+            mode=PermissionMode.BOUNDED_INDEFINITE,
+            scope="second rollback preview only",
+            max_actions=1,
+            grant_id="batch-rollback-b",
+        )
+        rollback_requests = (
+            AuthorizationRequest(
+                mission_id="mission-1",
+                grant_id=rollback_a.grant_id,
+                action=PermissionAction.PUBLISH,
+                resource=rollback_a.resource,
+                idempotency_key="batch-rollback-a-key",
+            ),
+            AuthorizationRequest(
+                mission_id="mission-1",
+                grant_id=rollback_b.grant_id,
+                action=PermissionAction.PUBLISH,
+                resource=rollback_b.resource,
+                idempotency_key="batch-rollback-b-key",
+            ),
+        )
+        original_create_event = self.store.create_event
+        permission_events = 0
+
+        def fail_on_second_permission_event(event: object) -> object:
+            nonlocal permission_events
+            if getattr(event, "event_type", None) is EventType.PERMISSION_USED:
+                permission_events += 1
+                if permission_events == 2:
+                    raise RuntimeError("batch audit unavailable")
+            return original_create_event(event)
+
+        with patch.object(
+            self.store,
+            "create_event",
+            side_effect=fail_on_second_permission_event,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "batch audit unavailable"):
+                self.service.authorize_actions(rollback_requests)
+        self.assertEqual(
+            self.store.get_permission_grant(rollback_a.grant_id), rollback_a
+        )
+        self.assertEqual(
+            self.store.get_permission_grant(rollback_b.grant_id), rollback_b
+        )
+        self.assertIsNone(self.store.get_permission_use(rollback_requests[0].idempotency_key))
+        self.assertIsNone(self.store.get_permission_use(rollback_requests[1].idempotency_key))
+
+    def test_verified_attempt_finalization_is_atomic_and_crash_resumable(self) -> None:
+        self._activate()
+        at = datetime(2026, 1, 8, tzinfo=UTC)
+        task = self.service.add_task("mission-1", "Verified task", task_id="verified-task")
+        self.service.start_task(task.task_id, at=at)
+        attempt = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "verified-attempt-key",
+            worker_role_id="role",
+            route_id="route",
+            attempt_id="verified-attempt",
+            created_at=at,
+        )
+        running = self.service.claim_attempt(
+            attempt.attempt_id,
+            "worker",
+            lease_expires_at=at + timedelta(seconds=30),
+            at=at,
+        )
+        verifying = self.service.begin_attempt_verification(
+            attempt.attempt_id,
+            lease_owner="worker",
+            fencing_token=running.fencing_token,
+            at=at + timedelta(seconds=1),
+        )
+        evidence = self.service.record_evidence(
+            "mission-1",
+            "The verified task output is present.",
+            kind=EvidenceKind.TEST,
+            task_id=task.task_id,
+            evidence_id="verified-task-evidence",
+            created_at=at + timedelta(seconds=2),
+        )
+        self.service.verify_evidence(
+            evidence.evidence_id,
+            "independent test",
+            verified_at=at + timedelta(seconds=3),
+        )
+        finalized = self.service.finalize_verified_attempt(
+            verifying.attempt_id,
+            lease_owner="worker",
+            fencing_token=verifying.fencing_token,
+            result_summary="Verified output accepted.",
+            total_tokens=100,
+            estimated_cost_usd=0.01,
+            latency_ms=250,
+            at=at + timedelta(seconds=4),
+        )
+        self.assertEqual(finalized.status, AttemptStatus.SUCCEEDED)
+        self.assertEqual(self.service.get_task(task.task_id).state, TaskStatus.COMPLETED)
+        checkpoints = [
+            checkpoint
+            for checkpoint in self.store.list_checkpoints("mission-1")
+            if checkpoint.task_id == task.task_id
+        ]
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[0].kind, CheckpointType.FIRST_USABLE_SLICE)
+        attempt_revision = finalized.revision
+        event_count = len(self.store.list_events("mission-1"))
+        repeated = self.service.finalize_verified_attempt(
+            finalized.attempt_id, at=at + timedelta(seconds=5)
+        )
+        self.assertEqual(repeated, finalized)
+        self.assertEqual(len(self.store.list_events("mission-1")), event_count)
+        self.assertEqual(
+            len(
+                [
+                    checkpoint
+                    for checkpoint in self.store.list_checkpoints("mission-1")
+                    if checkpoint.task_id == task.task_id
+                ]
+            ),
+            1,
+        )
+        self.assertEqual(repeated.revision, attempt_revision)
+
+        crash_task = self.service.add_task(
+            "mission-1", "Crash recovery task", task_id="crash-task"
+        )
+        self.service.start_task(crash_task.task_id, at=at + timedelta(seconds=6))
+        crash_attempt = self.service.create_attempt(
+            "mission-1",
+            crash_task.task_id,
+            "crash-attempt-key",
+            worker_role_id="role",
+            route_id="route",
+            attempt_id="crash-attempt",
+            created_at=at + timedelta(seconds=6),
+        )
+        crash_running = self.service.claim_attempt(
+            crash_attempt.attempt_id,
+            "worker",
+            lease_expires_at=at + timedelta(seconds=40),
+            at=at + timedelta(seconds=6),
+        )
+        crash_verifying = self.service.begin_attempt_verification(
+            crash_attempt.attempt_id,
+            lease_owner="worker",
+            fencing_token=crash_running.fencing_token,
+            at=at + timedelta(seconds=7),
+        )
+        crash_evidence = self.service.record_evidence(
+            "mission-1",
+            "The crash-window output is independently verified.",
+            kind=EvidenceKind.TEST,
+            task_id=crash_task.task_id,
+            evidence_id="crash-task-evidence",
+            created_at=at + timedelta(seconds=8),
+        )
+        self.service.verify_evidence(
+            crash_evidence.evidence_id,
+            "independent test",
+            verified_at=at + timedelta(seconds=9),
+        )
+        succeeded_before_crash = self.service.succeed_attempt(
+            crash_verifying.attempt_id,
+            result_summary="Attempt commit completed before task finalization crashed.",
+            lease_owner="worker",
+            fencing_token=crash_verifying.fencing_token,
+            at=at + timedelta(seconds=10),
+        )
+        self.assertEqual(self.service.get_task(crash_task.task_id).state, TaskStatus.IN_PROGRESS)
+        recovered = self.service.finalize_verified_attempt(
+            succeeded_before_crash.attempt_id, at=at + timedelta(seconds=11)
+        )
+        self.assertEqual(recovered, succeeded_before_crash)
+        self.assertEqual(
+            self.service.get_task(crash_task.task_id).state, TaskStatus.COMPLETED
+        )
+        self.assertEqual(
+            len(
+                [
+                    checkpoint
+                    for checkpoint in self.store.list_checkpoints("mission-1")
+                    if checkpoint.task_id == crash_task.task_id
+                ]
+            ),
+            1,
+        )
+
+    def test_conditional_mission_finalization_and_terminal_no_write(self) -> None:
+        self._activate()
+        at = datetime(2026, 1, 9, tzinfo=UTC)
+        task = self.service.add_task("mission-1", "Mission-ready task", task_id="mission-task")
+        self.service.start_task(task.task_id, at=at)
+        self.service.begin_task_verification(task.task_id, at=at + timedelta(seconds=1))
+        evidence = self.service.record_evidence(
+            "mission-1",
+            "The mission-ready task passed its acceptance check.",
+            kind=EvidenceKind.TEST,
+            task_id=task.task_id,
+            evidence_id="mission-task-evidence",
+            created_at=at + timedelta(seconds=2),
+        )
+        self.service.verify_evidence(
+            evidence.evidence_id,
+            "independent test",
+            verified_at=at + timedelta(seconds=3),
+        )
+        self.service.complete_task(task.task_id, at=at + timedelta(seconds=4))
+        verifying = self.service.begin_verification("mission-1", at=at + timedelta(seconds=5))
+        completed = self.service.finalize_mission(
+            "mission-1",
+            expected_revision=verifying.revision,
+            at=at + timedelta(seconds=6),
+        )
+        self.assertEqual(completed.state, MissionState.COMPLETED)
+        coverage = [
+            evidence
+            for evidence in self.store.list_evidence("mission-1")
+            if evidence.kind is EvidenceKind.REQUIREMENT_COVERAGE
+        ]
+        self.assertEqual(len(coverage), 1)
+        self.assertIsNotNone(coverage[0].verified_at)
+        mission_checkpoint_id = "checkpoint:mission:mission-1:completed"
+        self.assertEqual(
+            [
+                checkpoint.checkpoint_id
+                for checkpoint in self.store.list_checkpoints("mission-1")
+                if checkpoint.checkpoint_id == mission_checkpoint_id
+            ],
+            [mission_checkpoint_id],
+        )
+        events_after_completion = self.store.list_events("mission-1")
+        checkpoints_after_completion = self.store.list_checkpoints("mission-1")
+        persisted = self.service.finalize_mission(
+            "mission-1", expected_revision=0, at=at + timedelta(seconds=7)
+        )
+        self.assertEqual(persisted, completed)
+        self.assertEqual(self.store.list_events("mission-1"), events_after_completion)
+        self.assertEqual(
+            self.store.list_checkpoints("mission-1"), checkpoints_after_completion
+        )
+
+    def test_waiting_mission_finalization_returns_persisted_state_without_writes(self) -> None:
+        self._activate()
+        waiting = self.service.wait_for_user(
+            "mission-1", at=datetime(2026, 1, 10, tzinfo=UTC)
+        )
+        events = self.store.list_events("mission-1")
+        checkpoints = self.store.list_checkpoints("mission-1")
+        result = self.service.finalize_mission(
+            "mission-1",
+            expected_revision=0,
+            at=datetime(2026, 1, 10, 1, tzinfo=UTC),
+        )
+        self.assertEqual(result, waiting)
+        self.assertEqual(self.store.list_events("mission-1"), events)
+        self.assertEqual(self.store.list_checkpoints("mission-1"), checkpoints)
 
     def test_permission_grants_require_bounded_scope_and_owner_approval(self) -> None:
         with self.assertRaises(InvalidTransitionError):

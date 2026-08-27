@@ -21,6 +21,7 @@ from uuid import uuid4
 from kora.mission.domain import (
     Artifact,
     ArtifactKind,
+    AuthorizationRequest,
     AttemptStatus,
     Assumption,
     AssumptionStatus,
@@ -38,6 +39,7 @@ from kora.mission.domain import (
     PermissionAction,
     PermissionGrant,
     PermissionMode,
+    PermissionUse,
     Task,
     TaskAttempt,
     TaskDependency,
@@ -54,7 +56,7 @@ from kora.mission.errors import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _timestamp(value: datetime) -> str:
@@ -421,11 +423,20 @@ class SQLiteMissionStore:
 
                 CREATE TABLE IF NOT EXISTS permission_uses (
                     use_id TEXT PRIMARY KEY,
+                    mission_id TEXT NOT NULL,
                     grant_id TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK (action IN (
+                        'read_context', 'write_workspace', 'execute_workspace',
+                        'deploy', 'send_message', 'publish', 'outreach', 'spend',
+                        'account_change', 'delete'
+                    )),
+                    resource TEXT NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     action_count INTEGER NOT NULL CHECK (action_count > 0),
                     spent_cents INTEGER NOT NULL CHECK (spent_cents >= 0),
                     created_at TEXT NOT NULL,
+                    FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
+                        ON DELETE CASCADE,
                     FOREIGN KEY (grant_id) REFERENCES permission_grants(grant_id)
                         ON DELETE RESTRICT
                 );
@@ -522,6 +533,72 @@ class SQLiteMissionStore:
                 self._connection.execute(
                     "ALTER TABLE permission_grants ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0"
                 )
+
+            # Version 5 binds every persisted use to the immutable authority
+            # request that created it.  Existing version-4 databases have
+            # enough information on the referenced grant to backfill these
+            # fields without changing any counters or audit history.
+            permission_use_columns = {
+                row[1]
+                for row in self._connection.execute(
+                    "PRAGMA table_info(permission_uses)"
+                )
+            }
+            if "mission_id" not in permission_use_columns:
+                self._connection.execute(
+                    "ALTER TABLE permission_uses ADD COLUMN mission_id TEXT"
+                )
+            if "action" not in permission_use_columns:
+                self._connection.execute(
+                    "ALTER TABLE permission_uses ADD COLUMN action TEXT"
+                )
+            if "resource" not in permission_use_columns:
+                self._connection.execute(
+                    "ALTER TABLE permission_uses ADD COLUMN resource TEXT"
+                )
+            self._connection.execute(
+                """
+                UPDATE permission_uses
+                SET mission_id = (
+                        SELECT mission_id
+                        FROM permission_grants
+                        WHERE permission_grants.grant_id = permission_uses.grant_id
+                    ),
+                    action = (
+                        SELECT action
+                        FROM permission_grants
+                        WHERE permission_grants.grant_id = permission_uses.grant_id
+                    ),
+                    resource = (
+                        SELECT resource
+                        FROM permission_grants
+                        WHERE permission_grants.grant_id = permission_uses.grant_id
+                    )
+                WHERE mission_id IS NULL OR action IS NULL OR resource IS NULL
+                """
+            )
+            incomplete_permission_use = self._connection.execute(
+                """
+                SELECT use_id
+                FROM permission_uses
+                WHERE mission_id IS NULL OR action IS NULL OR resource IS NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            if incomplete_permission_use is not None:
+                raise ValidationError(
+                    "permission use is missing its immutable authority binding: "
+                    f"{incomplete_permission_use[0]}"
+                )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_permission_uses_binding
+                    ON permission_uses(
+                        mission_id, idempotency_key, grant_id, action, resource,
+                        action_count, spent_cents
+                    )
+                """
+            )
 
             event_table = self._connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mission_events'"
@@ -1853,6 +1930,37 @@ class SQLiteMissionStore:
             rows = self._connection.execute(query, tuple(params)).fetchall()
         return [self._permission_from_row(row) for row in rows]
 
+    def get_permission_use(self, idempotency_key: str) -> PermissionUse | None:
+        """Return the immutable use bound to an idempotency key, if any."""
+
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT *
+                FROM permission_uses
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        return self._permission_use_from_row(row) if row is not None else None
+
+    def list_permission_uses(
+        self,
+        mission_id: str,
+        grant_id: str | None = None,
+    ) -> list[PermissionUse]:
+        """List immutable permission-use bindings in deterministic order."""
+
+        query = "SELECT * FROM permission_uses WHERE mission_id = ?"
+        params: list[Any] = [mission_id]
+        if grant_id is not None:
+            query += " AND grant_id = ?"
+            params.append(grant_id)
+        query += " ORDER BY created_at ASC, use_id ASC"
+        with self._lock:
+            rows = self._connection.execute(query, tuple(params)).fetchall()
+        return [self._permission_use_from_row(row) for row in rows]
+
     def update_permission_grant(self, grant: PermissionGrant) -> PermissionGrant:
         with self.transaction():
             current = self.get_permission_grant(grant.grant_id)
@@ -1956,13 +2064,16 @@ class SQLiteMissionStore:
             self._connection.execute(
                 """
                 INSERT INTO permission_uses(
-                    use_id, grant_id, idempotency_key, action_count,
-                    spent_cents, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    use_id, mission_id, grant_id, action, resource,
+                    idempotency_key, action_count, spent_cents, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     f"use-{uuid4().hex}",
+                    row["mission_id"],
                     grant_id,
+                    row["action"],
+                    row["resource"],
                     idempotency_key,
                     action_count,
                     spent_cents,
@@ -1977,6 +2088,114 @@ class SQLiteMissionStore:
             if updated_row is not None
             else None
         )
+
+    def apply_authorization_request(
+        self,
+        request: AuthorizationRequest,
+        *,
+        used_at: datetime | None = None,
+    ) -> PermissionGrant | None:
+        """Apply one prevalidated exact authorization request.
+
+        The method is intentionally usable inside an outer service batch
+        transaction.  It performs the grant counter CAS and immutable use
+        insert together; callers must validate replay and batch capacity before
+        invoking it.
+        """
+
+        if not isinstance(request, AuthorizationRequest):
+            raise ValidationError("request must be an AuthorizationRequest")
+        used = normalize_timestamp(used_at or utc_now())
+        used_text = _timestamp(used)
+        with self.transaction(immediate=True):
+            row = self._connection.execute(
+                "SELECT * FROM permission_grants WHERE grant_id = ?",
+                (request.grant_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"permission grant not found: {request.grant_id}")
+            if (
+                row["mission_id"] != request.mission_id
+                or row["action"] != request.action.value
+                or row["resource"] != request.resource
+            ):
+                raise ConflictError("authorization request does not match grant")
+            if (
+                row["mode"] == PermissionMode.APPROVE_ONCE.value
+                and request.action_count != 1
+            ):
+                raise ValidationError("approve-once grants permit exactly one action")
+            cursor = self._connection.execute(
+                """
+                UPDATE permission_grants
+                SET actions_used = actions_used + ?,
+                    spent_cents = spent_cents + ?,
+                    consumed_at = CASE
+                        WHEN mode = ? THEN ?
+                        ELSE consumed_at
+                    END
+                WHERE grant_id = ?
+                  AND revoked_at IS NULL
+                  AND approved_at <= ?
+                  AND (expires_at IS NULL OR expires_at > ?)
+                  AND consumed_at IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM missions
+                      WHERE missions.mission_id = permission_grants.mission_id
+                        AND missions.state = 'active'
+                  )
+                  AND (max_actions IS NULL OR actions_used + ? <= max_actions)
+                  AND (budget_limit_cents IS NULL OR spent_cents < budget_limit_cents)
+                  AND (budget_limit_cents IS NULL
+                       OR spent_cents + ? <= budget_limit_cents)
+                """,
+                (
+                    request.action_count,
+                    request.spent_cents,
+                    PermissionMode.APPROVE_ONCE.value,
+                    used_text,
+                    request.grant_id,
+                    used_text,
+                    used_text,
+                    request.action_count,
+                    request.spent_cents,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO permission_uses(
+                        use_id, mission_id, grant_id, action, resource,
+                        idempotency_key, action_count, spent_cents, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"use-{uuid4().hex}",
+                        request.mission_id,
+                        request.grant_id,
+                        request.action.value,
+                        request.resource,
+                        request.idempotency_key,
+                        request.action_count,
+                        request.spent_cents,
+                        used_text,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError(
+                    "permission use idempotency key already exists: "
+                    f"{request.idempotency_key}"
+                ) from exc
+            updated_row = self._connection.execute(
+                "SELECT * FROM permission_grants WHERE grant_id = ?",
+                (request.grant_id,),
+            ).fetchone()
+        return self._permission_from_row(updated_row) if updated_row is not None else None
+
+    record_authorization_use = apply_authorization_request
 
     def consume_permission(
         self,
@@ -2225,6 +2444,20 @@ class SQLiteMissionStore:
             else None,
             actions_used=row["actions_used"],
             spent_cents=row["spent_cents"],
+        )
+
+    @staticmethod
+    def _permission_use_from_row(row: sqlite3.Row) -> PermissionUse:
+        return PermissionUse(
+            use_id=row["use_id"],
+            mission_id=row["mission_id"],
+            grant_id=row["grant_id"],
+            action=PermissionAction(row["action"]),
+            resource=row["resource"],
+            idempotency_key=row["idempotency_key"],
+            action_count=row["action_count"],
+            spent_cents=row["spent_cents"],
+            created_at=_parse_timestamp(row["created_at"]),
         )
 
 

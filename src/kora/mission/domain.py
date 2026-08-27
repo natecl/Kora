@@ -239,6 +239,78 @@ class PermissionAction(StrEnum):
     EXTERNAL_OUTREACH = OUTREACH
 
 
+@dataclass(frozen=True, slots=True)
+class AuthorizationRequest:
+    """The immutable semantic binding for one requested authority use.
+
+    Kora compares every field of this value on an idempotent retry.  In
+    particular, ``resource`` is intentionally retained as the exact
+    canonical resource string supplied by the caller; callers cannot retry a
+    use against a broader or otherwise different resource under the same
+    idempotency key.
+    """
+
+    mission_id: str
+    grant_id: str
+    action: PermissionAction
+    resource: str
+    action_count: int = 1
+    spent_cents: int = 0
+    idempotency_key: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mission_id", _non_empty(self.mission_id, "mission_id"))
+        object.__setattr__(self, "grant_id", _non_empty(self.grant_id, "grant_id"))
+        object.__setattr__(
+            self, "action", _coerce_enum(self.action, PermissionAction, "action")
+        )
+        object.__setattr__(self, "resource", _non_empty(self.resource, "resource"))
+        if (
+            isinstance(self.action_count, bool)
+            or not isinstance(self.action_count, int)
+            or self.action_count <= 0
+        ):
+            raise ValidationError("action_count must be a positive integer")
+        if (
+            isinstance(self.spent_cents, bool)
+            or not isinstance(self.spent_cents, int)
+            or self.spent_cents < 0
+        ):
+            raise ValidationError("spent_cents must be a non-negative integer")
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            _non_empty(self.idempotency_key, "idempotency_key"),
+        )
+
+    @property
+    def canonical_resource(self) -> str:
+        """The exact resource string bound by this request."""
+
+        return self.resource
+
+    @property
+    def binding(self) -> tuple[str, str, PermissionAction, str, int, int, str]:
+        """Return all immutable authorization-binding fields in one value."""
+
+        return (
+            self.mission_id,
+            self.grant_id,
+            self.action,
+            self.resource,
+            self.action_count,
+            self.spent_cents,
+            self.idempotency_key,
+        )
+
+
+# These aliases make the semantic value discoverable for callers that use the
+# permission-oriented vocabulary while keeping one immutable implementation.
+PermissionAuthorizationRequest = AuthorizationRequest
+AuthorizationValue = AuthorizationRequest
+PermissionUseRequest = AuthorizationRequest
+
+
 class ArtifactKind(StrEnum):
     """Kinds of durable artifacts that can support evidence."""
 
@@ -961,6 +1033,57 @@ class PermissionGrant:
         ):
             return False
         return self.expires_at is None or self.expires_at > now
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionUse:
+    """Immutable persisted record of one exact permission authorization use."""
+
+    use_id: str
+    mission_id: str
+    grant_id: str
+    action: PermissionAction
+    resource: str
+    idempotency_key: str
+    action_count: int
+    spent_cents: int
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        for field_name in ("use_id", "mission_id", "grant_id", "resource", "idempotency_key"):
+            object.__setattr__(
+                self, field_name, _non_empty(getattr(self, field_name), field_name)
+            )
+        object.__setattr__(
+            self, "action", _coerce_enum(self.action, PermissionAction, "action")
+        )
+        if (
+            isinstance(self.action_count, bool)
+            or not isinstance(self.action_count, int)
+            or self.action_count <= 0
+        ):
+            raise ValidationError("action_count must be a positive integer")
+        if (
+            isinstance(self.spent_cents, bool)
+            or not isinstance(self.spent_cents, int)
+            or self.spent_cents < 0
+        ):
+            raise ValidationError("spent_cents must be a non-negative integer")
+        object.__setattr__(self, "created_at", normalize_timestamp(self.created_at))
+
+    @property
+    def authorization_request(self) -> AuthorizationRequest:
+        """Reconstruct the exact immutable request represented by this use."""
+
+        return AuthorizationRequest(
+            mission_id=self.mission_id,
+            grant_id=self.grant_id,
+            action=self.action,
+            resource=self.resource,
+            action_count=self.action_count,
+            spent_cents=self.spent_cents,
+            idempotency_key=self.idempotency_key,
+        )
 
 
 @dataclass(frozen=True, slots=True)

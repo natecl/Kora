@@ -6,12 +6,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from math import isfinite
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import TYPE_CHECKING, Iterable, Mapping
 from uuid import uuid4
 
 from kora.mission.domain import (
     Artifact,
     ArtifactKind,
+    AuthorizationRequest,
     AttemptStatus,
     Assumption,
     AssumptionStatus,
@@ -45,6 +46,9 @@ from kora.mission.errors import (
     ValidationError,
 )
 from kora.mission.store import SQLiteMissionStore
+
+if TYPE_CHECKING:
+    from kora.runtime.contracts import ExecutionFenceTicket
 
 
 # Explicit transition matrices make the lifecycle reviewable and prevent a
@@ -150,7 +154,6 @@ ATTEMPT_TRANSITIONS: Mapping[AttemptStatus, frozenset[AttemptStatus]] = {
     AttemptStatus.INTERRUPTED: frozenset(),
     AttemptStatus.UNKNOWN: frozenset(
         {
-            AttemptStatus.VERIFYING,
             AttemptStatus.FAILED,
             AttemptStatus.INTERRUPTED,
         }
@@ -299,6 +302,12 @@ class MissionService:
     ) -> Mission:
         target_state = _coerce_mission_state(target)
         timestamp = normalize_timestamp(at or utc_now())
+        if target_state is MissionState.COMPLETED:
+            return self.finalize_mission(
+                mission_id,
+                expected_revision=expected_revision,
+                at=timestamp,
+            )
         with self.store.transaction(immediate=True):
             current = self._require_owned_mission(mission_id)
             if expected_revision is not None and expected_revision != current.revision:
@@ -360,10 +369,55 @@ class MissionService:
             at=at,
         )
 
-    def complete_mission(
-        self, mission_id: str, *, at: datetime | None = None
+    def finalize_mission(
+        self,
+        mission_id: str,
+        *,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
     ) -> Mission:
-        return self.transition_mission(mission_id, MissionState.COMPLETED, at=at)
+        """Conditionally finalize a ready mission in one atomic operation.
+
+        Terminal and waiting missions are returned exactly as persisted and
+        are never written.  For an active/verifying mission, readiness,
+        aggregate checkpoint creation, and the mission CAS transition all
+        share one immediate transaction.
+        """
+
+        timestamp = normalize_timestamp(at or utc_now())
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_mission(mission_id)
+            if current.state in {
+                MissionState.WAITING_FOR_USER,
+                MissionState.COMPLETED,
+                MissionState.STOPPED,
+                MissionState.FAILED,
+            }:
+                return current
+            if expected_revision is not None and expected_revision != current.revision:
+                raise ConflictError(
+                    f"stale mission revision for {mission_id}: expected "
+                    f"{expected_revision}, current {current.revision}"
+                )
+            self._validate_mission_transition(current.state, MissionState.COMPLETED)
+            self._ensure_mission_completion_ready(current.mission_id)
+            self._ensure_mission_completion_evidence_in_transaction(
+                current.mission_id,
+                at=timestamp,
+            )
+            self._ensure_mission_completion_checkpoint_in_transaction(
+                current.mission_id,
+                at=timestamp,
+            )
+            return self._transition_mission_in_transaction(
+                current,
+                MissionState.COMPLETED,
+                reason=None,
+                at=timestamp,
+            )
+
+    complete_mission = finalize_mission
+    finalize = finalize_mission
 
     def stop_mission(
         self,
@@ -378,6 +432,17 @@ class MissionService:
             reason=reason,
             at=at,
         )
+
+    def cancel_mission(
+        self,
+        mission_id: str,
+        *,
+        reason: str | None = None,
+        at: datetime | None = None,
+    ) -> Mission:
+        """Cancel a mission through Kora's explicit STOPPED terminal state."""
+
+        return self.stop_mission(mission_id, reason=reason, at=at)
 
     def fail_mission(
         self,
@@ -477,6 +542,94 @@ class MissionService:
     def get_attempt(self, attempt_id: str) -> TaskAttempt:
         return self._require_owned_attempt(attempt_id)
 
+    def issue_execution_fence_ticket(
+        self,
+        attempt_id: str,
+        *,
+        cancellation_identity: str | None = None,
+        at: datetime | None = None,
+    ) -> "ExecutionFenceTicket":
+        """Issue a runtime fence ticket from the currently active Kora lease."""
+
+        timestamp = normalize_timestamp(at or utc_now())
+        attempt = self._require_owned_attempt(attempt_id)
+        mission = self._require_owned_mission(attempt.mission_id)
+        if mission.state not in {
+            MissionState.ACTIVE,
+            MissionState.VERIFYING,
+        }:
+            raise ConflictError(
+                f"execution fences require an active mission: {attempt.mission_id}"
+            )
+        if attempt.status not in {
+            AttemptStatus.RUNNING,
+            AttemptStatus.VERIFYING,
+        }:
+            raise InvalidTransitionError(
+                f"execution fences require a running or verifying attempt: {attempt_id}"
+            )
+        if not attempt.has_active_lease(timestamp):
+            raise ConflictError(f"attempt lease is no longer active: {attempt_id}")
+        from kora.runtime.contracts import ExecutionFenceTicket
+
+        identity = (
+            cancellation_identity
+            if cancellation_identity is not None
+            else (
+                f"cancel:{attempt.mission_id}:{attempt.attempt_id}:"
+                f"{attempt.fencing_token}"
+            )
+        )
+        return ExecutionFenceTicket.from_attempt(
+            attempt,
+            cancellation_identity=identity,
+            at=timestamp,
+        )
+
+    issue_fence_ticket = issue_execution_fence_ticket
+    execution_fence_ticket = issue_execution_fence_ticket
+    fence_ticket_for_attempt = issue_execution_fence_ticket
+
+    def validate_execution_fence_ticket(
+        self,
+        ticket: object,
+        *,
+        cancellation_identity: str | None = None,
+        at: datetime | None = None,
+    ) -> "ExecutionFenceTicket":
+        """Validate a runtime ticket against the current Kora lease state."""
+
+        from kora.runtime.contracts import ExecutionFenceTicket
+
+        if not isinstance(ticket, ExecutionFenceTicket):
+            raise ValidationError("ticket must be an ExecutionFenceTicket")
+        timestamp = normalize_timestamp(at or utc_now())
+        with self.store.transaction():
+            ticket.validate(
+                cancellation_identity=cancellation_identity,
+                at=timestamp,
+            )
+            attempt = self._require_owned_attempt(ticket.attempt_id)
+            mission = self._require_owned_mission(attempt.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"execution fence is invalid while mission is {mission.state.value}: "
+                    f"{attempt.attempt_id}"
+                )
+            self._check_attempt_fence(
+                attempt,
+                ticket.lease_owner,
+                ticket.fencing_token,
+                at=timestamp,
+            )
+        return ticket
+
+    validate_fence_ticket = validate_execution_fence_ticket
+    validate_execution_fence = validate_execution_fence_ticket
+
     def list_attempts(
         self,
         mission_id: str,
@@ -516,6 +669,11 @@ class MissionService:
         )
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state is not MissionState.ACTIVE:
+                raise InvalidTransitionError(
+                    "an attempt can be claimed only while its mission is active"
+                )
             self._check_expected_attempt_revision(current, expected_revision)
             reclaimed = False
             if current.status is AttemptStatus.CREATED:
@@ -572,6 +730,34 @@ class MissionService:
             )
             return updated
 
+    def resume_created_attempt(
+        self,
+        attempt_id: str,
+        lease_owner: str,
+        *,
+        lease_expires_at: datetime | None = None,
+        lease_ttl_seconds: float | int | None = None,
+        lease_seconds: float | int | None = None,
+        lease_duration_seconds: float | int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        """Claim a durable CREATED attempt after a creation/claim crash window."""
+
+        return self.claim_attempt(
+            attempt_id,
+            lease_owner,
+            lease_expires_at=lease_expires_at,
+            lease_ttl_seconds=lease_ttl_seconds,
+            lease_seconds=lease_seconds,
+            lease_duration_seconds=lease_duration_seconds,
+            expected_revision=expected_revision,
+            at=at,
+        )
+
+    claim_created_attempt = resume_created_attempt
+    resume_attempt = resume_created_attempt
+
     def renew_lease(
         self,
         attempt_id: str,
@@ -599,17 +785,28 @@ class MissionService:
         )
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"attempt cannot renew a lease while mission is "
+                    f"{mission.state.value}: {attempt_id}"
+                )
             self._check_expected_attempt_revision(current, expected_revision)
-            if current.status is not AttemptStatus.RUNNING:
+            if current.status not in {
+                AttemptStatus.RUNNING,
+                AttemptStatus.VERIFYING,
+            }:
                 raise InvalidTransitionError(
-                    f"only running attempts can renew a lease: {attempt_id}"
+                    f"only running or verifying attempts can renew a lease: {attempt_id}"
                 )
             self._check_attempt_fence(
                 current,
                 owner,
                 token,
                 at=timestamp,
-                require_active_lease=True,
             )
             updated = self.store.update_attempt(
                 replace(current, lease_expires_at=expiry, updated_at=timestamp),
@@ -636,22 +833,24 @@ class MissionService:
         timestamp = normalize_timestamp(at or utc_now())
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"attempt cannot begin verification while mission is "
+                    f"{mission.state.value}: {attempt_id}"
+                )
             if current.status is not AttemptStatus.RUNNING:
                 raise InvalidTransitionError(
                     f"only running attempts can begin verification: {attempt_id}"
-                )
-            if current.status is AttemptStatus.RUNNING and not current.has_active_lease(
-                timestamp
-            ):
-                raise ConflictError(
-                    f"attempt lease is no longer active: {current.attempt_id}"
                 )
             self._check_attempt_fence(
                 current,
                 lease_owner,
                 fencing_token,
                 at=timestamp,
-                require_active_lease=current.status is AttemptStatus.RUNNING,
             )
             return self._transition_attempt_in_transaction(
                 current,
@@ -679,6 +878,15 @@ class MissionService:
         timestamp = normalize_timestamp(at or utc_now())
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"attempt cannot succeed while mission is "
+                    f"{mission.state.value}: {attempt_id}"
+                )
             if current.status is not AttemptStatus.VERIFYING:
                 raise InvalidTransitionError(
                     f"only verifying attempts can succeed: {attempt_id}"
@@ -688,7 +896,6 @@ class MissionService:
                 lease_owner,
                 fencing_token,
                 at=timestamp,
-                require_active_lease=current.status is AttemptStatus.RUNNING,
             )
             return self._transition_attempt_in_transaction(
                 current,
@@ -715,6 +922,142 @@ class MissionService:
                 finished_at=timestamp,
             )
 
+    def finalize_verified_attempt(
+        self,
+        attempt_id: str,
+        *,
+        result_summary: str | None = None,
+        total_tokens: int | None = None,
+        estimated_cost_usd: float | None = None,
+        latency_ms: int | None = None,
+        accepted: bool = True,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        expected_revision: int | None = None,
+        expected_task_revision: int | None = None,
+        checkpoint_id: str | None = None,
+        checkpoint_summary: str = (
+            "Task completed with independently verified workspace evidence."
+        ),
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        """Finalize a verified attempt, task, and checkpoint atomically.
+
+        A previously SUCCEEDED attempt is deliberately reusable here.  This
+        covers the legacy/crash window where the attempt commit succeeded but
+        task finalization did not, without invoking the runtime again.
+        """
+
+        if accepted is not True:
+            raise ValidationError("verified attempt finalization requires accepted=True")
+        timestamp = normalize_timestamp(at or utc_now())
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"verified attempt cannot be finalized while mission is "
+                    f"{mission.state.value}: {attempt_id}"
+                )
+            self._check_expected_attempt_revision(current, expected_revision)
+            if current.status is AttemptStatus.VERIFYING:
+                self._check_attempt_fence(
+                    current,
+                    lease_owner,
+                    fencing_token,
+                    at=timestamp,
+                )
+                succeeded = self._transition_attempt_in_transaction(
+                    current,
+                    AttemptStatus.SUCCEEDED,
+                    at=timestamp,
+                    expected_revision=current.revision,
+                    result_summary=(
+                        current.result_summary
+                        if result_summary is None
+                        else result_summary
+                    ),
+                    total_tokens=(
+                        current.total_tokens if total_tokens is None else total_tokens
+                    ),
+                    estimated_cost_usd=(
+                        current.estimated_cost_usd
+                        if estimated_cost_usd is None
+                        else estimated_cost_usd
+                    ),
+                    latency_ms=current.latency_ms if latency_ms is None else latency_ms,
+                    accepted=True,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    finished_at=timestamp,
+                )
+            elif current.status is AttemptStatus.SUCCEEDED:
+                succeeded = current
+            else:
+                raise InvalidTransitionError(
+                    f"only verifying or already succeeded attempts can be finalized: "
+                    f"{attempt_id}"
+                )
+
+            task = self.store.require_task(succeeded.task_id)
+            if task.mission_id != succeeded.mission_id:
+                raise ConflictError("attempt task belongs to another mission")
+            if expected_task_revision is not None:
+                if (
+                    isinstance(expected_task_revision, bool)
+                    or not isinstance(expected_task_revision, int)
+                    or expected_task_revision < 0
+                ):
+                    raise ValidationError(
+                        "expected_task_revision must be a non-negative integer"
+                    )
+                if expected_task_revision != task.revision:
+                    raise ConflictError(
+                        f"stale task revision for {task.task_id}: expected "
+                        f"{expected_task_revision}, current {task.revision}"
+                    )
+            if not self._has_verified_evidence_for_task(task):
+                raise ConflictError(
+                    f"task {task.task_id} cannot complete without verified evidence"
+                )
+            if task.state is TaskStatus.IN_PROGRESS:
+                task = self._transition_task_in_transaction(
+                    task,
+                    TaskStatus.VERIFYING,
+                    at=timestamp,
+                )
+            if task.state is TaskStatus.VERIFYING:
+                task = self._transition_task_in_transaction(
+                    task,
+                    TaskStatus.COMPLETED,
+                    at=timestamp,
+                )
+            elif task.state is not TaskStatus.COMPLETED:
+                raise ConflictError(
+                    f"task {task.task_id} is not ready for verified finalization: "
+                    f"{task.state.value}"
+                )
+            self._refresh_task_states_in_transaction(
+                task.mission_id,
+                at=timestamp,
+            )
+
+            self._ensure_task_completion_checkpoint_in_transaction(
+                task,
+                checkpoint_id=checkpoint_id,
+                summary=checkpoint_summary,
+                at=timestamp,
+            )
+            return self.store.require_attempt(succeeded.attempt_id)
+
+    finalize_attempt = finalize_verified_attempt
+    complete_verified_attempt = finalize_verified_attempt
+    finalize_task_attempt = finalize_verified_attempt
+    finalize_attempt_after_verification = finalize_verified_attempt
+
     def fail_attempt(
         self,
         attempt_id: str,
@@ -735,6 +1078,15 @@ class MissionService:
         timestamp = normalize_timestamp(at or utc_now())
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"attempt cannot fail while mission is "
+                    f"{mission.state.value}: {attempt_id}"
+                )
             if current.status not in {
                 AttemptStatus.RUNNING,
                 AttemptStatus.VERIFYING,
@@ -742,18 +1094,11 @@ class MissionService:
                 raise InvalidTransitionError(
                     f"only running or verifying attempts can fail: {attempt_id}"
                 )
-            if current.status is AttemptStatus.RUNNING and not current.has_active_lease(
-                timestamp
-            ):
-                raise ConflictError(
-                    f"attempt lease is no longer active: {current.attempt_id}"
-                )
             self._check_attempt_fence(
                 current,
                 lease_owner,
                 fencing_token,
                 at=timestamp,
-                require_active_lease=current.status is AttemptStatus.RUNNING,
             )
             return self._transition_attempt_in_transaction(
                 current,
@@ -802,13 +1147,25 @@ class MissionService:
         summary = error_summary if error_summary is not None else reason
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
-            self._check_attempt_fence(
-                current,
-                lease_owner,
-                fencing_token,
-                at=timestamp,
-                require_active_lease=current.status is AttemptStatus.RUNNING,
-            )
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"attempt cannot be interrupted while mission is "
+                    f"{mission.state.value}: {attempt_id}"
+                )
+            if current.status in {
+                AttemptStatus.RUNNING,
+                AttemptStatus.VERIFYING,
+            }:
+                self._check_attempt_fence(
+                    current,
+                    lease_owner,
+                    fencing_token,
+                    at=timestamp,
+                )
             return self._transition_attempt_in_transaction(
                 current,
                 AttemptStatus.INTERRUPTED,
@@ -840,6 +1197,15 @@ class MissionService:
         summary = error_summary if error_summary is not None else reason
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if mission.state not in {
+                MissionState.ACTIVE,
+                MissionState.VERIFYING,
+            }:
+                raise ConflictError(
+                    f"expired attempt cannot be reconciled while mission is "
+                    f"{mission.state.value}: {attempt_id}"
+                )
             self._check_expected_attempt_revision(current, expected_revision)
             if current.status not in {
                 AttemptStatus.RUNNING,
@@ -853,13 +1219,10 @@ class MissionService:
                 raise ConflictError(f"running attempt has no lease expiry: {attempt_id}")
             if current.lease_expires_at > timestamp:
                 raise ConflictError(f"attempt lease is still active: {attempt_id}")
-            self._check_attempt_fence(
-                current,
-                lease_owner,
-                fencing_token,
-                at=timestamp,
-                require_active_lease=False,
-            )
+            if lease_owner is not None or fencing_token is not None:
+                self._check_expired_attempt_fence(
+                    current, lease_owner, fencing_token, at=timestamp
+                )
             return self._transition_attempt_in_transaction(
                 current,
                 AttemptStatus.UNKNOWN,
@@ -897,13 +1260,13 @@ class MissionService:
             raise ValidationError("reconcile_unknown requires a target status")
         target_status = _coerce_attempt_status(target_value)
         allowed = {
-            AttemptStatus.VERIFYING,
             AttemptStatus.FAILED,
             AttemptStatus.INTERRUPTED,
         }
         if target_status not in allowed:
             raise InvalidTransitionError(
-                "unknown attempts can reconcile only to verifying, failed, or interrupted"
+                "unknown attempts can reconcile only to failed or interrupted; "
+                "verifier resume requires a new fenced claim"
             )
         if reason is not None and error_summary is not None and reason != error_summary:
             raise ValidationError("reason and error_summary must match when both given")
@@ -1083,6 +1446,13 @@ class MissionService:
                     raise ConflictError(
                         f"task {task_id} cannot complete without verified evidence"
                     )
+            if target_status is TaskStatus.CANCELLED:
+                self._invalidate_live_attempts_in_transaction(
+                    current.mission_id,
+                    task_id=current.task_id,
+                    at=timestamp,
+                    reason="Task was cancelled before this attempt completed.",
+                )
             updated = self._transition_task_in_transaction(
                 current,
                 target_status,
@@ -1750,63 +2120,100 @@ class MissionService:
         spent_cents: int = 0,
         used_at: datetime | None = None,
     ) -> PermissionGrant:
-        """Authorize and record one action against an exact permission grant."""
+        """Authorize one exact action through the batch authorization path."""
 
-        action_value = _coerce_permission_action(action)
-        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-            raise ValidationError("idempotency_key must be a non-empty string")
+        request = AuthorizationRequest(
+            mission_id=mission_id,
+            grant_id=grant_id,
+            action=_coerce_permission_action(action),
+            resource=resource,
+            action_count=action_count,
+            spent_cents=spent_cents,
+            idempotency_key=idempotency_key,
+        )
+        return self.authorize_actions((request,), used_at=used_at)[0]
+
+    def preflight_authorizations(
+        self,
+        requests: Iterable[AuthorizationRequest] | AuthorizationRequest,
+        *,
+        at: datetime | None = None,
+    ) -> tuple[PermissionGrant, ...]:
+        """Read-only validate a batch of exact authority requests.
+
+        A persisted use is accepted only when every immutable request field
+        matches.  Such a replay is considered authorized even when its
+        approve-once grant is now consumed; no database row or counter is
+        changed by this method.
+        """
+
+        normalized = self._normalize_authorization_requests(requests)
+        timestamp = normalize_timestamp(at or utc_now())
+        with self.store.transaction():
+            grants, _ = self._preflight_authorizations_in_transaction(
+                normalized, at=timestamp
+            )
+            return grants
+
+    # Singular and permission-oriented aliases keep the read-only operation
+    # discoverable without introducing multiple implementations.
+    preflight_authorization = preflight_authorizations
+    preflight_authorize = preflight_authorizations
+    preflight_permission_batch = preflight_authorizations
+    preflight_authorization_batch = preflight_authorizations
+
+    def authorize_actions(
+        self,
+        requests: Iterable[AuthorizationRequest] | AuthorizationRequest,
+        *,
+        used_at: datetime | None = None,
+    ) -> tuple[PermissionGrant, ...]:
+        """Atomically authorize every request in one immediate transaction.
+
+        The preflight phase performs all validation and capacity simulation
+        before the first use or counter mutation.  A failure therefore rolls
+        back the whole batch rather than leaving a partially authorized set.
+        Exact persisted replays do not create a second use, event, or counter
+        mutation.
+        """
+
+        normalized = self._normalize_authorization_requests(requests)
         timestamp = normalize_timestamp(used_at or utc_now())
         with self.store.transaction(immediate=True):
-            mission = self._require_owned_mission(mission_id)
-            if mission.state is not MissionState.ACTIVE:
-                raise PermissionUnavailableError(
-                    f"mission is not active: {mission_id}"
+            _, new_requests = self._preflight_authorizations_in_transaction(
+                normalized, at=timestamp
+            )
+            for request in new_requests:
+                grant = self.store.apply_authorization_request(
+                    request, used_at=timestamp
                 )
-            existing = self.store.get_permission_grant(grant_id)
-            if existing is None:
-                raise NotFoundError(f"permission grant not found: {grant_id}")
-            if existing.mission_id != mission_id:
-                raise ConflictError("permission grant belongs to another mission")
-            if existing.action != action_value:
-                raise ConflictError("permission grant action does not match request")
-            if existing.resource != resource:
-                raise ConflictError(
-                    "permission grant resource does not match request"
-                )
-            try:
-                grant = self.store.use_permission(
-                    grant_id,
-                    idempotency_key=idempotency_key,
-                    action_count=action_count,
-                    spent_cents=spent_cents,
+                if grant is None:
+                    # This should be unreachable after the locked preflight,
+                    # but retaining the guard keeps the operation atomic if a
+                    # lower-level grant predicate changes.
+                    raise PermissionUnavailableError(
+                        f"permission grant is not available: {request.grant_id}"
+                    )
+                self._record_permission_use_event(
+                    grant,
+                    action_count=request.action_count,
+                    spent_cents=request.spent_cents,
                     used_at=timestamp,
                 )
-            except ConflictError:
-                prior_use = self.store.connection.execute(
-                    """
-                    SELECT grant_id
-                    FROM permission_uses
-                    WHERE idempotency_key = ?
-                    """,
-                    (idempotency_key,),
-                ).fetchone()
-                if prior_use is None or prior_use["grant_id"] != grant_id:
-                    raise
-                grant = self.store.get_permission_grant(grant_id)
+            result: list[PermissionGrant] = []
+            for request in normalized:
+                grant = self.store.get_permission_grant(request.grant_id)
                 if grant is None:
-                    raise NotFoundError(f"permission grant not found: {grant_id}")
-                return grant
-            if grant is None:
-                raise PermissionUnavailableError(
-                    f"permission grant is not available: {grant_id}"
-                )
-            self._record_permission_use_event(
-                grant,
-                action_count=action_count,
-                spent_cents=spent_cents,
-                used_at=timestamp,
-            )
-            return grant
+                    raise NotFoundError(
+                        f"permission grant not found: {request.grant_id}"
+                    )
+                result.append(grant)
+            return tuple(result)
+
+    authorize_batch = authorize_actions
+    authorize_permissions = authorize_actions
+    authorize_authorization_requests = authorize_actions
+    authorize_action_batch = authorize_actions
 
     def revoke_permission(
         self,
@@ -1831,6 +2238,153 @@ class MissionService:
         return grant
 
     # Internal transaction helpers ----------------------------------------
+
+    @staticmethod
+    def _normalize_authorization_requests(
+        requests: Iterable[AuthorizationRequest] | AuthorizationRequest,
+    ) -> tuple[AuthorizationRequest, ...]:
+        if isinstance(requests, AuthorizationRequest):
+            values = (requests,)
+        else:
+            if isinstance(requests, (str, bytes)):
+                raise ValidationError(
+                    "authorization requests must contain AuthorizationRequest values"
+                )
+            try:
+                values = tuple(requests)
+            except TypeError as exc:
+                raise ValidationError(
+                    "authorization requests must contain AuthorizationRequest values"
+                ) from exc
+        if not values:
+            raise ValidationError("authorization request batch cannot be empty")
+        if any(not isinstance(value, AuthorizationRequest) for value in values):
+            raise ValidationError(
+                "authorization requests must contain AuthorizationRequest values"
+            )
+        return values
+
+    def _preflight_authorizations_in_transaction(
+        self,
+        requests: tuple[AuthorizationRequest, ...],
+        *,
+        at: datetime,
+    ) -> tuple[tuple[PermissionGrant, ...], tuple[AuthorizationRequest, ...]]:
+        """Validate a batch without writing and return grants plus new uses."""
+
+        grants: list[PermissionGrant] = []
+        new_requests: list[AuthorizationRequest] = []
+        seen_requests: dict[str, AuthorizationRequest] = {}
+        pending_actions: dict[str, int] = {}
+        pending_spend: dict[str, int] = {}
+
+        # All reads happen before ``authorize_actions`` invokes the first
+        # mutating store method.  The enclosing transaction gives this pass a
+        # stable view even when multiple requests target the same grant.
+        for request in requests:
+            prior_request = seen_requests.get(request.idempotency_key)
+            if prior_request is not None:
+                if prior_request != request:
+                    raise ConflictError(
+                        "idempotency key is already bound to a different "
+                        "authorization request"
+                    )
+                persisted = self.store.get_permission_use(request.idempotency_key)
+                if persisted is None:
+                    # The first identical request in this same batch owns the
+                    # single new use; the duplicate is an exact in-batch
+                    # replay and must not consume capacity twice.
+                    grant = self.store.get_permission_grant(request.grant_id)
+                    if grant is None:
+                        raise NotFoundError(
+                            f"permission grant not found: {request.grant_id}"
+                        )
+                    grants.append(grant)
+                    continue
+                self._ensure_exact_permission_replay(request, persisted)
+                grant = self.store.get_permission_grant(request.grant_id)
+                if grant is None:
+                    raise NotFoundError(
+                        f"permission grant not found: {request.grant_id}"
+                    )
+                grants.append(grant)
+                continue
+            seen_requests[request.idempotency_key] = request
+
+            mission = self._require_owned_mission(request.mission_id)
+            if mission.state is not MissionState.ACTIVE:
+                raise PermissionUnavailableError(
+                    f"mission is not active: {request.mission_id}"
+                )
+            grant = self.store.get_permission_grant(request.grant_id)
+            if grant is None:
+                raise NotFoundError(f"permission grant not found: {request.grant_id}")
+            if grant.mission_id != request.mission_id:
+                raise ConflictError("permission grant belongs to another mission")
+            if grant.action != request.action:
+                raise ConflictError("permission grant action does not match request")
+            if grant.resource != request.resource:
+                raise ConflictError("permission grant resource does not match request")
+
+            persisted = self.store.get_permission_use(request.idempotency_key)
+            if persisted is not None:
+                self._ensure_exact_permission_replay(request, persisted)
+                grants.append(grant)
+                continue
+
+            previous_actions = pending_actions.get(request.grant_id, 0)
+            previous_spend = pending_spend.get(request.grant_id, 0)
+            if not grant.is_active(at):
+                raise PermissionUnavailableError(
+                    f"permission grant is not available: {request.grant_id}"
+                )
+            if (
+                grant.mode is PermissionMode.APPROVE_ONCE
+                and request.action_count != 1
+            ):
+                raise ValidationError("approve-once grants permit exactly one action")
+            if (
+                grant.mode is PermissionMode.APPROVE_ONCE
+                and previous_actions > 0
+            ):
+                raise PermissionUnavailableError(
+                    f"approve-once permission grant is already used in this batch: "
+                    f"{request.grant_id}"
+                )
+            total_actions = previous_actions + request.action_count
+            total_spend = previous_spend + request.spent_cents
+            if (
+                grant.max_actions is not None
+                and grant.actions_used + total_actions > grant.max_actions
+            ):
+                raise PermissionUnavailableError(
+                    f"permission grant action limit exceeded: {request.grant_id}"
+                )
+            if (
+                grant.budget_limit_cents is not None
+                and grant.spent_cents + total_spend > grant.budget_limit_cents
+            ):
+                raise PermissionUnavailableError(
+                    f"permission grant budget exceeded: {request.grant_id}"
+                )
+            pending_actions[request.grant_id] = total_actions
+            pending_spend[request.grant_id] = total_spend
+            new_requests.append(request)
+            grants.append(grant)
+
+        return tuple(grants), tuple(new_requests)
+
+    @staticmethod
+    def _ensure_exact_permission_replay(
+        request: AuthorizationRequest,
+        persisted: object,
+    ) -> None:
+        prior_request = getattr(persisted, "authorization_request", None)
+        if prior_request != request:
+            raise ConflictError(
+                "idempotency key is already bound to a different "
+                "authorization request"
+            )
 
     def _record_permission_use_event(
         self,
@@ -1990,10 +2544,7 @@ class MissionService:
         fencing_token: int | None,
         *,
         at: datetime,
-        require_active_lease: bool,
     ) -> None:
-        if lease_owner is None and fencing_token is None:
-            return
         if lease_owner is None or fencing_token is None:
             raise ValidationError(
                 "lease_owner and fencing_token must be provided together"
@@ -2004,8 +2555,38 @@ class MissionService:
             raise ConflictError(
                 f"attempt fence does not match current lease: {current.attempt_id}"
             )
-        if require_active_lease and not current.has_active_lease(at):
+        if not current.has_active_lease(at):
             raise ConflictError(f"attempt lease is no longer active: {current.attempt_id}")
+
+    @classmethod
+    def _check_expired_attempt_fence(
+        cls,
+        current: TaskAttempt,
+        lease_owner: str | None,
+        fencing_token: int | None,
+        *,
+        at: datetime,
+    ) -> None:
+        """Validate an optional fence supplied to the system expiry path.
+
+        Expiry is the one control-plane transition that intentionally occurs
+        after a lease has elapsed: it converts the stale worker's outcome to
+        UNKNOWN and clears that fence.  A caller that supplies a fence must
+        still identify the exact expired lease.
+        """
+
+        if lease_owner is None or fencing_token is None:
+            raise ValidationError(
+                "lease_owner and fencing_token must be provided together"
+            )
+        owner = cls._validate_lease_owner(lease_owner)
+        token = cls._validate_fencing_token(fencing_token)
+        if current.lease_owner != owner or current.fencing_token != token:
+            raise ConflictError(
+                f"attempt fence does not match current lease: {current.attempt_id}"
+            )
+        if current.lease_expires_at is None or current.lease_expires_at > at:
+            raise ConflictError(f"attempt lease is still active: {current.attempt_id}")
 
     def _require_owned_attempt(self, attempt_id: str) -> TaskAttempt:
         attempt = self.store.require_attempt(attempt_id)
@@ -2037,6 +2618,17 @@ class MissionService:
             failure_reason = reason
         elif target is MissionState.STOPPED:
             stop_reason = reason
+        if target in {
+            MissionState.WAITING_FOR_USER,
+            MissionState.STOPPED,
+            MissionState.FAILED,
+            MissionState.COMPLETED,
+        }:
+            self._invalidate_live_attempts_in_transaction(
+                current.mission_id,
+                at=at,
+                reason=reason,
+            )
         updated = self.store.update_mission(
             replace(
                 current,
@@ -2061,6 +2653,211 @@ class MissionService:
             created_at=at,
         )
         return updated
+
+    def _invalidate_live_attempts_in_transaction(
+        self,
+        mission_id: str,
+        *,
+        task_id: str | None = None,
+        at: datetime,
+        reason: str | None = None,
+    ) -> None:
+        """Terminalize live attempts before a mission leaves active work.
+
+        Incrementing the fencing token as well as clearing the lease makes the
+        invalidation explicit for durable readers.  Terminalizing CREATED and
+        UNKNOWN attempts also prevents a worker from claiming a fence after a
+        stop/wait decision has committed.
+        """
+
+        attempts = self.store.list_attempts(mission_id, task_id)
+        summary = reason or "Mission work was invalidated before this attempt completed."
+        for attempt in attempts:
+            if not attempt.is_live:
+                continue
+            self._transition_attempt_in_transaction(
+                attempt,
+                AttemptStatus.INTERRUPTED,
+                at=at,
+                expected_revision=attempt.revision,
+                error_summary=attempt.error_summary or summary,
+                accepted=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                fencing_token=attempt.fencing_token + 1,
+                finished_at=at,
+            )
+
+    def _ensure_task_completion_checkpoint_in_transaction(
+        self,
+        task: Task,
+        *,
+        checkpoint_id: str | None,
+        summary: str,
+        at: datetime,
+    ) -> Checkpoint:
+        """Record one deterministic checkpoint for a completed task."""
+
+        deterministic_id = checkpoint_id or f"checkpoint:task:{task.task_id}:completed"
+        existing = next(
+            (
+                checkpoint
+                for checkpoint in self.store.list_checkpoints(task.mission_id)
+                if checkpoint.checkpoint_id == deterministic_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if (
+                existing.task_id != task.task_id
+                or existing.kind is not CheckpointType.FIRST_USABLE_SLICE
+                or existing.summary != summary
+            ):
+                raise ConflictError(
+                    f"task completion checkpoint conflicts with existing record: "
+                    f"{deterministic_id}"
+                )
+            return existing
+        checkpoint = Checkpoint(
+            checkpoint_id=deterministic_id,
+            mission_id=task.mission_id,
+            task_id=task.task_id,
+            kind=CheckpointType.FIRST_USABLE_SLICE,
+            summary=summary,
+            created_at=at,
+        )
+        self.store.create_checkpoint(checkpoint)
+        self._record_event(
+            mission_id=task.mission_id,
+            event_type=EventType.CHECKPOINT_RECORDED,
+            entity_id=checkpoint.checkpoint_id,
+            payload={"kind": checkpoint.kind.value, "task_id": task.task_id},
+            created_at=at,
+        )
+        return checkpoint
+
+    def _ensure_mission_completion_evidence_in_transaction(
+        self,
+        mission_id: str,
+        *,
+        at: datetime,
+    ) -> Evidence | None:
+        """Record and verify deterministic aggregate evidence for task work."""
+
+        tasks = self.store.list_tasks(mission_id)
+        if not tasks:
+            return None
+        task_evidence_ids = sorted(
+            evidence.evidence_id
+            for evidence in self.store.list_evidence(mission_id)
+            if evidence.task_id is not None and evidence.verified_at is not None
+        )
+        evidence_id = f"evidence:mission:{mission_id}:coverage"
+        locator = "verified-task-evidence://aggregate/" + ",".join(task_evidence_ids)
+        summary = "All completed tasks have independently verified evidence."
+        coverage = next(
+            (
+                evidence
+                for evidence in self.store.list_evidence(mission_id)
+                if evidence.task_id is None
+                and evidence.kind is EvidenceKind.REQUIREMENT_COVERAGE
+            ),
+            None,
+        )
+        if coverage is None:
+            conflicting = self.store.get_evidence(evidence_id)
+            if conflicting is not None:
+                raise ConflictError(
+                    "mission completion evidence ID conflicts with an existing record: "
+                    f"{evidence_id}"
+                )
+            coverage = Evidence(
+                evidence_id=evidence_id,
+                mission_id=mission_id,
+                summary=summary,
+                kind=EvidenceKind.REQUIREMENT_COVERAGE,
+                locator=locator,
+                created_at=at,
+            )
+            self.store.create_evidence(coverage)
+            self._record_event(
+                mission_id=mission_id,
+                event_type=EventType.EVIDENCE_RECORDED,
+                entity_id=coverage.evidence_id,
+                payload={"kind": coverage.kind.value},
+                created_at=at,
+            )
+        if coverage.verified_at is None:
+            coverage = replace(
+                coverage,
+                verified_at=at,
+                verification_method="kora mission finalization",
+            )
+            self.store.update_evidence(coverage)
+            self._record_event(
+                mission_id=mission_id,
+                event_type=EventType.EVIDENCE_VERIFIED,
+                entity_id=coverage.evidence_id,
+                payload={"method": coverage.verification_method},
+                created_at=at,
+            )
+        return coverage
+
+    def _ensure_mission_completion_checkpoint_in_transaction(
+        self,
+        mission_id: str,
+        *,
+        at: datetime,
+    ) -> Checkpoint:
+        """Record one deterministic aggregate checkpoint before completion."""
+
+        checkpoint_id = f"checkpoint:mission:{mission_id}:completed"
+        verified_ids = sorted(
+            evidence.evidence_id
+            for evidence in self.store.list_evidence(mission_id)
+            if evidence.verified_at is not None
+        )
+        summary = (
+            "Mission completed with verified evidence: " + ", ".join(verified_ids)
+        )
+        existing = next(
+            (
+                checkpoint
+                for checkpoint in self.store.list_checkpoints(mission_id)
+                if checkpoint.checkpoint_id == checkpoint_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if (
+                existing.task_id is not None
+                or existing.kind is not CheckpointType.MISSION_COMPLETE
+                or existing.summary != summary
+            ):
+                raise ConflictError(
+                    "mission completion checkpoint conflicts with existing record: "
+                    f"{checkpoint_id}"
+                )
+            return existing
+        checkpoint = Checkpoint(
+            checkpoint_id=checkpoint_id,
+            mission_id=mission_id,
+            kind=CheckpointType.MISSION_COMPLETE,
+            summary=summary,
+            created_at=at,
+        )
+        self.store.create_checkpoint(checkpoint)
+        self._record_event(
+            mission_id=mission_id,
+            event_type=EventType.CHECKPOINT_RECORDED,
+            entity_id=checkpoint.checkpoint_id,
+            payload={
+                "kind": checkpoint.kind.value,
+                "verified_evidence_count": len(verified_ids),
+            },
+            created_at=at,
+        )
+        return checkpoint
 
     def _transition_task_in_transaction(
         self,

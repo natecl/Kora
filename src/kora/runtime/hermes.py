@@ -25,6 +25,7 @@ from typing import Mapping
 from kora.runtime.contracts import (
     Capability,
     IsolationMode,
+    RuntimeContractError,
     RuntimeJob,
     RuntimeResult,
     RuntimeStatus,
@@ -257,6 +258,11 @@ class HermesRuntimeAdapter:
                 raise HermesRuntimeError(
                     "Mutating Hermes toolsets require cloud-sandbox isolation"
                 )
+
+        try:
+            job.validate_execution_fence()
+        except RuntimeContractError as exc:
+            raise HermesRuntimeError(str(exc)) from exc
 
         return workspace
 

@@ -7,15 +7,26 @@ surfaces.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Protocol
+
+from kora._process_local import attach as attach_process_local
+from kora._process_local import get as get_process_local
+from kora._process_local import invoke as invoke_process_local
 
 
 class RuntimeContractError(ValueError):
     """A runtime contract is missing or contains invalid Kora data."""
+
+
+class LiveFenceValidator(Protocol):
+    """Kora-owned process-local validation immediately before an effect."""
+
+    def __call__(self, ticket: "ExecutionFenceTicket") -> object: ...
 
 
 def _non_empty(value: Any, field_name: str) -> str:
@@ -32,7 +43,7 @@ def _timestamp(value: datetime, field_name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class ExecutionFenceTicket:
     """A Kora-issued lease/fence credential carried into runtime work."""
 
@@ -168,7 +179,7 @@ class RuntimeStatus(StrEnum):
     UNSTRUCTURED = "unstructured"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class RuntimeJob:
     """One task scoped to an already-approved Kora mission."""
 
@@ -184,14 +195,41 @@ class RuntimeJob:
     timeout_seconds: float = 300.0
     session_id: str | None = None
     execution_fence: ExecutionFenceTicket | None = None
+    live_fence_validator: InitVar[Callable[..., object] | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        live_fence_validator: Callable[..., object] | None,
+    ) -> None:
         if self.execution_fence is not None and not isinstance(
             self.execution_fence, ExecutionFenceTicket
         ):
             raise RuntimeContractError(
                 "execution_fence must be an ExecutionFenceTicket or None"
             )
+        if live_fence_validator is not None:
+            attach_process_local(self, live_fence_validator)
+        try:
+            workspace = Path(self.workspace).expanduser()
+            if workspace.exists():
+                object.__setattr__(
+                    self,
+                    "workspace",
+                    workspace.resolve(strict=True),
+                )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # The adapter owns the final error for a missing/non-directory
+            # workspace.  Existing directories are bound to their real target
+            # here so a later alias retarget cannot redirect this job.
+            pass
+        if isinstance(self.timeout_seconds, bool) or not isinstance(
+            self.timeout_seconds, (int, float)
+        ):
+            raise RuntimeContractError("timeout_seconds must be a positive number")
+        timeout_seconds = float(self.timeout_seconds)
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise RuntimeContractError("timeout_seconds must be a positive number")
+        object.__setattr__(self, "timeout_seconds", timeout_seconds)
 
     @property
     def fence_ticket(self) -> ExecutionFenceTicket | None:
@@ -240,14 +278,46 @@ class RuntimeJob:
                     "effect-bearing runtime jobs require a Kora execution fence"
                 )
             return None
-        return self.execution_fence.validate(
+        ticket = self.execution_fence.validate(
             attempt_id=attempt_id,
             cancellation_identity=cancellation_identity,
             at=at,
         )
+        callback = get_process_local(self)
+        if callback is None:
+            # MissionService-issued tickets carry the Kora-owned validator in
+            # the same process-local channel.  This keeps direct adapter use
+            # fail-closed without putting a controller or database handle in
+            # the public ticket representation.
+            callback = get_process_local(ticket)
+        if callback is not None:
+            try:
+                result = invoke_process_local(callback, ticket)
+            except Exception as exc:  # noqa: BLE001 - preserve the boundary error
+                if isinstance(exc, RuntimeContractError):
+                    raise
+                raise RuntimeContractError(
+                    "live Kora execution fence validation failed"
+                ) from exc
+            if result is False:
+                raise RuntimeContractError(
+                    "live Kora execution fence validation was rejected"
+                )
+        return ticket
 
     validate_fence = validate_execution_fence
     validate_for_execution = validate_execution_fence
+
+
+def _runtime_job_live_fence_validator(
+    job: RuntimeJob,
+) -> Callable[..., object] | None:
+    """Expose the process-local hook without adding a dataclass field."""
+
+    return get_process_local(job)
+
+
+RuntimeJob.live_fence_validator = property(_runtime_job_live_fence_validator)
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +333,38 @@ class RuntimeResult:
     total_tokens: int | None = None
     estimated_cost_usd: float | None = None
     session_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, RuntimeStatus):
+            try:
+                object.__setattr__(self, "status", RuntimeStatus(self.status))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeContractError("status must be a RuntimeStatus") from exc
+        if not isinstance(self.response, str):
+            raise RuntimeContractError("response must be a string")
+        if isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int):
+            raise RuntimeContractError("exit_code must be an integer")
+        for field_name in ("api_calls", "total_tokens"):
+            value = getattr(self, field_name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise RuntimeContractError(
+                    f"{field_name} must be a non-negative integer or None"
+                )
+        if self.estimated_cost_usd is not None:
+            if isinstance(self.estimated_cost_usd, bool) or not isinstance(
+                self.estimated_cost_usd, (int, float)
+            ):
+                raise RuntimeContractError(
+                    "estimated_cost_usd must be a finite non-negative number or None"
+                )
+            cost = float(self.estimated_cost_usd)
+            if not isfinite(cost) or cost < 0:
+                raise RuntimeContractError(
+                    "estimated_cost_usd must be a finite non-negative number or None"
+                )
+            object.__setattr__(self, "estimated_cost_usd", cost)
 
     @property
     def completed(self) -> bool:

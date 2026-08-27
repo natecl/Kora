@@ -163,6 +163,18 @@ class HermesRuntimeAdapter:
                 command.extend(["-s", ",".join(job.skills)])
 
             environment = self._build_environment()
+            # This is deliberately adjacent to the subprocess launch.  The
+            # earlier validation protects setup, while this check closes the
+            # stop/wait and lease-expiry window immediately before Hermes can
+            # create effects.
+            try:
+                job.validate_execution_fence()
+            except Exception as exc:  # noqa: BLE001 - adapter boundary
+                if isinstance(exc, HermesRuntimeError):
+                    raise
+                raise HermesRuntimeError(
+                    "Kora execution fence rejected Hermes launch"
+                ) from exc
             completed = subprocess.run(
                 command,
                 cwd=workspace,
@@ -227,7 +239,10 @@ class HermesRuntimeAdapter:
         if job.timeout_seconds <= 0:
             raise HermesRuntimeError("Runtime timeout must be positive")
 
-        workspace = job.workspace.expanduser().resolve()
+        try:
+            workspace = job.workspace.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, TypeError) as exc:
+            raise HermesRuntimeError("Workspace must resolve to an existing directory") from exc
         if not workspace.is_dir():
             raise HermesRuntimeError(f"Workspace is not a directory: {workspace}")
         try:

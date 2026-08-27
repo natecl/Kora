@@ -216,7 +216,7 @@ class FinalSolReviewRegressionTests(unittest.TestCase):
         mission_id: str,
         task_id: str,
     ) -> tuple[str, Task]:
-        mission = service.create_mission(
+        service.create_mission(
             "Final Sol review mission",
             "Complete the approved execution slice.",
             "The changed workspace is independently verified.",
@@ -923,30 +923,28 @@ print('KORA_TASK_COMPLETE')
                 writes=(("must-not-be-written.txt", "blocked\n"),)
             )
             verifier = FencedCommandVerifier(service, runtime, mission_id)
-            spec = self._spec(
-                task,
-                workspace,
-                capabilities=frozenset(
-                    {Capability.WORKSPACE_WRITE, Capability.WORKSPACE_EXECUTE}
-                ),
-                permissions=(
-                    PermissionRequirement(
-                        "wrong-write-grant",
-                        PermissionAction.WRITE_WORKSPACE,
-                        resource,
+            with self.assertRaises(ExecutionValidationError):
+                self._spec(
+                    task,
+                    workspace,
+                    capabilities=frozenset(
+                        {Capability.WORKSPACE_WRITE, Capability.WORKSPACE_EXECUTE}
                     ),
-                    PermissionRequirement(
-                        "wrong-execute-grant",
-                        PermissionAction.EXECUTE_WORKSPACE,
-                        wrong_resource,
+                    permissions=(
+                        PermissionRequirement(
+                            "wrong-write-grant",
+                            PermissionAction.WRITE_WORKSPACE,
+                            resource,
+                        ),
+                        PermissionRequirement(
+                            "wrong-execute-grant",
+                            PermissionAction.EXECUTE_WORKSPACE,
+                            wrong_resource,
+                        ),
                     ),
-                ),
-                commands=commands,
-            )
-            result = self._coordinator(
-                service, task, spec, runtime, verifier
-            ).run_once(mission_id)
-            self.assertEqual(result.status, CoordinatorStatus.WAITING_FOR_USER)
+                    commands=commands,
+                )
+            self.assertEqual(service.store.list_attempts(mission_id), [])
             self.assertEqual(runtime.calls, [])
             self.assertEqual(verifier.command_calls, 0)
             self.assertEqual(self._permission_uses(service), [])

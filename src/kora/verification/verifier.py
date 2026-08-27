@@ -10,19 +10,23 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import subprocess
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
-from typing import BinaryIO, Mapping
+from typing import Any, BinaryIO, Callable, Mapping
 from urllib.parse import quote
 
 from kora.mission.domain import ArtifactKind, EvidenceKind
 from kora.mission.errors import ValidationError
+from kora._process_local import attach as attach_process_local
+from kora._process_local import get as get_process_local
+from kora._process_local import invoke_noarg as invoke_process_local_noarg
 
 
 class WorkspaceVerificationError(ValidationError):
@@ -45,6 +49,8 @@ _SUMMARY_LIMIT = 4000
 _COMMAND_CAPTURE_LIMIT = 4096
 _PIPE_READ_SIZE = 16 * 1024
 _GIT_TIMEOUT_SECONDS = 30.0
+_GIT_CAPTURE_LIMIT = 4096
+_UNTRACKED_PATH_CAPTURE_LIMIT = 1024 * 1024
 
 
 def _non_empty_string(value: object, field_name: str) -> str:
@@ -199,7 +205,7 @@ class VerificationArtifact:
         object.__setattr__(self, "summary", _sanitize_summary(summary))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class WorkspaceVerificationRequest:
     """The immutable input to one independent workspace verification."""
 
@@ -207,12 +213,29 @@ class WorkspaceVerificationRequest:
     commands: tuple[VerificationCommand, ...]
     require_changes: bool = True
     baseline_ref: str = "HEAD"
+    # These authority fields are populated by ExecutionCoordinator.  The
+    # unmarked legacy mode keeps direct read-only verifier callers source
+    # compatible; production coordinator requests set the required flag.
+    execution_authorized: bool | None = None
+    execution_capability: bool | None = None
+    execution_granted: bool | None = None
+    require_execution_authority: bool = False
+    live_fence_validator: InitVar[Callable[..., object] | None] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        live_fence_validator: Callable[..., object] | None,
+    ) -> None:
         try:
-            workspace = Path(self.workspace)
-        except TypeError as exc:
-            raise WorkspaceVerificationError("workspace must be a path") from exc
+            workspace = Path(self.workspace).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise WorkspaceVerificationError(
+                "workspace must resolve to an existing directory"
+            ) from exc
+        if not workspace.is_dir():
+            raise WorkspaceVerificationError(
+                f"workspace is not a directory: {workspace}"
+            )
         object.__setattr__(self, "workspace", workspace)
 
         if isinstance(self.commands, (str, bytes)):
@@ -238,6 +261,46 @@ class WorkspaceVerificationRequest:
             "baseline_ref",
             _non_empty_string(self.baseline_ref, "baseline_ref"),
         )
+        for field_name in (
+            "execution_authorized",
+            "execution_capability",
+            "execution_granted",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, bool):
+                raise WorkspaceVerificationError(
+                    f"{field_name} must be a boolean or None"
+                )
+        if not isinstance(self.require_execution_authority, bool):
+            raise WorkspaceVerificationError(
+                "require_execution_authority must be a boolean"
+            )
+        if live_fence_validator is not None:
+            attach_process_local(self, live_fence_validator)
+
+    @property
+    def authority_is_explicit(self) -> bool:
+        return self.require_execution_authority or any(
+            value is not None
+            for value in (
+                self.execution_authorized,
+                self.execution_capability,
+                self.execution_granted,
+            )
+        )
+
+
+def _verification_request_live_fence_validator(
+    request: WorkspaceVerificationRequest,
+) -> Callable[..., object] | None:
+    """Expose the process-local hook without adding a dataclass field."""
+
+    return get_process_local(request)
+
+
+WorkspaceVerificationRequest.live_fence_validator = property(
+    _verification_request_live_fence_validator
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,12 +359,23 @@ class _ProcessResult:
     error: str | None = None
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    stdout_bytes: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceSnapshot:
+    """Bounded digest of one workspace state at one exact observation point."""
+
+    fingerprint: str
+    has_changes: bool
+    relative_workspace: Path
 
 
 def _read_pipe(
     stream: BinaryIO,
     capture: _PipeCapture,
     limit: int | None,
+    stream_digest: Any = None,
 ) -> None:
     """Drain a child pipe while retaining no more than the requested bytes."""
 
@@ -310,6 +384,8 @@ def _read_pipe(
             chunk = stream.read(_PIPE_READ_SIZE)
             if not chunk:
                 return
+            if stream_digest is not None:
+                stream_digest.update(chunk)
             if limit is None:
                 capture.data.extend(chunk)
                 continue
@@ -360,6 +436,9 @@ class WorkspaceVerifier:
             if key in os.environ
         }
         environment.update(self.environment)
+        # Verification must not leave interpreter bytecode or other implicit
+        # files that would invalidate the post-command immutable snapshot.
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         return environment
 
     def verify(self, request: WorkspaceVerificationRequest) -> WorkspaceVerificationResult:
@@ -372,59 +451,51 @@ class WorkspaceVerifier:
 
         workspace, relative_workspace = self._validate_workspace(request.workspace)
         environment = self._build_environment()
+        live_fence_validator = request.live_fence_validator
 
-        status_result = self._run_process(
-            ("git", "status", "--porcelain=v1"),
-            workspace=workspace,
-            environment=environment,
-            timeout_seconds=_GIT_TIMEOUT_SECONDS,
-            stdout_limit=None,
-            stderr_limit=_COMMAND_CAPTURE_LIMIT,
-        )
-        diff_result = self._run_process(
-            ("git", "diff", "--no-ext-diff", "--binary", request.baseline_ref, "--"),
-            workspace=workspace,
-            environment=environment,
-            timeout_seconds=_GIT_TIMEOUT_SECONDS,
-            stdout_limit=None,
-            stderr_limit=_COMMAND_CAPTURE_LIMIT,
-        )
+        if request.authority_is_explicit:
+            if (
+                request.execution_authorized is not True
+                or live_fence_validator is None
+            ):
+                return self._authority_rejection()
+            if request.commands and (
+                request.execution_capability is not True
+                or request.execution_granted is not True
+            ):
+                return self._authority_rejection()
+        try:
+            self._validate_live_fence(live_fence_validator)
+        except WorkspaceVerificationError:
+            return self._authority_rejection()
 
-        git_status_ok = status_result.exit_code == 0 and not status_result.timed_out
-        git_diff_ok = diff_result.exit_code == 0 and not diff_result.timed_out
-        if not git_status_ok or not git_diff_ok:
-            failed_git = (
-                ("git status", status_result)
-                if not git_status_ok
-                else ("git diff", diff_result)
-            )
-            name, failed_result = failed_git
+        pre_snapshot, snapshot_error = self._capture_snapshot(
+            workspace,
+            relative_workspace,
+            request.baseline_ref,
+            environment,
+            live_fence_validator,
+        )
+        if pre_snapshot is None:
             return WorkspaceVerificationResult(
                 accepted=False,
                 summary=(
                     "Candidate verification rejected: "
-                    f"{name} failed ({self._process_failure_detail(failed_result)})."
+                    + (snapshot_error or "workspace snapshot failed safely.")
                 ),
                 change_fingerprint=None,
                 checks=(),
                 artifacts=(),
             )
 
-        status = status_result.stdout
-        diff = diff_result.stdout
-        change_fingerprint = hashlib.sha256(
-            status.encode("utf-8") + b"\n" + diff.encode("utf-8")
-        ).hexdigest()
-        has_changes = bool(status)
-
-        if request.require_changes and not has_changes:
+        if request.require_changes and not pre_snapshot.has_changes:
             return WorkspaceVerificationResult(
                 accepted=False,
                 summary=(
                     "Candidate verification rejected: "
                     "workspace has no changes relative to the baseline."
                 ),
-                change_fingerprint=change_fingerprint,
+                change_fingerprint=pre_snapshot.fingerprint,
                 checks=(),
                 artifacts=(),
             )
@@ -438,6 +509,7 @@ class WorkspaceVerifier:
                 timeout_seconds=command.timeout_seconds,
                 stdout_limit=_COMMAND_CAPTURE_LIMIT,
                 stderr_limit=_COMMAND_CAPTURE_LIMIT,
+                live_fence_validator=live_fence_validator,
             )
             passed = process_result.exit_code == 0 and not process_result.timed_out
             check = VerificationCheckResult(
@@ -453,6 +525,41 @@ class WorkspaceVerifier:
 
         checks = tuple(check for _, check in executed)
         all_checks_passed = all(check.passed for check in checks)
+
+        post_snapshot, post_error = self._capture_snapshot(
+            workspace,
+            relative_workspace,
+            request.baseline_ref,
+            environment,
+            live_fence_validator,
+        )
+        if post_snapshot is None:
+            return WorkspaceVerificationResult(
+                accepted=False,
+                summary=(
+                    "Candidate verification rejected: "
+                    + (post_error or "post-command workspace snapshot failed safely.")
+                ),
+                change_fingerprint=None,
+                checks=checks,
+                artifacts=(),
+            )
+        if post_snapshot != pre_snapshot:
+            return WorkspaceVerificationResult(
+                accepted=False,
+                summary=(
+                    "Candidate verification rejected: verification commands "
+                    "mutated the workspace."
+                ),
+                change_fingerprint=post_snapshot.fingerprint,
+                checks=checks,
+                artifacts=(),
+            )
+
+        # Artifacts are constructed only from the snapshot that survived the
+        # post-command equality check.
+        change_fingerprint = post_snapshot.fingerprint
+        has_changes = post_snapshot.has_changes
         artifacts: list[VerificationArtifact] = []
         locator_path = self._locator_path(relative_workspace)
         if has_changes:
@@ -491,7 +598,7 @@ class WorkspaceVerifier:
                 )
             )
 
-        accepted = all_checks_passed
+        accepted = all_checks_passed and post_snapshot == pre_snapshot
         if accepted:
             summary = (
                 "Candidate verification accepted: git inspection and "
@@ -512,11 +619,271 @@ class WorkspaceVerifier:
             artifacts=tuple(artifacts),
         )
 
+    @staticmethod
+    def _authority_rejection() -> WorkspaceVerificationResult:
+        return WorkspaceVerificationResult(
+            accepted=False,
+            summary=(
+                "Candidate verification rejected: workspace execute authority "
+                "or the live Kora execution fence was not confirmed."
+            ),
+            change_fingerprint=None,
+            checks=(),
+            artifacts=(),
+        )
+
+    @staticmethod
+    def _validate_live_fence(
+        validator: Callable[..., object] | None,
+    ) -> None:
+        if validator is None:
+            return
+        try:
+            result = invoke_process_local_noarg(validator)
+        except Exception as exc:  # noqa: BLE001 - verifier authority boundary
+            raise WorkspaceVerificationError(
+                "live Kora execution fence validation failed"
+            ) from exc
+        if result is False:
+            raise WorkspaceVerificationError(
+                "live Kora execution fence validation was rejected"
+            )
+
+    def _capture_snapshot(
+        self,
+        workspace: Path,
+        relative_workspace: Path,
+        baseline_ref: str,
+        environment: Mapping[str, str],
+        live_fence_validator: Callable[..., object] | None,
+    ) -> tuple[_WorkspaceSnapshot | None, str | None]:
+        """Capture tracked git state and untracked content in bounded memory."""
+
+        digest = hashlib.sha256()
+        status_result = self._run_process(
+            ("git", "status", "--porcelain=v1"),
+            workspace=workspace,
+            environment=environment,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            stdout_limit=_GIT_CAPTURE_LIMIT,
+            stderr_limit=_COMMAND_CAPTURE_LIMIT,
+            stream_digest=digest,
+            live_fence_validator=live_fence_validator,
+        )
+        if not self._process_succeeded(status_result):
+            return None, (
+                "git status failed ("
+                + self._process_failure_detail(status_result)
+                + ")."
+            )
+
+        digest.update(b"\n")
+        diff_result = self._run_process(
+            ("git", "diff", "--no-ext-diff", "--binary", baseline_ref, "--"),
+            workspace=workspace,
+            environment=environment,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            stdout_limit=_GIT_CAPTURE_LIMIT,
+            stderr_limit=_COMMAND_CAPTURE_LIMIT,
+            stream_digest=digest,
+            live_fence_validator=live_fence_validator,
+        )
+        if not self._process_succeeded(diff_result):
+            return None, (
+                "git diff failed ("
+                + self._process_failure_detail(diff_result)
+                + ")."
+            )
+
+        untracked_result = self._run_process(
+            ("git", "ls-files", "--others", "--exclude-standard", "-z"),
+            workspace=workspace,
+            environment=environment,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            stdout_limit=_UNTRACKED_PATH_CAPTURE_LIMIT,
+            stderr_limit=_COMMAND_CAPTURE_LIMIT,
+            live_fence_validator=live_fence_validator,
+        )
+        if not self._process_succeeded(untracked_result):
+            return None, (
+                "git untracked-file inspection failed ("
+                + self._process_failure_detail(untracked_result)
+                + ")."
+            )
+        if untracked_result.stdout_truncated:
+            return None, "workspace contains too many untracked paths to inspect safely."
+
+        try:
+            untracked_paths = tuple(
+                sorted(
+                    {
+                        Path(os.fsdecode(path))
+                        for path in untracked_result.stdout_bytes.split(b"\0")
+                        if path
+                    },
+                    key=lambda path: path.as_posix().encode(
+                        "utf-8", errors="surrogateescape"
+                    ),
+                )
+            )
+            for path in untracked_paths:
+                self._hash_untracked_entry(digest, workspace, path)
+        except WorkspaceVerificationError as exc:
+            return None, str(exc)
+
+        return (
+            _WorkspaceSnapshot(
+                fingerprint=digest.hexdigest(),
+                has_changes=bool(status_result.stdout) or bool(untracked_paths),
+                relative_workspace=relative_workspace,
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _process_succeeded(result: _ProcessResult) -> bool:
+        return (
+            result.exit_code == 0
+            and not result.timed_out
+            and result.error is None
+        )
+
+    @staticmethod
+    def _hash_untracked_entry(
+        digest: Any,
+        workspace: Path,
+        relative_path: Path,
+    ) -> None:
+        """Hash one untracked entry without following links or buffering files."""
+
+        if (
+            relative_path.is_absolute()
+            or not relative_path.parts
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+            or relative_path.parts[0] == ".git"
+        ):
+            raise WorkspaceVerificationError(
+                "untracked path is not a safe workspace-relative entry"
+            )
+        candidate = workspace.joinpath(*relative_path.parts)
+        lexical_candidate = Path(os.path.abspath(os.fspath(candidate)))
+        try:
+            lexical_candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise WorkspaceVerificationError(
+                "untracked path escapes the canonical workspace"
+            ) from exc
+
+        # Do not follow a symlink or special entry in any parent component.
+        # The final component is inspected with lstat below so a symlink itself
+        # can be fingerprinted by its link target without dereferencing it.
+        parent = workspace
+        for part in relative_path.parts[:-1]:
+            parent = parent / part
+            try:
+                parent_stat = os.lstat(parent)
+            except OSError as exc:
+                raise WorkspaceVerificationError(
+                    "untracked workspace parent could not be inspected safely"
+                ) from exc
+            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                parent_stat.st_mode
+            ):
+                raise WorkspaceVerificationError(
+                    "untracked workspace path contains an unsafe parent entry"
+                )
+
+        try:
+            entry_stat = os.lstat(candidate)
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                "untracked workspace entry could not be inspected safely"
+            ) from exc
+
+        path_bytes = relative_path.as_posix().encode(
+            "utf-8", errors="surrogateescape"
+        )
+        mode = entry_stat.st_mode
+        digest.update(b"\0KORA-UNTRACKED\0")
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(stat.S_IFMT(mode).to_bytes(4, "big"))
+        digest.update((mode & 0o7777).to_bytes(4, "big"))
+
+        if stat.S_ISREG(mode):
+            digest.update(b"F")
+            digest.update(entry_stat.st_size.to_bytes(8, "big", signed=False))
+            flags = os.O_RDONLY
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(candidate, flags)
+            except OSError as exc:
+                raise WorkspaceVerificationError(
+                    "untracked file could not be opened without following links"
+                ) from exc
+            try:
+                opened_stat = os.fstat(descriptor)
+                if (
+                    opened_stat.st_dev != entry_stat.st_dev
+                    or opened_stat.st_ino != entry_stat.st_ino
+                    or opened_stat.st_size != entry_stat.st_size
+                    or stat.S_IFMT(opened_stat.st_mode) != stat.S_IFMT(mode)
+                    or (opened_stat.st_mode & 0o7777) != (mode & 0o7777)
+                ):
+                    raise WorkspaceVerificationError(
+                        "untracked file changed while it was being inspected"
+                    )
+                with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                    while True:
+                        chunk = stream.read(_PIPE_READ_SIZE)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    descriptor = -1
+                final_stat = os.stat(candidate, follow_symlinks=False)
+                if (
+                    final_stat.st_dev != entry_stat.st_dev
+                    or final_stat.st_ino != entry_stat.st_ino
+                    or final_stat.st_size != entry_stat.st_size
+                    or (final_stat.st_mode & 0o7777) != (mode & 0o7777)
+                ):
+                    raise WorkspaceVerificationError(
+                        "untracked file changed while it was being inspected"
+                    )
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            return
+
+        if stat.S_ISLNK(mode):
+            digest.update(b"L")
+            try:
+                target = os.readlink(os.fsencode(candidate))
+            except OSError as exc:
+                raise WorkspaceVerificationError(
+                    "untracked symlink could not be inspected safely"
+                ) from exc
+            if isinstance(target, str):
+                target = target.encode("utf-8", errors="surrogateescape")
+            digest.update(len(target).to_bytes(8, "big"))
+            digest.update(target)
+            return
+
+        if stat.S_ISDIR(mode):
+            digest.update(b"D")
+            return
+
+        raise WorkspaceVerificationError(
+            "special untracked workspace entries are not permitted"
+        )
+
     def _validate_workspace(self, workspace_value: Path) -> tuple[Path, Path]:
         try:
-            workspace = Path(workspace_value).expanduser().resolve()
-        except (TypeError, OSError) as exc:
-            raise WorkspaceVerificationError("workspace must be a path") from exc
+            workspace = Path(workspace_value).expanduser().resolve(strict=True)
+        except (TypeError, OSError, RuntimeError, ValueError) as exc:
+            raise WorkspaceVerificationError(
+                "workspace must resolve to an existing directory"
+            ) from exc
         if not workspace.is_dir():
             raise WorkspaceVerificationError(
                 f"workspace is not a directory: {workspace}"
@@ -538,9 +905,12 @@ class WorkspaceVerifier:
         timeout_seconds: float,
         stdout_limit: int | None,
         stderr_limit: int | None,
+        stream_digest: Any = None,
+        live_fence_validator: Callable[..., object] | None = None,
     ) -> _ProcessResult:
         started = time.monotonic()
         try:
+            self._validate_live_fence(live_fence_validator)
             process = subprocess.Popen(
                 list(argv),
                 cwd=workspace,
@@ -550,13 +920,14 @@ class WorkspaceVerifier:
                 stderr=subprocess.PIPE,
                 shell=False,
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, WorkspaceVerificationError) as exc:
             return _ProcessResult(
                 exit_code=None,
                 stdout="",
                 stderr="",
                 duration_ms=self._duration_ms(started),
                 error=str(exc),
+                stdout_bytes=b"",
             )
 
         stdout_capture = _PipeCapture(bytearray())
@@ -565,7 +936,7 @@ class WorkspaceVerifier:
         assert process.stderr is not None
         stdout_thread = threading.Thread(
             target=_read_pipe,
-            args=(process.stdout, stdout_capture, stdout_limit),
+            args=(process.stdout, stdout_capture, stdout_limit, stream_digest),
             daemon=True,
         )
         stderr_thread = threading.Thread(
@@ -606,15 +977,17 @@ class WorkspaceVerifier:
         stdout_thread.join(timeout=0.1)
         stderr_thread.join(timeout=0.1)
 
+        stdout_bytes = bytes(stdout_capture.data)
         return _ProcessResult(
             exit_code=exit_code,
-            stdout=bytes(stdout_capture.data).decode("utf-8", errors="replace"),
+            stdout=stdout_bytes.decode("utf-8", errors="replace"),
             stderr=bytes(stderr_capture.data).decode("utf-8", errors="replace"),
             duration_ms=self._duration_ms(started),
             timed_out=timed_out,
             error=error,
             stdout_truncated=stdout_capture.truncated,
             stderr_truncated=stderr_capture.truncated,
+            stdout_bytes=stdout_bytes,
         )
 
     @staticmethod

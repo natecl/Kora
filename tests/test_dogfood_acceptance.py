@@ -171,7 +171,7 @@ class DeterministicRuntimeAdapter:
 
     def run(self, job: RuntimeJob) -> RuntimeResult:
         self.calls.append(job)
-        if job.workspace != self.workspace:
+        if job.workspace.resolve() != self.workspace.resolve():
             raise AssertionError("runtime received an unexpected workspace")
         if job.objective != "Implement the approved waitlist MVP slice.":
             raise AssertionError("runtime received an unexpected task objective")

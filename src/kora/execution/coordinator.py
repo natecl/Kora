@@ -236,6 +236,20 @@ def _nonnegative_metric(value: Any, default: float) -> int | float:
     return default
 
 
+def _persisted_nonnegative_int(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _persisted_nonnegative_float(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        result = float(value)
+        if math.isfinite(result) and result >= 0.0:
+            return result
+    return 0.0
+
+
 def sanitize_summary(value: Any, fallback: str = "") -> str:
     """Remove control data and cap runtime-derived text before persistence."""
 
@@ -270,11 +284,43 @@ def _path(value: Any, field_name: str) -> Path:
 def _canonical_workspace(value: Any, field_name: str = "workspace") -> Path:
     raw_path = _path(value, field_name)
     try:
-        # Lexical canonicalization keeps the exact workspace authority stable
-        # across platform aliases such as macOS's /var -> /private/var link.
-        return Path(os.path.abspath(os.fspath(raw_path.expanduser())))
-    except (OSError, TypeError, ValueError) as exc:
-        raise ExecutionValidationError(f"{field_name} must be a canonical path") from exc
+        # Resolve the target once, before an attempt exists.  The resolved
+        # target—not a later alias lookup—is the authority carried through the
+        # runtime, permission batch, and verifier.
+        workspace = raw_path.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ExecutionValidationError(
+            f"{field_name} must resolve to an existing directory"
+        ) from exc
+    if not workspace.is_dir():
+        raise ExecutionValidationError(
+            f"{field_name} must resolve to an existing directory"
+        )
+    return workspace
+
+
+def _workspace_resource_matches(resource: str, workspace: Path) -> bool:
+    """Match the real target while retaining macOS's stable /var alias."""
+
+    try:
+        lexical = Path(os.path.abspath(Path(resource).expanduser()))
+    except (OSError, TypeError, ValueError):
+        return False
+    if lexical == workspace:
+        return True
+    # macOS exposes /var and /tmp as system aliases.  They are stable OS
+    # aliases, unlike a user-controlled symlink inside a workspace tree; the
+    # latter must remain an authority mismatch.
+    for alias_root in (Path("/var"), Path("/tmp")):
+        try:
+            target_root = alias_root.resolve(strict=True)
+            alias_relative = lexical.relative_to(alias_root)
+            target_relative = workspace.relative_to(target_root)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if alias_relative == target_relative:
+            return True
+    return False
 
 
 _EVIDENCE_REQUIREMENT_ALIASES: Mapping[str, str] = {
@@ -483,6 +529,21 @@ class TaskExecutionSpec:
             raise ExecutionValidationError(
                 "WORKSPACE_EXECUTE requires an exact EXECUTE_WORKSPACE permission requirement"
             )
+        if self.verification_commands:
+            if Capability.WORKSPACE_EXECUTE not in capabilities:
+                raise ExecutionValidationError(
+                    "verification_commands require WORKSPACE_EXECUTE capability"
+                )
+            if not any(
+                requirement.action is PermissionAction.EXECUTE_WORKSPACE
+                and _workspace_resource_matches(
+                    requirement.resource, self.workspace
+                )
+                for requirement in requirements
+            ):
+                raise ExecutionValidationError(
+                    "verification_commands require an exact canonical EXECUTE_WORKSPACE permission requirement"
+                )
 
 
 def _validate_spec_for_task(spec: TaskExecutionSpec, task: Task) -> None:
@@ -499,6 +560,31 @@ def _validate_spec_for_task(spec: TaskExecutionSpec, task: Task) -> None:
         raise ExecutionValidationError(
             "task execution profile objective does not match the mission task"
         )
+    if any(
+        requirement.action
+        in {
+            PermissionAction.WRITE_WORKSPACE,
+            PermissionAction.EXECUTE_WORKSPACE,
+        }
+        and not _workspace_resource_matches(requirement.resource, spec.workspace)
+        for requirement in spec.permission_requirements
+    ):
+        raise ExecutionValidationError(
+            "workspace permission resources must exactly match the canonical workspace"
+        )
+    if spec.verification_commands:
+        if Capability.WORKSPACE_EXECUTE not in spec.runtime_capabilities:
+            raise ExecutionValidationError(
+                "verification_commands require WORKSPACE_EXECUTE capability"
+            )
+        if not any(
+            requirement.action is PermissionAction.EXECUTE_WORKSPACE
+            and _workspace_resource_matches(requirement.resource, spec.workspace)
+            for requirement in spec.permission_requirements
+        ):
+            raise ExecutionValidationError(
+                "verification_commands require an exact canonical EXECUTE_WORKSPACE permission requirement"
+            )
 
 
 class TaskSpecProvider(Protocol):
@@ -934,10 +1020,26 @@ class ExecutionCoordinator:
                 attempt_id=attempt.attempt_id,
             )
 
+        verifying = [
+            attempt
+            for attempt in attempts
+            if attempt.status is AttemptStatus.VERIFYING
+            and attempt.lease_expires_at is not None
+            and attempt.lease_expires_at > now
+        ]
+        if verifying:
+            if len(verifying) > 1:
+                return self._result(
+                    mission_id,
+                    CoordinatorStatus.BUSY,
+                    "Multiple verification attempts require serialized recovery.",
+                )
+            return self._resume_verifying_attempt(mission_id, verifying[0])
+
         live = [
             attempt
             for attempt in attempts
-            if attempt.status in {AttemptStatus.RUNNING, AttemptStatus.VERIFYING}
+            if attempt.status is AttemptStatus.RUNNING
             and attempt.lease_expires_at is not None
             and attempt.lease_expires_at > now
         ]
@@ -977,6 +1079,59 @@ class ExecutionCoordinator:
                 return self._race_result(mission_id, attempt_id=attempt.attempt_id)
             return self._resume_created_attempt(mission_id, claimed)
         return None
+
+    def _resume_verifying_attempt(
+        self,
+        mission_id: str,
+        attempt: TaskAttempt,
+    ) -> CoordinatorResult | None:
+        """Resume only independent verification for a confirmed effect.
+
+        A VERIFYING attempt is never sent back through route selection or a
+        runtime adapter.  Its persisted task specification is the sole source
+        of verifier commands and workspace authority.
+        """
+
+        task = self.mission_service.get_task(attempt.task_id)
+        spec = self.task_spec_provider.get(task)
+        _validate_spec_for_task(spec, task)
+        if not self._workspace_authority_matches(spec):
+            return self._invalid_task_result(mission_id, task.task_id)
+        try:
+            _normalize_evidence_requirements(spec.profile.evidence_requirements)
+        except ExecutionValidationError:
+            return self._invalid_task_result(mission_id, task.task_id)
+
+        authorization_error = self._authorize_requirements(
+            mission_id, task.task_id, spec.permission_requirements
+        )
+        if authorization_error is not None:
+            self._interrupt_for_authorization_failure(attempt)
+            self._escalate_permission(
+                mission_id,
+                task.task_id,
+                None,
+                detail=authorization_error,
+            )
+            return self._result(
+                mission_id,
+                CoordinatorStatus.WAITING_FOR_USER,
+                "Verification is waiting for the required authority.",
+                task_id=task.task_id,
+                attempt_id=attempt.attempt_id,
+            )
+
+        return self._verify_candidate(
+            mission_id,
+            task,
+            spec,
+            attempt,
+            attempt.route_id,
+            _persisted_nonnegative_int(attempt.total_tokens),
+            _persisted_nonnegative_float(attempt.estimated_cost_usd),
+            _persisted_nonnegative_int(attempt.latency_ms),
+            resume_verifying=True,
+        )
 
     def _recover_succeeded_attempt(
         self,
@@ -1242,21 +1397,31 @@ class ExecutionCoordinator:
             mission_id, task.task_id, attempt_id=last_attempt_id
         )
 
-    @staticmethod
-    def _workspace_authority_matches(spec: TaskExecutionSpec) -> bool:
-        canonical_workspace = _canonical_workspace(spec.workspace)
+    def _workspace_authority_matches(self, spec: TaskExecutionSpec) -> bool:
+        try:
+            canonical_workspace = _canonical_workspace(spec.workspace)
+        except ExecutionValidationError:
+            return False
         if spec.workspace != canonical_workspace:
             return False
-        expected_resource = str(canonical_workspace)
-        return all(
+        if any(
             requirement.action
-            not in {
+            in {
                 PermissionAction.WRITE_WORKSPACE,
                 PermissionAction.EXECUTE_WORKSPACE,
             }
-            or requirement.resource == expected_resource
+            and not _workspace_resource_matches(requirement.resource, canonical_workspace)
             for requirement in spec.permission_requirements
-        )
+        ):
+            return False
+        cloud_root = getattr(self.workspace_verifier, "cloud_root", None)
+        if cloud_root is not None:
+            try:
+                canonical_root = Path(cloud_root).expanduser().resolve(strict=True)
+                canonical_workspace.relative_to(canonical_root)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return False
+        return True
 
     def _invalid_task_result(
         self,
@@ -1701,6 +1866,9 @@ class ExecutionCoordinator:
                 capabilities=spec.runtime_capabilities,
                 isolation=spec.isolation,
                 execution_fence=ticket,
+                live_fence_validator=lambda candidate_ticket: self._validate_fence(
+                    current_attempt, candidate_ticket
+                ),
             )
             # The controller validates the durable fence immediately before
             # dispatch; adapters independently validate the same job at their
@@ -1863,6 +2031,8 @@ class ExecutionCoordinator:
         total_tokens: int,
         estimated_cost: float,
         latency_ms: int,
+        *,
+        resume_verifying: bool = False,
     ) -> CoordinatorResult | None:
         verification_durable = False
         current_attempt = attempt
@@ -1870,11 +2040,12 @@ class ExecutionCoordinator:
         try:
             current_attempt, fence_ticket = self._refresh_fence(current_attempt)
             self._validate_fence(current_attempt, fence_ticket)
-            self.mission_service.begin_attempt_verification(
-                current_attempt.attempt_id,
-                lease_owner=self.lease_owner,
-                fencing_token=current_attempt.fencing_token,
-            )
+            if not resume_verifying:
+                self.mission_service.begin_attempt_verification(
+                    current_attempt.attempt_id,
+                    lease_owner=self.lease_owner,
+                    fencing_token=current_attempt.fencing_token,
+                )
             current_attempt, fence_ticket = self._refresh_fence(current_attempt)
             self._validate_fence(current_attempt, fence_ticket)
             current_task = self.mission_service.get_task(task.task_id)
@@ -1899,6 +2070,15 @@ class ExecutionCoordinator:
                     commands=spec.verification_commands,
                     require_changes=spec.require_changes,
                     baseline_ref=spec.baseline_ref,
+                    execution_authorized=True,
+                    execution_capability=(
+                        Capability.WORKSPACE_EXECUTE in spec.runtime_capabilities
+                    ),
+                    execution_granted=True,
+                    require_execution_authority=bool(spec.verification_commands),
+                    live_fence_validator=lambda: self._validate_fence(
+                        current_attempt, fence_ticket
+                    ),
                 )
             )
             # A verifier cannot turn a stale runtime result into accepted
@@ -2055,36 +2235,17 @@ class ExecutionCoordinator:
                 latency_ms=latency_ms,
             )
 
-            if self._service_method_overridden(self.mission_service, "complete_task"):
-                # Compatibility seam for a legacy observer that deliberately
-                # raises after succeed_attempt.  The normal path below is
-                # fully atomic; this branch exists only when that historical
-                # hook is explicitly overridden.
-                succeeded = self.mission_service.succeed_attempt(
-                    current_attempt.attempt_id,
-                    result_summary=summary,
-                    total_tokens=total_tokens,
-                    estimated_cost_usd=estimated_cost,
-                    latency_ms=latency_ms,
-                    lease_owner=self.lease_owner,
-                    fencing_token=current_attempt.fencing_token,
-                )
-                self.mission_service.complete_task(task.task_id)
-                finalized = self.mission_service.finalize_verified_attempt(
-                    succeeded.attempt_id,
-                )
-            else:
-                finalized = self.mission_service.finalize_verified_attempt(
-                    current_attempt.attempt_id,
-                    result_summary=summary,
-                    total_tokens=total_tokens,
-                    estimated_cost_usd=estimated_cost,
-                    latency_ms=latency_ms,
-                    lease_owner=self.lease_owner,
-                    fencing_token=current_attempt.fencing_token,
-                    checkpoint_id=f"checkpoint:task:{task.task_id}:completed",
-                    checkpoint_summary=summary,
-                )
+            finalized = self.mission_service.finalize_verified_attempt(
+                current_attempt.attempt_id,
+                result_summary=summary,
+                total_tokens=total_tokens,
+                estimated_cost_usd=estimated_cost,
+                latency_ms=latency_ms,
+                lease_owner=self.lease_owner,
+                fencing_token=current_attempt.fencing_token,
+                checkpoint_id=f"checkpoint:task:{task.task_id}:completed",
+                checkpoint_summary=summary,
+            )
 
             return self._after_task_finalization(
                 mission_id,

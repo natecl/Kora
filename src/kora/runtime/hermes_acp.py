@@ -18,7 +18,12 @@ import acp
 import acp.schema as schema
 
 from kora import __version__
-from kora.runtime.contracts import RuntimeJob, RuntimeResult, RuntimeStatus
+from kora.runtime.contracts import (
+    RuntimeContractError,
+    RuntimeJob,
+    RuntimeResult,
+    RuntimeStatus,
+)
 from kora.runtime.hermes import HermesRuntimeAdapter
 
 
@@ -39,11 +44,32 @@ PermissionResolver = Callable[[ACPPermissionRequest], str | None]
 class _KoraACPClient:
     """Minimal ACP client that collects semantic events and gates permissions."""
 
-    def __init__(self, permission_resolver: PermissionResolver | None = None) -> None:
+    def __init__(
+        self,
+        permission_resolver: PermissionResolver | None = None,
+        live_fence_validator: Callable[[], object] | None = None,
+    ) -> None:
         self.permission_resolver = permission_resolver
+        self.live_fence_validator = live_fence_validator
         self.message_chunks: list[str] = []
         self.tool_events: list[dict[str, str | None]] = []
         self.connection: Any = None
+
+    def _validate_effect_boundary(self) -> None:
+        if self.live_fence_validator is None:
+            return
+        try:
+            result = self.live_fence_validator()
+        except Exception as exc:  # noqa: BLE001 - ACP authority boundary
+            if isinstance(exc, RuntimeContractError):
+                raise
+            raise RuntimeContractError(
+                "live Kora execution fence validation failed"
+            ) from exc
+        if result is False:
+            raise RuntimeContractError(
+                "live Kora execution fence validation was rejected"
+            )
 
     def on_connect(self, conn: Any) -> None:
         self.connection = conn
@@ -55,6 +81,7 @@ class _KoraACPClient:
         tool_call: schema.ToolCallUpdate,
         **_: Any,
     ) -> schema.RequestPermissionResponse:
+        self._validate_effect_boundary()
         option_ids = tuple(option.option_id for option in options)
         request = ACPPermissionRequest(
             session_id=session_id,
@@ -103,26 +130,33 @@ class _KoraACPClient:
             )
 
     async def read_text_file(self, **_: Any) -> schema.ReadTextFileResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client filesystem access is disabled")
 
     async def write_text_file(self, **_: Any) -> schema.WriteTextFileResponse | None:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client filesystem access is disabled")
 
     async def create_terminal(self, **_: Any) -> schema.CreateTerminalResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def terminal_output(self, **_: Any) -> schema.TerminalOutputResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def release_terminal(self, **_: Any) -> schema.ReleaseTerminalResponse | None:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def wait_for_terminal_exit(
         self, **_: Any
     ) -> schema.WaitForTerminalExitResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def kill_terminal(self, **_: Any) -> schema.KillTerminalResponse | None:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -168,13 +202,19 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
         workspace = self._validate_job(job)
         executable = self._resolve_executable()
         prompt = self._build_prompt(job)
-        client = _KoraACPClient(self.permission_resolver)
+        client = _KoraACPClient(
+            self.permission_resolver,
+            live_fence_validator=job.validate_execution_fence,
+        )
 
         environment = self._build_environment()
         environment["HERMES_ACP_SKIP_CONFIGURED_MCP"] = "1"
         session_id = job.session_id
 
         try:
+            # Keep the structural and live checks adjacent to ACP process
+            # creation; setup-time validation cannot close a stop/wait race.
+            job.validate_execution_fence()
             async with asyncio.timeout(job.timeout_seconds):
                 async with acp.spawn_agent_process(
                     client,
@@ -185,6 +225,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                     transport_kwargs={"stderr": asyncio.subprocess.DEVNULL},
                     use_unstable_protocol=True,
                 ) as (connection, _process):
+                    job.validate_execution_fence()
                     await connection.initialize(
                         protocol_version=acp.PROTOCOL_VERSION,
                         client_capabilities=schema.ClientCapabilities(
@@ -203,12 +244,14 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                     if job.session_id is not None:
                         # ACP 0.9 acknowledges a loaded session without
                         # repeating its already-known session ID.
+                        job.validate_execution_fence()
                         await connection.load_session(
                             cwd=str(workspace),
                             session_id=job.session_id,
                             mcp_servers=[],
                         )
                     else:
+                        job.validate_execution_fence()
                         session = await connection.new_session(
                             cwd=str(workspace),
                             mcp_servers=[],
@@ -216,6 +259,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                         session_id = self._validate_identifier(
                             session.session_id, "session_id"
                         )
+                    job.validate_execution_fence()
                     response = await connection.prompt(
                         session_id=session_id,
                         prompt=[

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from math import fsum, isfinite
 from threading import RLock
 from typing import Any
 from uuid import uuid4
@@ -15,6 +16,20 @@ from kora.workforce.domain import (
     TaskProfile,
 )
 from kora.workforce.errors import NoEligibleRouteError, WorkforceValidationError
+
+
+def _finite_nonnegative(value: Any, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise WorkforceValidationError(f"{field_name} must be finite and non-negative")
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise WorkforceValidationError(
+            f"{field_name} must be finite and non-negative"
+        ) from exc
+    if not isfinite(result) or result < 0.0:
+        raise WorkforceValidationError(f"{field_name} must be finite and non-negative")
+    return result
 
 
 def _route_ids(value: Any, field_name: str = "excluded_route_ids") -> frozenset[str]:
@@ -31,6 +46,18 @@ def _route_ids(value: Any, field_name: str = "excluded_route_ids") -> frozenset[
     return result
 
 
+def _finite_sum(values: Iterable[float], field_name: str) -> float:
+    try:
+        result = fsum(values)
+    except OverflowError as exc:
+        raise WorkforceValidationError(
+            f"{field_name} must remain finite"
+        ) from exc
+    if not isfinite(result) or result < 0.0:
+        raise WorkforceValidationError(f"{field_name} must remain finite")
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class RouteStatistics:
     """Deterministic aggregate data; it never changes route predictions."""
@@ -44,6 +71,37 @@ class RouteStatistics:
     total_cost_usd: float
     mean_cost_usd: float
     mean_latency_ms: float
+
+    def __post_init__(self) -> None:
+        for field_name in ("route_id", "task_class"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise WorkforceValidationError(
+                    f"{field_name} must be a non-empty string or None"
+                )
+        for field_name in ("sample_count", "accepted_count", "total_tokens"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise WorkforceValidationError(
+                    f"{field_name} must be a non-negative integer"
+                )
+        if self.accepted_count > self.sample_count:
+            raise WorkforceValidationError(
+                "accepted_count cannot exceed sample_count"
+            )
+        for field_name in (
+            "acceptance_rate",
+            "total_cost_usd",
+            "mean_cost_usd",
+            "mean_latency_ms",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _finite_nonnegative(getattr(self, field_name), field_name),
+            )
+        if self.acceptance_rate > 1.0:
+            raise WorkforceValidationError("acceptance_rate must be at most 1")
 
     @property
     def accepted_rate(self) -> float:
@@ -101,8 +159,14 @@ class RouteObservationStats:
         sample_count = len(matching)
         accepted_count = sum(observation.accepted for observation in matching)
         total_tokens = sum(observation.total_tokens for observation in matching)
-        total_cost = sum(observation.cost_usd for observation in matching)
-        total_latency = sum(observation.latency_ms for observation in matching)
+        total_cost = _finite_sum(
+            (observation.cost_usd for observation in matching),
+            "total_cost_usd",
+        )
+        total_latency = _finite_sum(
+            (observation.latency_ms for observation in matching),
+            "total_latency_ms",
+        )
         return RouteStatistics(
             route_id=route_id,
             task_class=task_class,
@@ -134,6 +198,19 @@ class RouteReservation:
     reservation_id: str
     route_id: str
     reserved_cost_usd: float
+
+    def __post_init__(self) -> None:
+        for field_name in ("reservation_id", "route_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise WorkforceValidationError(
+                    f"{field_name} must be a non-empty string"
+                )
+        object.__setattr__(
+            self,
+            "reserved_cost_usd",
+            _finite_nonnegative(self.reserved_cost_usd, "reserved_cost_usd"),
+        )
 
 
 class ModelRouter:
@@ -183,9 +260,9 @@ class ModelRouter:
                 raise WorkforceValidationError(
                     "budget_ceiling_usd must be non-negative when provided"
                 ) from exc
-            if budget_ceiling_usd < 0.0:
+            if not isfinite(budget_ceiling_usd) or budget_ceiling_usd < 0.0:
                 raise WorkforceValidationError(
-                    "budget_ceiling_usd must be non-negative when provided"
+                    "budget_ceiling_usd must be finite and non-negative when provided"
                 )
         if observation_stats is not None and not isinstance(
             observation_stats, RouteObservationStats
@@ -238,15 +315,7 @@ class ModelRouter:
 
         if not isinstance(task, TaskProfile) or not isinstance(route, ModelRoute):
             raise WorkforceValidationError("attempt_cost requires task and route records")
-        return route.fixed_cost_usd + (
-            task.estimated_input_tokens
-            * route.input_cost_per_million
-            / 1_000_000
-        ) + (
-            task.estimated_output_tokens
-            * route.output_cost_per_million
-            / 1_000_000
-        )
+        return route.attempt_cost(task)
 
     calculate_attempt_cost = attempt_cost
 
@@ -355,8 +424,10 @@ class ModelRouter:
             spent_cost_usd = float(spent_cost_usd)
         except (TypeError, ValueError) as exc:
             raise WorkforceValidationError("spent_cost_usd must be non-negative") from exc
-        if spent_cost_usd < 0.0:
-            raise WorkforceValidationError("spent_cost_usd must be non-negative")
+        if not isfinite(spent_cost_usd) or spent_cost_usd < 0.0:
+            raise WorkforceValidationError(
+                "spent_cost_usd must be finite and non-negative"
+            )
 
         limit = self.max_concurrency
         if concurrency_limit is not None:
@@ -382,9 +453,9 @@ class ModelRouter:
                 raise WorkforceValidationError(
                     "budget_ceiling_usd must be non-negative when provided"
                 ) from exc
-            if budget_ceiling_usd < 0.0:
+            if not isfinite(budget_ceiling_usd) or budget_ceiling_usd < 0.0:
                 raise WorkforceValidationError(
-                    "budget_ceiling_usd must be non-negative when provided"
+                    "budget_ceiling_usd must be finite and non-negative when provided"
                 )
             budget = budget_ceiling_usd if budget is None else min(budget, budget_ceiling_usd)
 
@@ -392,6 +463,10 @@ class ModelRouter:
             active = len(self._reservations) + active_concurrency
             reserved = self._reserved_cost_usd
             committed = self._spent_cost_usd
+        base_spend = _finite_sum(
+            (committed, reserved, spent_cost_usd),
+            "projected route spend",
+        )
         if limit is not None and active >= limit:
             raise NoEligibleRouteError(
                 task.task_id,
@@ -408,9 +483,15 @@ class ModelRouter:
                 continue
             attempt_cost = self.attempt_cost(task, route)
             expected_cost = self.expected_cost_per_accepted_outcome(task, route)
-            if budget is not None and (
-                committed + reserved + spent_cost_usd + expected_cost > budget
-            ):
+            if not isfinite(attempt_cost) or not isfinite(expected_cost):
+                raise WorkforceValidationError(
+                    "route cost predictions must be finite and non-negative"
+                )
+            projected_spend = _finite_sum(
+                (base_spend, expected_cost),
+                "projected route spend",
+            )
+            if budget is not None and projected_spend > budget:
                 reasons[route.route_id] = ("budget_ceiling",)
                 continue
             candidates.append(
@@ -506,9 +587,9 @@ class ModelRouter:
                 raise WorkforceValidationError(
                     "budget_ceiling_usd must be non-negative when provided"
                 ) from exc
-            if budget_ceiling_usd < 0.0:
+            if not isfinite(budget_ceiling_usd) or budget_ceiling_usd < 0.0:
                 raise WorkforceValidationError(
-                    "budget_ceiling_usd must be non-negative when provided"
+                    "budget_ceiling_usd must be finite and non-negative when provided"
                 )
             budget = budget_ceiling_usd if budget is None else min(budget, budget_ceiling_usd)
 
@@ -520,16 +601,23 @@ class ModelRouter:
                     decision.task_id,
                     {decision.route_id: ("concurrency_limit",)},
                 )
-            if budget is not None and (
-                self._spent_cost_usd
-                + self._reserved_cost_usd
-                + decision.expected_attempt_cost_usd
-                > budget
-            ):
+            projected_spend = _finite_sum(
+                (
+                    self._spent_cost_usd,
+                    self._reserved_cost_usd,
+                    decision.expected_attempt_cost_usd,
+                ),
+                "projected route spend",
+            )
+            if budget is not None and projected_spend > budget:
                 raise NoEligibleRouteError(
                     decision.task_id,
                     {decision.route_id: ("budget_ceiling",)},
                 )
+            _finite_sum(
+                (self._reserved_cost_usd, decision.expected_attempt_cost_usd),
+                "reserved route cost",
+            )
             reservation = RouteReservation(
                 reservation_id=reservation_id,
                 route_id=decision.route_id,
@@ -552,26 +640,27 @@ class ModelRouter:
         if not isinstance(reservation, RouteReservation):
             raise WorkforceValidationError("reservation must be a RouteReservation")
         if actual_cost_usd is not None:
-            if isinstance(actual_cost_usd, bool):
-                raise WorkforceValidationError("actual_cost_usd must be non-negative")
-            try:
-                actual_cost_usd = float(actual_cost_usd)
-            except (TypeError, ValueError) as exc:
-                raise WorkforceValidationError(
-                    "actual_cost_usd must be non-negative"
-                ) from exc
-            if actual_cost_usd < 0.0:
-                raise WorkforceValidationError("actual_cost_usd must be non-negative")
+            actual_cost_usd = _finite_nonnegative(
+                actual_cost_usd, "actual_cost_usd"
+            )
         with self._lock:
-            current = self._reservations.pop(reservation.reservation_id, None)
+            current = self._reservations.get(reservation.reservation_id)
             if current is None or current != reservation:
                 raise WorkforceValidationError("reservation is not active")
-            self._reserved_cost_usd -= current.reserved_cost_usd
-            self._spent_cost_usd += (
+            committed_cost = (
                 actual_cost_usd
                 if actual_cost_usd is not None
                 else current.reserved_cost_usd
             )
+            next_reserved = self._reserved_cost_usd - current.reserved_cost_usd
+            next_spent = self._spent_cost_usd + committed_cost
+            if not isfinite(next_reserved) or next_reserved < 0.0:
+                raise WorkforceValidationError("reserved route cost must remain finite")
+            if not isfinite(next_spent) or next_spent < 0.0:
+                raise WorkforceValidationError("spent route cost must remain finite")
+            self._reservations.pop(reservation.reservation_id, None)
+            self._reserved_cost_usd = next_reserved
+            self._spent_cost_usd = next_spent
 
     def record_observation(self, observation: RouteObservation) -> None:
         """Store route telemetry without changing deterministic selection."""

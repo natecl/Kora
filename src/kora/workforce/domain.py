@@ -136,7 +136,7 @@ def _score(value: Any, field_name: str) -> float:
         raise WorkforceValidationError(f"{field_name} must be a number from 0 to 1")
     try:
         result = float(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise WorkforceValidationError(
             f"{field_name} must be a number from 0 to 1"
         ) from exc
@@ -150,7 +150,7 @@ def _nonnegative_number(value: Any, field_name: str) -> float:
         raise WorkforceValidationError(f"{field_name} must be non-negative")
     try:
         result = float(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise WorkforceValidationError(f"{field_name} must be non-negative") from exc
     if not isfinite(result) or result < 0.0:
         raise WorkforceValidationError(f"{field_name} must be non-negative")
@@ -414,13 +414,17 @@ class ModelRoute:
     def attempt_cost(self, task: TaskProfile) -> float:
         """Return the exact predicted cost for one task attempt."""
 
-        return (
-            self.fixed_cost_usd
-            + task.estimated_input_tokens * self.input_cost_per_million / 1_000_000
-            + task.estimated_output_tokens
-            * self.output_cost_per_million
-            / 1_000_000
-        )
+        try:
+            cost = (
+                self.fixed_cost_usd
+                + task.estimated_input_tokens * self.input_cost_per_million / 1_000_000
+                + task.estimated_output_tokens
+                * self.output_cost_per_million
+                / 1_000_000
+            )
+        except OverflowError as exc:
+            raise WorkforceValidationError("attempt_cost must be finite") from exc
+        return _nonnegative_number(cost, "attempt_cost")
 
     calculate_attempt_cost = attempt_cost
 
@@ -428,7 +432,10 @@ class ModelRoute:
         """Return this route's predicted cost per accepted task outcome."""
 
         acceptance_probability = self.predicted_quality * self.reliability
-        return self.attempt_cost(task) / max(acceptance_probability, 0.01)
+        return _nonnegative_number(
+            self.attempt_cost(task) / max(acceptance_probability, 0.01),
+            "expected_cost_per_accepted_outcome",
+        )
 
 
 @dataclass(frozen=True, slots=True)

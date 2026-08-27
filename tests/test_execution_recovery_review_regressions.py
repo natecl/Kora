@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -135,14 +134,10 @@ class SynchronizedRouter:
         self._router.record_observation(observation)
 
 
-class CrashAfterSuccessfulVerification(BaseException):
-    """A process-crash stand-in that is not caught by coordinator recovery."""
-
-
-class CrashBeforeTaskFinalizationService(MissionService):
+class LegacyCompletionHookService(MissionService):
     def __init__(self) -> None:
         super().__init__()
-        self.crash_before_task_finalization = True
+        self.legacy_completion_called = False
 
     def complete_task(
         self,
@@ -151,14 +146,8 @@ class CrashBeforeTaskFinalizationService(MissionService):
         expected_revision: int | None = None,
         at: datetime | None = None,
     ) -> Task:
-        if self.crash_before_task_finalization:
-            self.crash_before_task_finalization = False
-            raise CrashAfterSuccessfulVerification()
-        return super().complete_task(
-            task_id,
-            expected_revision=expected_revision,
-            at=at,
-        )
+        self.legacy_completion_called = True
+        raise AssertionError("coordinator must use atomic verified finalization")
 
 
 class FailSecondAuthorizationService(MissionService):
@@ -533,11 +522,11 @@ class ExecutionRecoveryReviewRegressionTests(unittest.TestCase):
                 {CoordinatorStatus.TASK_COMPLETED, CoordinatorStatus.MISSION_COMPLETED},
             )
 
-    def test_invariant_3_durable_success_recovers_without_another_runtime_call(self) -> None:
-        service = CrashBeforeTaskFinalizationService()
+    def test_invariant_3_atomic_finalization_does_not_use_legacy_completion_hook(self) -> None:
+        service = LegacyCompletionHookService()
         try:
             mission, task = self._create_active_mission(
-                service, "crash-mission", "crash-task"
+                service, "atomic-finalization-mission", "atomic-finalization-task"
             )
             spec = self._spec(task, self.workspace)
             runtime = ScriptedRuntime(
@@ -556,41 +545,11 @@ class ExecutionRecoveryReviewRegressionTests(unittest.TestCase):
                 verifier=verifier,
             )
 
-            with self.assertRaises(CrashAfterSuccessfulVerification):
-                coordinator.run_once(mission.mission_id)
+            result = coordinator.run_once(mission.mission_id)
 
-            attempts_before_recovery = service.store.list_attempts(
-                mission.mission_id, task.task_id
-            )
-            self.assertEqual(len(attempts_before_recovery), 1)
-            self.assertEqual(attempts_before_recovery[0].status, AttemptStatus.SUCCEEDED)
-            self.assertEqual(service.get_task(task.task_id).state, TaskStatus.VERIFYING)
-            self.assertEqual(
-                len(
-                    [
-                        evidence
-                        for evidence in service.store.list_evidence(mission.mission_id)
-                        if evidence.task_id == task.task_id
-                        and evidence.verified_at is not None
-                    ]
-                ),
-                1,
-            )
-
-            recovered = self._coordinator(
-                service,
-                spec,
-                {"route": runtime},
-                [self._route("route", fixed_cost_usd=0.10)],
-                verifier=verifier,
-            ).run_once(mission.mission_id)
-
-            self.assertEqual(recovered.status, CoordinatorStatus.MISSION_COMPLETED)
+            self.assertEqual(result.status, CoordinatorStatus.MISSION_COMPLETED)
+            self.assertFalse(service.legacy_completion_called)
             self.assertEqual(len(runtime.calls), 1)
-            self.assertEqual(
-                service.store.list_attempts(mission.mission_id, task.task_id),
-                attempts_before_recovery,
-            )
             self.assertEqual(service.get_task(task.task_id).state, TaskStatus.COMPLETED)
             self.assertEqual(service.get_mission(mission.mission_id).state, MissionState.COMPLETED)
         finally:

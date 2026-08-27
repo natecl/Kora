@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Mapping
 from uuid import uuid4
 
+from kora._process_local import attach as attach_process_local
 from kora.mission.domain import (
     Artifact,
     ArtifactKind,
@@ -156,6 +157,7 @@ ATTEMPT_TRANSITIONS: Mapping[AttemptStatus, frozenset[AttemptStatus]] = {
         {
             AttemptStatus.FAILED,
             AttemptStatus.INTERRUPTED,
+            AttemptStatus.VERIFYING,
         }
     ),
 }
@@ -580,11 +582,21 @@ class MissionService:
                 f"{attempt.fencing_token}"
             )
         )
-        return ExecutionFenceTicket.from_attempt(
+        ticket = ExecutionFenceTicket.from_attempt(
             attempt,
             cancellation_identity=identity,
             at=timestamp,
         )
+        # Keep the live authority check attached to the Kora-issued ticket
+        # without allowing the service/closure into serialization or repr.
+        attach_process_local(
+            ticket,
+            lambda candidate_ticket: self.validate_execution_fence_ticket(
+                candidate_ticket,
+                cancellation_identity=identity,
+            ),
+        )
+        return ticket
 
     issue_fence_ticket = issue_execution_fence_ticket
     execution_fence_ticket = issue_execution_fence_ticket
@@ -1250,6 +1262,14 @@ class MissionService:
         estimated_cost_usd: float | None = None,
         latency_ms: int | None = None,
         expected_revision: int | None = None,
+        effects_confirmed: bool | None = None,
+        lease_owner: str | None = None,
+        verification_owner: str | None = None,
+        fencing_token: int | None = None,
+        lease_expires_at: datetime | None = None,
+        lease_ttl_seconds: float | int | None = None,
+        lease_seconds: float | int | None = None,
+        lease_duration_seconds: float | int | None = None,
         at: datetime | None = None,
     ) -> TaskAttempt:
         if target is not None and status is not None:
@@ -1259,19 +1279,64 @@ class MissionService:
         if target_value is None:
             raise ValidationError("reconcile_unknown requires a target status")
         target_status = _coerce_attempt_status(target_value)
-        allowed = {
+        if target_status not in {
             AttemptStatus.FAILED,
             AttemptStatus.INTERRUPTED,
-        }
-        if target_status not in allowed:
+            AttemptStatus.VERIFYING,
+        }:
             raise InvalidTransitionError(
-                "unknown attempts can reconcile only to failed or interrupted; "
-                "verifier resume requires a new fenced claim"
+                "unknown attempts can reconcile only to failed, interrupted, "
+                "or explicitly effects-confirmed verifying"
+            )
+        if effects_confirmed is not None and not isinstance(effects_confirmed, bool):
+            raise ValidationError("effects_confirmed must be a boolean or None")
+        if target_status is AttemptStatus.VERIFYING:
+            if effects_confirmed is not True:
+                raise InvalidTransitionError(
+                    "unknown attempts require an explicit effects-confirmed decision "
+                    "before verifier resume"
+                )
+            if (
+                lease_owner is not None
+                and verification_owner is not None
+                and lease_owner != verification_owner
+            ):
+                raise ValidationError(
+                    "lease_owner and verification_owner must match when both given"
+                )
+            owner = verification_owner if verification_owner is not None else lease_owner
+            if owner is None:
+                raise ValidationError(
+                    "verification resume requires a fresh lease owner"
+                )
+            owner = self._validate_lease_owner(owner)
+        elif any(
+            value is not None
+            for value in (
+                verification_owner,
+                fencing_token,
+                lease_expires_at,
+                lease_ttl_seconds,
+                lease_seconds,
+                lease_duration_seconds,
+            )
+        ):
+            raise ValidationError(
+                "verification lease fields are only valid for verifier resume"
             )
         if reason is not None and error_summary is not None and reason != error_summary:
             raise ValidationError("reason and error_summary must match when both given")
         timestamp = normalize_timestamp(at or utc_now())
         summary = error_summary if error_summary is not None else reason
+        verification_expiry: datetime | None = None
+        if target_status is AttemptStatus.VERIFYING:
+            verification_expiry = self._resolve_lease_expiry(
+                timestamp,
+                lease_expires_at=lease_expires_at,
+                lease_ttl_seconds=lease_ttl_seconds,
+                lease_seconds=lease_seconds,
+                lease_duration_seconds=lease_duration_seconds,
+            )
         changes: dict[str, object] = {
             "lease_owner": None,
             "lease_expires_at": None,
@@ -1289,6 +1354,12 @@ class MissionService:
         if target_status is AttemptStatus.VERIFYING:
             changes["accepted"] = None
             changes["finished_at"] = None
+            changes["lease_owner"] = owner
+            changes["lease_expires_at"] = verification_expiry
+            # UNKNOWN has no active worker authority.  A confirmed effect gets
+            # a fresh fence so only the verifier can finish it; runtime is
+            # never re-entered by this transition.
+            changes["fencing_token"] = None
         elif target_status is AttemptStatus.FAILED:
             changes["accepted"] = False
             changes["finished_at"] = timestamp
@@ -1297,6 +1368,25 @@ class MissionService:
             changes["finished_at"] = timestamp
         with self.store.transaction(immediate=True):
             current = self._require_owned_attempt(attempt_id)
+            if target_status is AttemptStatus.VERIFYING:
+                mission = self._require_owned_mission(current.mission_id)
+                if mission.state not in {
+                    MissionState.ACTIVE,
+                    MissionState.VERIFYING,
+                }:
+                    raise ConflictError(
+                        "confirmed-effect verification requires an active mission"
+                    )
+                next_fencing_token = current.fencing_token + 1
+                if fencing_token is not None:
+                    expected_fencing_token = self._validate_fencing_token(
+                        fencing_token
+                    )
+                    if expected_fencing_token != next_fencing_token:
+                        raise ConflictError(
+                            "confirmed-effect verification fencing token is stale"
+                        )
+                changes["fencing_token"] = next_fencing_token
             if current.status is not AttemptStatus.UNKNOWN:
                 raise InvalidTransitionError(
                     f"only unknown attempts can be reconciled: {attempt_id}"
@@ -1308,6 +1398,65 @@ class MissionService:
                 expected_revision=expected_revision,
                 **changes,
             )
+
+    def reconcile_unknown_effects_confirmed(
+        self,
+        attempt_id: str,
+        *,
+        target: AttemptStatus | str = AttemptStatus.VERIFYING,
+        status: AttemptStatus | str | None = None,
+        effects_confirmed: bool | None = None,
+        lease_owner: str | None = None,
+        verification_owner: str | None = None,
+        fencing_token: int | None = None,
+        lease_expires_at: datetime | None = None,
+        lease_ttl_seconds: float | int | None = None,
+        lease_seconds: float | int | None = None,
+        lease_duration_seconds: float | int | None = None,
+        reason: str | None = None,
+        error_summary: str | None = None,
+        result_summary: str | None = None,
+        total_tokens: int | None = None,
+        estimated_cost_usd: float | None = None,
+        latency_ms: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        """Atomically reopen an UNKNOWN effect for verification only.
+
+        This path records the explicit effects-confirmed decision, issues a
+        new verification fence, and leaves runtime dispatch impossible.
+        """
+
+        if effects_confirmed is not True:
+            raise InvalidTransitionError(
+                "confirmed-effect reconciliation requires an explicit "
+                "effects_confirmed=True decision"
+            )
+        return self.reconcile_unknown(
+            attempt_id,
+            target,
+            status=status,
+            effects_confirmed=effects_confirmed,
+            lease_owner=lease_owner,
+            verification_owner=verification_owner,
+            fencing_token=fencing_token,
+            lease_expires_at=lease_expires_at,
+            lease_ttl_seconds=lease_ttl_seconds,
+            lease_seconds=lease_seconds,
+            lease_duration_seconds=lease_duration_seconds,
+            reason=reason,
+            error_summary=error_summary,
+            result_summary=result_summary,
+            total_tokens=total_tokens,
+            estimated_cost_usd=estimated_cost_usd,
+            latency_ms=latency_ms,
+            expected_revision=expected_revision,
+            at=at,
+        )
+
+    resume_unknown_for_verification = reconcile_unknown_effects_confirmed
+    confirm_unknown_effects = reconcile_unknown_effects_confirmed
 
     # Task graph -----------------------------------------------------------
 

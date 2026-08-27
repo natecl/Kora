@@ -677,9 +677,9 @@ class ExecutionBoundaryAdversarialTests(unittest.TestCase):
             verifier=verifier,
         )
         completion_snapshot: list[tuple[int, int, bool]] = []
-        real_complete_task = self.service.complete_task
+        real_finalize_verified_attempt = self.service.finalize_verified_attempt
 
-        def complete_task_after_evidence(task_id: str, **kwargs: object) -> object:
+        def finalize_after_evidence(attempt_id: str, **kwargs: object) -> object:
             artifacts = self.service.store.list_artifacts(self.mission_id)
             evidence = [
                 item
@@ -689,9 +689,9 @@ class ExecutionBoundaryAdversarialTests(unittest.TestCase):
             completion_snapshot.append(
                 (len(artifacts), len(evidence), all(item.verified_at is not None for item in evidence))
             )
-            return real_complete_task(task_id, **kwargs)
+            return real_finalize_verified_attempt(attempt_id, **kwargs)
 
-        self.service.complete_task = complete_task_after_evidence  # type: ignore[method-assign]
+        self.service.finalize_verified_attempt = finalize_after_evidence  # type: ignore[method-assign]
         result = coordinator.run_once(self.mission_id)
 
         self.assertEqual(result.status, CoordinatorStatus.MISSION_COMPLETED)

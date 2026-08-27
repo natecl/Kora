@@ -56,6 +56,7 @@ _COMMAND_CAPTURE_LIMIT = 4096
 _PIPE_READ_SIZE = 16 * 1024
 _GIT_TIMEOUT_SECONDS = 30.0
 _GIT_CAPTURE_LIMIT = 4096
+_TRACKED_PATH_CAPTURE_LIMIT = 1024 * 1024
 _UNTRACKED_PATH_CAPTURE_LIMIT = 1024 * 1024
 _UNTRACKED_ENTRY_LIMIT = 100_000
 _UNTRACKED_DEPTH_LIMIT = 64
@@ -421,6 +422,15 @@ class _UntrackedPathObservation:
     recursive: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _UntrackedHashTarget:
+    """One planned workspace entry and its bounded inspection policy."""
+
+    path: Path
+    recursive: bool
+    optional: bool = False
+
+
 def _read_pipe(
     stream: BinaryIO,
     capture: _PipeCapture,
@@ -751,6 +761,25 @@ class WorkspaceVerifier:
                 + ")."
             )
 
+        tracked_result = self._run_process(
+            ("git", "ls-files", "-z"),
+            workspace=workspace,
+            environment=environment,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            stdout_limit=_TRACKED_PATH_CAPTURE_LIMIT,
+            stderr_limit=_COMMAND_CAPTURE_LIMIT,
+            workspace_identity=workspace_identity,
+            live_fence_validator=live_fence_validator,
+        )
+        if not self._process_succeeded(tracked_result):
+            return None, (
+                "git tracked-file inspection failed ("
+                + self._process_failure_detail(tracked_result)
+                + ")."
+            )
+        if tracked_result.stdout_truncated:
+            return None, "workspace contains too many tracked paths to inspect safely."
+
         untracked_result = self._run_process(
             ("git", "ls-files", "--others", "--exclude-standard", "-z"),
             workspace=workspace,
@@ -850,23 +879,45 @@ class WorkspaceVerifier:
             return None, "workspace contains too many ignored paths to inspect safely."
 
         try:
+            tracked_directory_ancestors = self._parse_tracked_directory_ancestors(
+                tracked_result.stdout_bytes
+            )
             untracked_paths = self._parse_untracked_paths(
                 (untracked_result.stdout_bytes, False),
                 (ignored_result.stdout_bytes, False),
                 (untracked_directory_result.stdout_bytes, True),
                 (ignored_directory_result.stdout_bytes, True),
             )
-            untracked_entries = self._untracked_hash_plan(untracked_paths)
+            known_directory_ancestors = self._untracked_directory_ancestors(
+                untracked_paths
+            )
+            directory_ancestors = tuple(
+                sorted(
+                    set(tracked_directory_ancestors)
+                    | set(known_directory_ancestors),
+                    key=lambda path: path.as_posix().encode(
+                        "utf-8", errors="surrogateescape"
+                    ),
+                )
+            )
+            nested_git_paths = tuple(
+                ancestor / ".git" for ancestor in directory_ancestors
+            )
+            untracked_entries = self._untracked_hash_plan(
+                untracked_paths,
+                optional_paths=nested_git_paths,
+            )
             hash_budget = _UntrackedHashBudget()
             with workspace_identity.open_descriptor() as workspace_descriptor:
-                for path, recursive in untracked_entries:
+                for target in untracked_entries:
                     self._hash_untracked_entry(
                         digest,
                         workspace,
-                        path,
+                        target.path,
                         workspace_descriptor=workspace_descriptor,
                         budget=hash_budget,
-                        recursive=recursive,
+                        recursive=target.recursive,
+                        optional=target.optional,
                     )
         except (OSError, TypeError, ValueError) as exc:
             return None, str(exc)
@@ -878,6 +929,64 @@ class WorkspaceVerifier:
                 relative_workspace=relative_workspace,
             ),
             None,
+        )
+
+    @staticmethod
+    def _parse_tracked_directory_ancestors(output: bytes) -> tuple[Path, ...]:
+        """Parse bounded tracked paths into canonical directory ancestors."""
+
+        ancestors: set[Path] = set()
+        for path_bytes in output.split(b"\0"):
+            if not path_bytes:
+                continue
+            path_text = os.fsdecode(path_bytes)
+            path = Path(path_text)
+            if (
+                path.is_absolute()
+                or path.as_posix() != path_text
+                or not path.parts
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or "\0" in path_text
+            ):
+                raise WorkspaceVerificationError(
+                    "tracked path is not a safe workspace-relative entry"
+                )
+            # The repository metadata at the workspace root is not tracked
+            # workspace state.  A nested ``.git`` remains an ordinary child
+            # of its tracked directory ancestor and is inspected separately.
+            if path.parts[0] == ".git":
+                continue
+            if len(path.parts) > _UNTRACKED_DEPTH_LIMIT:
+                raise WorkspaceVerificationError(
+                    "tracked workspace tree exceeds the inspection depth limit"
+                )
+            ancestors.update(parent for parent in path.parents if parent != Path("."))
+
+        return tuple(
+            sorted(
+                ancestors,
+                key=lambda path: path.as_posix().encode(
+                    "utf-8", errors="surrogateescape"
+                ),
+            )
+        )
+
+    @staticmethod
+    def _untracked_directory_ancestors(
+        paths: tuple[_UntrackedPathObservation, ...],
+    ) -> tuple[Path, ...]:
+        """Return known workspace directories without promoting them to roots."""
+
+        ancestors: set[Path] = set()
+        for item in paths:
+            ancestors.update(parent for parent in item.path.parents if parent != Path("."))
+        return tuple(
+            sorted(
+                ancestors,
+                key=lambda path: path.as_posix().encode(
+                    "utf-8", errors="surrogateescape"
+                ),
+            )
         )
 
     @staticmethod
@@ -936,10 +1045,46 @@ class WorkspaceVerifier:
     @staticmethod
     def _untracked_hash_plan(
         paths: tuple[_UntrackedPathObservation, ...],
-    ) -> tuple[tuple[Path, bool], ...]:
+        *,
+        optional_paths: tuple[Path, ...] = (),
+    ) -> tuple[_UntrackedHashTarget, ...]:
         """Plan metadata and recursive hashing without promoting tracked parents."""
 
-        recursive_paths = {item.path for item in paths if item.recursive}
+        entries: dict[Path, tuple[bool, bool]] = {}
+
+        def add_entry(path: Path, recursive: bool, optional: bool) -> None:
+            existing = entries.get(path)
+            if existing is None:
+                entries[path] = (recursive, optional)
+                return
+            entries[path] = (
+                existing[0] or recursive,
+                existing[1] and optional,
+            )
+
+        def add_ancestor_metadata(path: Path) -> None:
+            for parent in reversed(path.parents):
+                if parent != Path("."):
+                    add_entry(parent, False, False)
+
+        known_recursive_paths = {item.path for item in paths if item.recursive}
+        for path in known_recursive_paths:
+            add_entry(path, True, False)
+
+        for item in paths:
+            if item.recursive or any(
+                item.path == root or root in item.path.parents
+                for root in known_recursive_paths
+            ):
+                continue
+            add_ancestor_metadata(item.path)
+            add_entry(item.path, False, False)
+
+        for path in optional_paths:
+            WorkspaceVerifier._validate_untracked_relative_path(path)
+            add_entry(path, True, True)
+
+        recursive_paths = {path for path, (recursive, _) in entries.items() if recursive}
         recursive_roots = tuple(
             sorted(
                 (
@@ -952,33 +1097,25 @@ class WorkspaceVerifier:
                 ),
             )
         )
-
-        entries: dict[Path, bool] = {}
-
-        def add_ancestor_metadata(path: Path) -> None:
-            for parent in reversed(path.parents):
-                if parent != Path("."):
-                    entries.setdefault(parent, False)
-
         for path in recursive_roots:
             add_ancestor_metadata(path)
-            entries[path] = True
-
-        for item in paths:
-            if item.recursive or any(
-                item.path == root or root in item.path.parents
-                for root in recursive_roots
-            ):
-                continue
-            add_ancestor_metadata(item.path)
-            entries.setdefault(item.path, False)
 
         return tuple(
-            sorted(
+            _UntrackedHashTarget(
+                path=path,
+                recursive=recursive,
+                optional=optional,
+            )
+            for path, (recursive, optional) in sorted(
                 entries.items(),
                 key=lambda item: item[0].as_posix().encode(
                     "utf-8", errors="surrogateescape"
                 ),
+            )
+            if not any(
+                path == root or root in path.parents
+                for root in recursive_roots
+                if path != root
             )
         )
 
@@ -999,6 +1136,7 @@ class WorkspaceVerifier:
         workspace_descriptor: int | None = None,
         budget: _UntrackedHashBudget | None = None,
         recursive: bool = True,
+        optional: bool = False,
     ) -> None:
         """Hash one untracked entry without following links or buffering files."""
 
@@ -1020,6 +1158,7 @@ class WorkspaceVerifier:
                     workspace_descriptor=descriptor,
                     budget=budget,
                     recursive=recursive,
+                    optional=optional,
                 )
 
         WorkspaceVerifier._validate_untracked_relative_path(relative_path)
@@ -1045,6 +1184,12 @@ class WorkspaceVerifier:
                         _directory_open_flags(),
                         dir_fd=parent_descriptor,
                     )
+                except FileNotFoundError as exc:
+                    if optional:
+                        return
+                    raise WorkspaceVerificationError(
+                        "untracked workspace parent could not be inspected safely"
+                    ) from exc
                 except (OSError, TypeError, ValueError) as exc:
                     raise WorkspaceVerificationError(
                         "untracked workspace parent could not be inspected safely"
@@ -1067,8 +1212,15 @@ class WorkspaceVerifier:
                 relative_path.parts[-1],
                 relative_path,
                 budget,
-                recursive,
+                recursive=recursive,
+                optional=optional,
             )
+        except FileNotFoundError as exc:
+            if optional:
+                return
+            raise WorkspaceVerificationError(
+                "untracked workspace parent could not be inspected safely"
+            ) from exc
         except WorkspaceVerificationError:
             raise
         except (OSError, TypeError, ValueError) as exc:
@@ -1091,6 +1243,7 @@ class WorkspaceVerifier:
         relative_path: Path,
         budget: _UntrackedHashBudget,
         recursive: bool = True,
+        optional: bool = False,
     ) -> None:
         """Hash one named entry relative to an already-open directory."""
 
@@ -1104,6 +1257,12 @@ class WorkspaceVerifier:
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
+        except FileNotFoundError as exc:
+            if optional:
+                return
+            raise WorkspaceVerificationError(
+                "untracked workspace entry could not be inspected safely"
+            ) from exc
         except (OSError, TypeError, ValueError) as exc:
             raise WorkspaceVerificationError(
                 "untracked workspace entry could not be inspected safely"

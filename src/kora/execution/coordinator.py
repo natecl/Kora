@@ -8,15 +8,19 @@ module; coordinator results contain only semantic mission state.
 
 from __future__ import annotations
 
+import hashlib
 import math
+import os
+import re
 import time
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from os import PathLike
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from kora.execution.errors import (
     ExecutionError,
@@ -27,6 +31,7 @@ from kora.execution.errors import (
     TaskSpecNotFoundError,
 )
 from kora.mission import (
+    ArtifactKind,
     AttemptStatus,
     CheckpointType,
     EscalationStatus,
@@ -58,6 +63,7 @@ from kora.workforce import (
     ModelRouter,
     RoleCharter,
     RouteObservation,
+    RouteReservation,
     TaskProfile,
     WorkerEnvelope,
     WorkforceCompiler,
@@ -66,6 +72,42 @@ from kora.workforce.errors import NoEligibleRouteError
 
 _SUMMARY_LIMIT = 1000
 _VERIFICATION_METHOD = "independent workspace verifier"
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+# These strings are the only controller-owned summaries that may cross the
+# execution boundary.  Runtime responses, verifier text, and exceptions are
+# intentionally never selected as public summaries.
+_RUNTIME_SUMMARIES: Mapping[RuntimeStatus, str] = {
+    RuntimeStatus.NEEDS_USER: (
+        "Please choose the requested input in Kora before continuing."
+    ),
+    RuntimeStatus.FAILED: "The work attempt did not complete.",
+    RuntimeStatus.UNSTRUCTURED: "The outcome could not be confirmed safely.",
+    RuntimeStatus.COMPLETED: (
+        "The work attempt completed and is being independently verified."
+    ),
+}
+
+
+def _controller_summary(status: "CoordinatorStatus") -> str:
+    summaries = {
+        CoordinatorStatus.TASK_COMPLETED: (
+            "The task was completed after independent verification."
+        ),
+        CoordinatorStatus.MISSION_COMPLETED: (
+            "The mission was completed after independent verification."
+        ),
+        CoordinatorStatus.WAITING_FOR_USER: (
+            "Please choose the requested input in Kora before continuing."
+        ),
+        CoordinatorStatus.NO_WORK: "There is no executable task available.",
+        CoordinatorStatus.BUSY: "Kora is already handling an active work attempt.",
+        CoordinatorStatus.RETRY_EXHAUSTED: (
+            "The work attempt did not complete; user guidance is required."
+        ),
+        CoordinatorStatus.UNKNOWN_OUTCOME: "The outcome could not be confirmed safely.",
+    }
+    return summaries[status]
 
 
 def _non_empty_string(value: Any, field_name: str) -> str:
@@ -220,6 +262,81 @@ def _path(value: Any, field_name: str) -> Path:
         raise ExecutionValidationError(f"{field_name} must be a Path") from exc
 
 
+def _canonical_workspace(value: Any, field_name: str = "workspace") -> Path:
+    raw_path = _path(value, field_name)
+    try:
+        # Lexical canonicalization keeps the exact workspace authority stable
+        # across platform aliases such as macOS's /var -> /private/var link.
+        return Path(os.path.abspath(os.fspath(raw_path.expanduser())))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ExecutionValidationError(f"{field_name} must be a canonical path") from exc
+
+
+_EVIDENCE_REQUIREMENT_ALIASES: Mapping[str, str] = {
+    "source_citations": "source",
+    "research_notes": "document",
+    "reconciliation_report": "document",
+}
+_EVIDENCE_REQUIREMENT_KINDS: Mapping[
+    str, tuple[frozenset[ArtifactKind], frozenset[EvidenceKind]]
+] = {
+    "source": (frozenset({ArtifactKind.SOURCE}), frozenset()),
+    "diff": (frozenset({ArtifactKind.DIFF}), frozenset()),
+    "test_report": (frozenset({ArtifactKind.TEST_REPORT}), frozenset()),
+    "preview": (frozenset({ArtifactKind.PREVIEW}), frozenset()),
+    "deployment": (frozenset({ArtifactKind.DEPLOYMENT}), frozenset()),
+    "log": (frozenset({ArtifactKind.LOG}), frozenset()),
+    "document": (frozenset({ArtifactKind.DOCUMENT}), frozenset()),
+    "other": (frozenset({ArtifactKind.OTHER}), frozenset()),
+    "test": (frozenset(), frozenset({EvidenceKind.TEST})),
+    "walkthrough": (frozenset(), frozenset({EvidenceKind.WALKTHROUGH})),
+    "review": (frozenset(), frozenset({EvidenceKind.REVIEW})),
+    "artifact": (frozenset(), frozenset({EvidenceKind.ARTIFACT})),
+    "approval": (frozenset(), frozenset({EvidenceKind.APPROVAL})),
+    "requirement_coverage": (
+        frozenset(),
+        frozenset({EvidenceKind.REQUIREMENT_COVERAGE}),
+    ),
+}
+
+
+def _normalize_evidence_requirements(
+    requirements: Sequence[str],
+) -> tuple[tuple[str, frozenset[ArtifactKind], frozenset[EvidenceKind]], ...]:
+    """Map legacy requirement labels to the closed evidence-kind vocabulary."""
+
+    normalized: list[tuple[str, frozenset[ArtifactKind], frozenset[EvidenceKind]]] = []
+    for requirement in requirements:
+        if not isinstance(requirement, str) or not requirement.strip():
+            raise ExecutionValidationError(
+                "evidence requirements must use accepted evidence or artifact kinds"
+            )
+        key = requirement.strip().lower().replace("-", "_").replace(" ", "_")
+        key = _EVIDENCE_REQUIREMENT_ALIASES.get(key, key)
+        try:
+            artifact_kinds, evidence_kinds = _EVIDENCE_REQUIREMENT_KINDS[key]
+        except KeyError as exc:
+            raise ExecutionValidationError(
+                "unknown evidence requirement kind"
+            ) from exc
+        normalized.append((key, artifact_kinds, evidence_kinds))
+    return tuple(normalized)
+
+
+def _evidence_covers_requirements(
+    artifacts: Sequence[VerificationArtifact],
+    requirements: Sequence[tuple[str, frozenset[ArtifactKind], frozenset[EvidenceKind]]],
+) -> bool:
+    return all(
+        any(
+            artifact.artifact_kind in artifact_kinds
+            or artifact.evidence_kind in evidence_kinds
+            for artifact in artifacts
+        )
+        for _, artifact_kinds, evidence_kinds in requirements
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PermissionRequirement:
     """One exact semantic permission needed immediately before execution."""
@@ -305,7 +422,9 @@ class TaskExecutionSpec:
         if not isinstance(self.profile, TaskProfile):
             raise ExecutionValidationError("profile must be a TaskProfile")
         object.__setattr__(self, "instructions", _non_empty_string(self.instructions, "instructions"))
-        object.__setattr__(self, "workspace", _path(self.workspace, "workspace"))
+        object.__setattr__(
+            self, "workspace", _canonical_workspace(self.workspace, "workspace")
+        )
         capabilities = _capability_set(self.runtime_capabilities)
         object.__setattr__(self, "runtime_capabilities", capabilities)
         object.__setattr__(self, "toolsets", _string_tuple(self.toolsets, "toolsets"))
@@ -490,9 +609,12 @@ class CoordinatorResult:
                 object.__setattr__(self, "status", CoordinatorStatus(self.status))
             except (TypeError, ValueError) as exc:
                 raise ExecutionValidationError("status must be a CoordinatorStatus") from exc
-        object.__setattr__(self, "summary", sanitize_summary(self.summary))
-        if not self.summary:
+        # The caller-supplied summary is intentionally discarded.  Keeping the
+        # result as a closed status projection prevents a runtime response,
+        # verifier message, or exception from becoming mission-facing data.
+        if not isinstance(self.summary, str) or not self.summary.strip():
             raise ExecutionValidationError("summary must be a non-empty string")
+        object.__setattr__(self, "summary", _controller_summary(self.status))
         if not isinstance(self.task_id, (str, type(None))):
             raise ExecutionValidationError("task_id must be a string or None")
         if not isinstance(self.attempt_id, (str, type(None))):
@@ -528,6 +650,150 @@ def _runtime_metrics(result: RuntimeResult, latency_ms: int) -> tuple[int, float
     return total_tokens, float(estimated_cost), max(0, int(latency_ms))
 
 
+def _observed_runtime_cost(result: Any) -> float | None:
+    """Return a trustworthy observed cost, or ``None`` when it is unknown."""
+
+    value = getattr(result, "estimated_cost_usd", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    cost = float(value)
+    if not math.isfinite(cost) or cost < 0.0:
+        return None
+    return cost
+
+
+def _safe_relative_locator(value: str) -> str | None:
+    try:
+        decoded = unquote(value)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not decoded
+        or decoded.startswith("/")
+        or "\\" in decoded
+        or any(unicodedata.category(character).startswith("C") for character in decoded)
+    ):
+        return None
+    path = PurePosixPath(decoded)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    if str(path) != decoded:
+        return None
+    return decoded
+
+
+def _validated_candidate_locator(locator: str, workspace: Path) -> tuple[str, str] | None:
+    """Validate an internal verifier locator before projecting it publicly."""
+
+    try:
+        parsed = urlsplit(locator)
+    except (TypeError, ValueError):
+        return None
+    if parsed.fragment or any(character in parsed.netloc for character in "@:"):
+        return None
+
+    if parsed.scheme == "artifact":
+        if (
+            parsed.netloc != "sha256"
+            or not _SHA256_PATTERN.fullmatch(parsed.path[1:])
+            or not parsed.path.startswith("/")
+            or parsed.query
+        ):
+            return None
+        return "artifact", parsed.path[1:]
+
+    if parsed.scheme not in {"workspace", "workspace-diff", "workspace-test"}:
+        return None
+
+    relative = _safe_relative_locator(parsed.netloc + parsed.path)
+    if relative is None:
+        return None
+
+    if parsed.scheme == "workspace":
+        if parsed.query:
+            return None
+        return "legacy-workspace", relative
+
+    try:
+        query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+    query_keys = [key for key, _ in query]
+    if query_keys.count("sha256") != 1:
+        return None
+    if any(key not in {"sha256", "command"} for key in query_keys):
+        return None
+    if parsed.scheme == "workspace-diff" and "command" in query_keys:
+        return None
+    digest = next(value for key, value in query if key == "sha256")
+    if not _SHA256_PATTERN.fullmatch(digest):
+        return None
+    workspace_name = _safe_relative_locator(workspace.name)
+    if workspace_name is None or not (
+        relative == workspace_name or relative.startswith(workspace_name + "/")
+    ):
+        return None
+    return parsed.scheme, digest
+
+
+def _public_artifact_projection(
+    verification: Any,
+    artifact: VerificationArtifact,
+    workspace: Path,
+    ordinal: int,
+) -> tuple[str, str, str]:
+    """Return controller-owned display fields for one verified artifact."""
+
+    candidate = _validated_candidate_locator(artifact.locator, workspace)
+    if candidate is None:
+        raise ExecutionValidationError("workspace verifier returned an invalid locator")
+
+    candidate_kind, candidate_value = candidate
+    if candidate_kind == "artifact":
+        digest = candidate_value
+        locator = f"artifact://sha256/{digest}"
+    else:
+        fingerprint = getattr(verification, "change_fingerprint", None)
+        seed = (
+            f"{fingerprint!s}:{artifact.artifact_kind.value}:"
+            f"{artifact.evidence_kind.value}:{ordinal}"
+        )
+        digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()
+        if candidate_kind == "legacy-workspace":
+            locator = f"artifact://sha256/{digest}"
+        else:
+            locator = (
+                f"{candidate_kind}://{quote(workspace.name, safe='')}?sha256={digest}"
+            )
+
+    display_names = {
+        ArtifactKind.SOURCE: "Verified source",
+        ArtifactKind.DIFF: "Verified workspace changes",
+        ArtifactKind.TEST_REPORT: "Verified test report",
+        ArtifactKind.PREVIEW: "Verified walkthrough",
+        ArtifactKind.DEPLOYMENT: "Verified deployment",
+        ArtifactKind.LOG: "Verified log",
+        ArtifactKind.DOCUMENT: "Verified document",
+        ArtifactKind.OTHER: "Verified workspace artifact",
+    }
+    evidence_summaries = {
+        EvidenceKind.TEST: "The verified test evidence supports this task.",
+        EvidenceKind.WALKTHROUGH: "The verified walkthrough supports this task.",
+        EvidenceKind.REVIEW: "The verified review supports this task.",
+        EvidenceKind.ARTIFACT: "The verified workspace artifact supports this task.",
+        EvidenceKind.APPROVAL: "The verified approval supports this task.",
+        EvidenceKind.REQUIREMENT_COVERAGE: (
+            "The verified requirement coverage supports this task."
+        ),
+        EvidenceKind.OTHER: "The verified evidence supports this task.",
+    }
+    return (
+        display_names[artifact.artifact_kind],
+        locator,
+        evidence_summaries[artifact.evidence_kind],
+    )
+
+
 class ExecutionCoordinator:
     """Run at most one mission task's bounded execution sequence per tick."""
 
@@ -550,6 +816,10 @@ class ExecutionCoordinator:
             raise ExecutionValidationError("workforce_compiler must provide compile")
         if not callable(getattr(model_router, "select", None)):
             raise ExecutionValidationError("model_router must provide select")
+        if not callable(getattr(model_router, "reserve", None)):
+            raise ExecutionValidationError("model_router must provide reserve")
+        if not callable(getattr(model_router, "release", None)):
+            raise ExecutionValidationError("model_router must provide release")
         if not callable(getattr(task_spec_provider, "get", None)):
             raise ExecutionValidationError("task_spec_provider must provide get")
         if not callable(
@@ -685,6 +955,13 @@ class ExecutionCoordinator:
         spec = self.task_spec_provider.get(task)
         _validate_spec_for_task(spec, task)
 
+        if not self._workspace_authority_matches(spec):
+            return self._invalid_task_result(mission_id, task.task_id)
+        try:
+            _normalize_evidence_requirements(spec.profile.evidence_requirements)
+        except ExecutionValidationError:
+            return self._invalid_task_result(mission_id, task.task_id)
+
         if spec.material_ambiguity:
             self._escalate_once(
                 mission_id,
@@ -750,23 +1027,49 @@ class ExecutionCoordinator:
                     task_id=task.task_id,
                 )
 
+            # Runtime resolution is an internal route concern.  Resolve it
+            # before creating a durable attempt so a missing adapter can never
+            # strand a created or running attempt.
+            try:
+                runtime = self._resolve_runtime(decision.route_id)
+                if not callable(getattr(runtime, "run", None)):
+                    raise RuntimeResolutionError(decision.route_id)
+            except Exception:  # noqa: BLE001 - private route failures are recoverable
+                excluded.add(decision.route_id)
+                continue
+
             ordinal = attempt_count + 1
+            try:
+                reservation = self.model_router.reserve(
+                    decision,
+                    reservation_id=(
+                        f"execution:{mission_id}:{task.task_id}:{ordinal}"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - budget/concurrency is recoverable
+                excluded.add(decision.route_id)
+                continue
+
             idempotency_key = (
                 f"attempt:{mission_id}:{task.task_id}:{decision.route_id}:{ordinal}"
             )
-            attempt = self.mission_service.create_attempt(
-                mission_id,
-                task.task_id,
-                idempotency_key,
-                worker_role_id=envelope.envelope_id,
-                route_id=decision.route_id,
-                quality_floor=envelope.quality_floor,
-            )
-            claimed = self.mission_service.claim_attempt(
-                attempt.attempt_id,
-                self.lease_owner,
-                lease_seconds=self.lease_seconds,
-            )
+            try:
+                attempt = self.mission_service.create_attempt(
+                    mission_id,
+                    task.task_id,
+                    idempotency_key,
+                    worker_role_id=envelope.envelope_id,
+                    route_id=decision.route_id,
+                    quality_floor=envelope.quality_floor,
+                )
+                claimed = self.mission_service.claim_attempt(
+                    attempt.attempt_id,
+                    self.lease_owner,
+                    lease_seconds=self.lease_seconds,
+                )
+            except Exception:
+                self._settle_reservation(reservation, actual_cost_usd=0.0)
+                raise
             last_attempt_id = claimed.attempt_id
             current_task = self.mission_service.get_task(task.task_id)
             if current_task.state in {TaskStatus.READY, TaskStatus.VERIFYING}:
@@ -776,17 +1079,24 @@ class ExecutionCoordinator:
                 mission_id, current_task, spec.permission_requirements
             )
             if authorization_error is not None:
-                self.mission_service.interrupt_attempt(
-                    claimed.attempt_id,
-                    reason=authorization_error,
-                    lease_owner=self.lease_owner,
-                    fencing_token=claimed.fencing_token,
-                )
+                try:
+                    self.mission_service.interrupt_attempt(
+                        claimed.attempt_id,
+                        reason=(
+                            "The required authority could not be confirmed safely."
+                        ),
+                        lease_owner=self.lease_owner,
+                        fencing_token=claimed.fencing_token,
+                    )
+                finally:
+                    self._settle_reservation(reservation, actual_cost_usd=0.0)
                 self._escalate_permission(
                     mission_id,
                     task.task_id,
                     None,
-                    detail=authorization_error,
+                    detail=(
+                        "The required authority could not be confirmed safely."
+                    ),
                 )
                 return self._result(
                     mission_id,
@@ -808,10 +1118,10 @@ class ExecutionCoordinator:
                 isolation=spec.isolation,
             )
             started = time.monotonic()
-            runtime = self._resolve_runtime(decision.route_id)
             try:
                 runtime_result = runtime.run(runtime_job)
             except Exception:  # noqa: BLE001 - runtime effects may be unknown
+                self._settle_reservation(reservation)
                 return self._result(
                     mission_id,
                     CoordinatorStatus.UNKNOWN_OUTCOME,
@@ -820,6 +1130,11 @@ class ExecutionCoordinator:
                     attempt_id=claimed.attempt_id,
                 )
             latency_ms = max(0, round((time.monotonic() - started) * 1000))
+            observed_cost = _observed_runtime_cost(runtime_result)
+            self._settle_reservation(
+                reservation,
+                actual_cost_usd=observed_cost,
+            )
 
             status = _runtime_result_status(runtime_result)
             if not isinstance(runtime_result, RuntimeResult) or (
@@ -838,14 +1153,11 @@ class ExecutionCoordinator:
                 ),
                 latency_ms,
             )
+            if observed_cost is None:
+                estimated_cost = reservation.reserved_cost_usd
 
             if status is RuntimeStatus.NEEDS_USER:
-                response = sanitize_summary(
-                    runtime_result.response,
-                    fallback="The runtime needs user input before it can continue.",
-                )
-                if not response:
-                    response = "The runtime needs user input before it can continue."
+                response = _RUNTIME_SUMMARIES[RuntimeStatus.NEEDS_USER]
                 self.mission_service.interrupt_attempt(
                     claimed.attempt_id,
                     reason=response,
@@ -858,7 +1170,7 @@ class ExecutionCoordinator:
                     title="Runtime needs user input",
                     reason=response,
                     impact="The task cannot continue until the requested input is provided.",
-                    requested_action=response,
+                    requested_action="Provide the requested input in Kora to continue.",
                 )
                 return self._result(
                     mission_id,
@@ -869,12 +1181,12 @@ class ExecutionCoordinator:
                 )
 
             if status is not RuntimeStatus.COMPLETED:
-                failure_summary = sanitize_summary(
-                    getattr(runtime_result, "response", ""),
-                    fallback="The runtime did not produce a usable result.",
+                failure_status = (
+                    status
+                    if status in {RuntimeStatus.FAILED, RuntimeStatus.UNSTRUCTURED}
+                    else RuntimeStatus.UNSTRUCTURED
                 )
-                if not failure_summary:
-                    failure_summary = "The runtime did not produce a usable result."
+                failure_summary = _RUNTIME_SUMMARIES[failure_status]
                 self.mission_service.fail_attempt(
                     claimed.attempt_id,
                     error_summary=failure_summary,
@@ -928,6 +1240,58 @@ class ExecutionCoordinator:
         return self._retry_exhausted(
             mission_id, task.task_id, attempt_id=last_attempt_id
         )
+
+    @staticmethod
+    def _workspace_authority_matches(spec: TaskExecutionSpec) -> bool:
+        canonical_workspace = _canonical_workspace(spec.workspace)
+        if spec.workspace != canonical_workspace:
+            return False
+        expected_resource = str(canonical_workspace)
+        return all(
+            requirement.action
+            not in {
+                PermissionAction.WRITE_WORKSPACE,
+                PermissionAction.EXECUTE_WORKSPACE,
+            }
+            or requirement.resource == expected_resource
+            for requirement in spec.permission_requirements
+        )
+
+    def _invalid_task_result(
+        self,
+        mission_id: str,
+        task_id: str,
+    ) -> CoordinatorResult:
+        self._escalate_once(
+            mission_id,
+            task_id,
+            title="Invalid task specification",
+            reason="The task specification could not be validated safely.",
+            impact="Execution is paused until the task boundary is corrected.",
+            requested_action="Review and correct the task specification.",
+        )
+        return self._result(
+            mission_id,
+            CoordinatorStatus.WAITING_FOR_USER,
+            "The task specification could not be validated safely.",
+            task_id=task_id,
+        )
+
+    def _settle_reservation(
+        self,
+        reservation: RouteReservation,
+        *,
+        actual_cost_usd: float | None = None,
+    ) -> None:
+        """Close a reservation without exposing router state to mission data."""
+
+        if actual_cost_usd is None:
+            self.model_router.release(reservation)
+        else:
+            self.model_router.release(
+                reservation,
+                actual_cost_usd=actual_cost_usd,
+            )
 
     def _resolve_runtime(self, route_id: str) -> Runtime:
         resolver = self.runtime_resolver
@@ -1009,71 +1373,99 @@ class ExecutionCoordinator:
                     baseline_ref=spec.baseline_ref,
                 )
             )
-            artifacts = tuple(getattr(verification, "artifacts", ()))
-            persisted_evidence: list[Evidence] = []
-            for artifact in artifacts:
-                if not isinstance(artifact, VerificationArtifact):
-                    raise ExecutionValidationError(
-                        "workspace verifier returned an invalid artifact"
-                    )
-                record = self.mission_service.record_artifact(
-                    mission_id,
-                    artifact.name,
-                    artifact.locator,
-                    kind=artifact.artifact_kind,
-                    task_id=task.task_id,
-                )
-                evidence = self.mission_service.record_evidence(
-                    mission_id,
-                    sanitize_summary(
-                        artifact.summary,
-                        fallback="Verified workspace artifact.",
-                    )
-                    or "Verified workspace artifact.",
-                    kind=artifact.evidence_kind,
-                    artifact_id=record.artifact_id,
-                    task_id=task.task_id,
-                    locator=artifact.locator,
-                )
-                persisted_evidence.append(evidence)
-
             accepted = bool(getattr(verification, "accepted", False))
-            verified_count = 0
-            if accepted:
-                for evidence in persisted_evidence:
-                    verified = self.mission_service.verify_evidence(
-                        evidence.evidence_id,
-                        _VERIFICATION_METHOD,
-                    )
-                    if getattr(verified, "verified_at", None) is not None:
-                        verified_count += 1
-            accepted = accepted and bool(artifacts) and verified_count > 0
             if not accepted:
-                summary = sanitize_summary(
-                    getattr(verification, "summary", ""),
-                    fallback="Independent workspace verification rejected the result.",
-                )
-                if not summary:
-                    summary = "Independent workspace verification rejected the result."
                 self._fail_verification(
                     mission_id,
                     task,
                     spec.profile,
                     attempt,
                     route_id,
-                    summary,
+                    "The outcome could not be confirmed safely.",
                     total_tokens,
                     estimated_cost,
                     latency_ms,
                 )
                 return None
 
-            summary = sanitize_summary(
-                getattr(verification, "summary", ""),
-                fallback="Independent workspace verification accepted the result.",
+            artifacts = tuple(getattr(verification, "artifacts", ()))
+            projected_artifacts: list[tuple[str, str, str, VerificationArtifact]] = []
+            for ordinal, artifact in enumerate(artifacts, start=1):
+                if not isinstance(artifact, VerificationArtifact):
+                    raise ExecutionValidationError(
+                        "workspace verifier returned an invalid artifact"
+                    )
+                name, locator, evidence_summary = _public_artifact_projection(
+                    verification,
+                    artifact,
+                    spec.workspace,
+                    ordinal,
+                )
+                projected_artifacts.append(
+                    (name, locator, evidence_summary, artifact)
+                )
+
+            requirements = _normalize_evidence_requirements(
+                spec.profile.evidence_requirements
             )
-            if not summary:
-                summary = "Independent workspace verification accepted the result."
+            if not projected_artifacts or not _evidence_covers_requirements(
+                tuple(item[3] for item in projected_artifacts), requirements
+            ):
+                self._fail_verification(
+                    mission_id,
+                    task,
+                    spec.profile,
+                    attempt,
+                    route_id,
+                    "The outcome could not be confirmed safely.",
+                    total_tokens,
+                    estimated_cost,
+                    latency_ms,
+                )
+                return None
+
+            persisted_evidence: list[Evidence] = []
+            for name, locator, evidence_summary, artifact in projected_artifacts:
+                record = self.mission_service.record_artifact(
+                    mission_id,
+                    name,
+                    locator,
+                    kind=artifact.artifact_kind,
+                    task_id=task.task_id,
+                )
+                evidence = self.mission_service.record_evidence(
+                    mission_id,
+                    evidence_summary,
+                    kind=artifact.evidence_kind,
+                    artifact_id=record.artifact_id,
+                    task_id=task.task_id,
+                    locator=locator,
+                )
+                persisted_evidence.append(evidence)
+
+            verified_count = 0
+            for evidence in persisted_evidence:
+                verified = self.mission_service.verify_evidence(
+                    evidence.evidence_id,
+                    _VERIFICATION_METHOD,
+                )
+                if getattr(verified, "verified_at", None) is not None:
+                    verified_count += 1
+            if verified_count != len(persisted_evidence):
+                self._fail_verification(
+                    mission_id,
+                    task,
+                    spec.profile,
+                    attempt,
+                    route_id,
+                    "The outcome could not be confirmed safely.",
+                    total_tokens,
+                    estimated_cost,
+                    latency_ms,
+                )
+                return None
+
+            summary = "The workspace change was independently verified."
             self.mission_service.succeed_attempt(
                 attempt.attempt_id,
                 result_summary=summary,
@@ -1133,12 +1525,16 @@ class ExecutionCoordinator:
         estimated_cost: float,
         latency_ms: int,
     ) -> None:
+        # Verification providers are untrusted implementation details.  Keep
+        # their text out of durable attempt fields even when a caller passes it
+        # into this recovery helper.
+        summary = "The outcome could not be confirmed safely."
         current_attempt = self.mission_service.get_attempt(attempt.attempt_id)
         if current_attempt.status in {AttemptStatus.RUNNING, AttemptStatus.VERIFYING}:
             self.mission_service.fail_attempt(
                 attempt.attempt_id,
-                error_summary=sanitize_summary(summary),
-                result_summary=sanitize_summary(summary),
+                error_summary=summary,
+                result_summary=summary,
                 total_tokens=total_tokens,
                 estimated_cost_usd=estimated_cost,
                 latency_ms=latency_ms,
@@ -1374,7 +1770,7 @@ class ExecutionCoordinator:
         return CoordinatorResult(
             mission_id=mission_id,
             status=status,
-            summary=sanitize_summary(summary),
+            summary=_controller_summary(status),
             task_id=task_id,
             attempt_id=attempt_id,
         )

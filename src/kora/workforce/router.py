@@ -523,7 +523,7 @@ class ModelRouter:
             if budget is not None and (
                 self._spent_cost_usd
                 + self._reserved_cost_usd
-                + decision.expected_cost_per_accepted_outcome
+                + decision.expected_attempt_cost_usd
                 > budget
             ):
                 raise NoEligibleRouteError(
@@ -533,7 +533,7 @@ class ModelRouter:
             reservation = RouteReservation(
                 reservation_id=reservation_id,
                 route_id=decision.route_id,
-                reserved_cost_usd=decision.expected_cost_per_accepted_outcome,
+                reserved_cost_usd=decision.expected_attempt_cost_usd,
             )
             self._reservations[reservation_id] = reservation
             self._reserved_cost_usd += reservation.reserved_cost_usd

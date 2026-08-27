@@ -1,7 +1,7 @@
 # Conversation Synthesis
 
 **Status:** Historical synthesis  
-**Coverage:** Product-discovery conversation through 2026-08-26
+**Coverage:** Product-discovery conversation and implementation reconciliation through 2026-08-27
 
 This document preserves the path from an open-ended startup search to Kora.
 It exists because the rejected paths and founder motivations explain the final
@@ -292,6 +292,16 @@ immutable container image digest. OpenHands is only a gated fallback if Hermes
 fails concrete vertical-slice gates, and would have to satisfy the same
 adapter-owned boundary. This does not decide the broader technology stack.
 
+The founder's current runtime decision is to dogfood/test until Kora should
+default to a **NOT-YET-IMPLEMENTED Codex App Server adapter** using
+founder ChatGPT-managed Codex subscription authentication. Codex owns and
+refreshes credentials; tokens never enter Kora durable state or public
+projections, while Kora may privately observe plan/rate-limit state. Production
+must use company-owned API keys/provider accounts with metering, budgets, and
+billing, never a personal Codex subscription. The transport switch must not
+alter Kora's durable mission, permission, evidence, memory, or routing
+contracts.
+
 ## 15. The commercial hypothesis stayed premium and unified
 
 The founder could not imagine the average user paying much more than $300 per
@@ -318,6 +328,23 @@ Kora is now defined as:
 - conservative at external, destructive, costly, or ambiguous boundaries;
 - designed to reproduce more of the user's working judgment over time.
 
-The current repository implements the initial runtime boundary and a persistent
-Kora-owned mission control-plane slice, and documents the product. The
-headless autonomous loop and full Kora experience remain to be built.
+The current repository implements an accepted Kora-owned work-cycle slice and
+the initial runtime boundary. At canonical commit
+`1754168ed09692ed1b5a611ad6b06a220b42543b`, the Sol High review verdict is
+**ACCEPT**, with 27 focused and 168 full tests passing. The offline dogfood
+fixture turns an empty-repository founder brief into a functional,
+zero-dependency waitlist MVP while persisting mission, attempt, permission,
+evidence, lease/fence, recovery, private route-budget, and closed-projection
+state. No P0/P1/P2 findings were identified in the implemented verified
+work-cycle slice. This is not whole-product release readiness.
+
+## 17. Implementation reconciliation
+
+The founder-first wedge remains the starting point for a generalized
+professional coworker, never a decision to shrink Kora to a coding agent. The
+accepted slice proves the control-plane boundary and dogfood work cycle; the
+desktop, mobile/iMessage/voice, cloud workspace/VM fleet, connectors, external
+actions, always-on daemon/scheduler, and full skill-tree/self-learning UX remain
+future gaps. Tagged/pinned Hermes plus immutable-image live evaluation is also
+future hardening, and Hermes remains a replaceable execution harness rather
+than Kora's foundation or source of truth.

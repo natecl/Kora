@@ -1,8 +1,9 @@
-"""Typed, user-readable records owned by the Kora mission control plane.
+"""Typed records owned by the Kora mission control plane.
 
-The records in this module intentionally describe missions, work, authority,
-and evidence only.  Runtime models, providers, prompts, and worker topology
-do not belong in the control-plane data model.
+The semantic records describe missions, work, authority, and evidence.  A
+task attempt may additionally retain opaque private execution identifiers for
+recovery, but runtime model/provider identity, prompts, and raw traces do not
+belong in the control-plane data model.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
+from math import isfinite
 from typing import Any, Mapping
 
 from kora.mission.errors import ValidationError
@@ -153,6 +155,23 @@ TaskState = TaskStatus
 TaskLifecycleState = TaskStatus
 
 
+class AttemptStatus(StrEnum):
+    """Durable lifecycle state of one execution attempt."""
+
+    CREATED = "created"
+    RUNNING = "running"
+    VERIFYING = "verifying"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    UNKNOWN = "unknown"
+
+
+AttemptState = AttemptStatus
+AttemptLifecycleStatus = AttemptStatus
+AttemptLifecycleState = AttemptStatus
+
+
 class AssumptionStatus(StrEnum):
     """Resolution state for an explicit mission assumption."""
 
@@ -220,6 +239,78 @@ class PermissionAction(StrEnum):
     EXTERNAL_OUTREACH = OUTREACH
 
 
+@dataclass(frozen=True, slots=True)
+class AuthorizationRequest:
+    """The immutable semantic binding for one requested authority use.
+
+    Kora compares every field of this value on an idempotent retry.  In
+    particular, ``resource`` is intentionally retained as the exact
+    canonical resource string supplied by the caller; callers cannot retry a
+    use against a broader or otherwise different resource under the same
+    idempotency key.
+    """
+
+    mission_id: str
+    grant_id: str
+    action: PermissionAction
+    resource: str
+    action_count: int = 1
+    spent_cents: int = 0
+    idempotency_key: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mission_id", _non_empty(self.mission_id, "mission_id"))
+        object.__setattr__(self, "grant_id", _non_empty(self.grant_id, "grant_id"))
+        object.__setattr__(
+            self, "action", _coerce_enum(self.action, PermissionAction, "action")
+        )
+        object.__setattr__(self, "resource", _non_empty(self.resource, "resource"))
+        if (
+            isinstance(self.action_count, bool)
+            or not isinstance(self.action_count, int)
+            or self.action_count <= 0
+        ):
+            raise ValidationError("action_count must be a positive integer")
+        if (
+            isinstance(self.spent_cents, bool)
+            or not isinstance(self.spent_cents, int)
+            or self.spent_cents < 0
+        ):
+            raise ValidationError("spent_cents must be a non-negative integer")
+        object.__setattr__(
+            self,
+            "idempotency_key",
+            _non_empty(self.idempotency_key, "idempotency_key"),
+        )
+
+    @property
+    def canonical_resource(self) -> str:
+        """The exact resource string bound by this request."""
+
+        return self.resource
+
+    @property
+    def binding(self) -> tuple[str, str, PermissionAction, str, int, int, str]:
+        """Return all immutable authorization-binding fields in one value."""
+
+        return (
+            self.mission_id,
+            self.grant_id,
+            self.action,
+            self.resource,
+            self.action_count,
+            self.spent_cents,
+            self.idempotency_key,
+        )
+
+
+# These aliases make the semantic value discoverable for callers that use the
+# permission-oriented vocabulary while keeping one immutable implementation.
+PermissionAuthorizationRequest = AuthorizationRequest
+AuthorizationValue = AuthorizationRequest
+PermissionUseRequest = AuthorizationRequest
+
+
 class ArtifactKind(StrEnum):
     """Kinds of durable artifacts that can support evidence."""
 
@@ -264,6 +355,14 @@ class EventType(StrEnum):
     ARTIFACT_RECORDED = "artifact_recorded"
     EVIDENCE_RECORDED = "evidence_recorded"
     EVIDENCE_VERIFIED = "evidence_verified"
+    ATTEMPT_CREATED = "attempt_created"
+    ATTEMPT_TRANSITIONED = "attempt_transitioned"
+    ATTEMPT_LEASE_RENEWED = "attempt_lease_renewed"
+
+    # A claim is an attempt transition.  The alias keeps the vocabulary
+    # discoverable for callers that name that transition explicitly without
+    # creating a second audit record for one state change.
+    ATTEMPT_CLAIMED = ATTEMPT_TRANSITIONED
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +474,167 @@ class Task:
         """Alias for callers that name the lifecycle field ``status``."""
 
         return self.state
+
+
+@dataclass(frozen=True, slots=True)
+class TaskAttempt:
+    """A durable, model/provider-agnostic execution attempt for one task.
+
+    ``worker_role_id`` and ``route_id`` are opaque private identifiers.  They
+    let the execution coordinator correlate an attempt with its private
+    execution plan without making model or provider identity part of the
+    mission domain projection.
+    """
+
+    attempt_id: str
+    mission_id: str
+    task_id: str
+    idempotency_key: str
+    worker_role_id: str
+    route_id: str
+    status: AttemptStatus = AttemptStatus.CREATED
+    quality_floor: float = 0.0
+    lease_owner: str | None = None
+    fencing_token: int = 0
+    lease_expires_at: datetime | None = None
+    result_summary: str = ""
+    error_summary: str = ""
+    total_tokens: int | None = None
+    estimated_cost_usd: float | None = None
+    latency_ms: int | None = None
+    accepted: bool | None = None
+    revision: int = 0
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "attempt_id",
+            "mission_id",
+            "task_id",
+            "idempotency_key",
+            "worker_role_id",
+            "route_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _non_empty(getattr(self, field_name), field_name),
+            )
+        object.__setattr__(
+            self, "status", _coerce_enum(self.status, AttemptStatus, "status")
+        )
+        if isinstance(self.quality_floor, bool) or not isinstance(
+            self.quality_floor, (int, float)
+        ):
+            raise ValidationError("quality_floor must be a number between 0 and 1")
+        quality_floor = float(self.quality_floor)
+        if not isfinite(quality_floor) or quality_floor < 0.0 or quality_floor > 1.0:
+            raise ValidationError("quality_floor must be a number between 0 and 1")
+        object.__setattr__(self, "quality_floor", quality_floor)
+        object.__setattr__(
+            self, "lease_owner", _optional_non_empty(self.lease_owner, "lease_owner")
+        )
+        if (
+            isinstance(self.fencing_token, bool)
+            or not isinstance(self.fencing_token, int)
+            or self.fencing_token < 0
+        ):
+            raise ValidationError("fencing_token must be a non-negative integer")
+        if self.lease_expires_at is not None:
+            object.__setattr__(
+                self,
+                "lease_expires_at",
+                normalize_timestamp(self.lease_expires_at),
+            )
+        if (self.lease_owner is None) != (self.lease_expires_at is None):
+            raise ValidationError(
+                "lease_owner and lease_expires_at must be provided together"
+            )
+        for field_name in ("result_summary", "error_summary"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str):
+                raise ValidationError(f"{field_name} must be a string")
+        if self.total_tokens is not None:
+            if (
+                isinstance(self.total_tokens, bool)
+                or not isinstance(self.total_tokens, int)
+                or self.total_tokens < 0
+            ):
+                raise ValidationError("total_tokens must be a non-negative integer")
+        if self.estimated_cost_usd is not None:
+            if isinstance(self.estimated_cost_usd, bool) or not isinstance(
+                self.estimated_cost_usd, (int, float)
+            ):
+                raise ValidationError(
+                    "estimated_cost_usd must be a non-negative number"
+                )
+            estimated_cost_usd = float(self.estimated_cost_usd)
+            if not isfinite(estimated_cost_usd) or estimated_cost_usd < 0.0:
+                raise ValidationError(
+                    "estimated_cost_usd must be a non-negative number"
+                )
+            object.__setattr__(self, "estimated_cost_usd", estimated_cost_usd)
+        if self.latency_ms is not None:
+            if (
+                isinstance(self.latency_ms, bool)
+                or not isinstance(self.latency_ms, int)
+                or self.latency_ms < 0
+            ):
+                raise ValidationError("latency_ms must be a non-negative integer")
+        if self.accepted is not None and not isinstance(self.accepted, bool):
+            raise ValidationError("accepted must be a boolean or None")
+        if (
+            isinstance(self.revision, bool)
+            or not isinstance(self.revision, int)
+            or self.revision < 0
+        ):
+            raise ValidationError("revision must be a non-negative integer")
+        object.__setattr__(self, "created_at", normalize_timestamp(self.created_at))
+        object.__setattr__(self, "updated_at", normalize_timestamp(self.updated_at))
+        for field_name in ("started_at", "finished_at"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, normalize_timestamp(value))
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether this attempt has a closed outcome."""
+
+        return self.status in {
+            AttemptStatus.SUCCEEDED,
+            AttemptStatus.FAILED,
+            AttemptStatus.INTERRUPTED,
+        }
+
+    @property
+    def state(self) -> AttemptStatus:
+        """Compatibility alias for callers that use ``state`` for lifecycle."""
+
+        return self.status
+
+    @property
+    def is_live(self) -> bool:
+        """Whether this attempt still owns the task's live attempt slot."""
+
+        return self.status in {
+            AttemptStatus.CREATED,
+            AttemptStatus.RUNNING,
+            AttemptStatus.VERIFYING,
+            AttemptStatus.UNKNOWN,
+        }
+
+    def has_active_lease(self, at: datetime | None = None) -> bool:
+        """Return whether the persisted lease is currently unexpired."""
+
+        now = normalize_timestamp(at or utc_now())
+        return (
+            self.lease_owner is not None
+            and self.lease_expires_at is not None
+            and self.lease_expires_at > now
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -773,6 +1033,57 @@ class PermissionGrant:
         ):
             return False
         return self.expires_at is None or self.expires_at > now
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionUse:
+    """Immutable persisted record of one exact permission authorization use."""
+
+    use_id: str
+    mission_id: str
+    grant_id: str
+    action: PermissionAction
+    resource: str
+    idempotency_key: str
+    action_count: int
+    spent_cents: int
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        for field_name in ("use_id", "mission_id", "grant_id", "resource", "idempotency_key"):
+            object.__setattr__(
+                self, field_name, _non_empty(getattr(self, field_name), field_name)
+            )
+        object.__setattr__(
+            self, "action", _coerce_enum(self.action, PermissionAction, "action")
+        )
+        if (
+            isinstance(self.action_count, bool)
+            or not isinstance(self.action_count, int)
+            or self.action_count <= 0
+        ):
+            raise ValidationError("action_count must be a positive integer")
+        if (
+            isinstance(self.spent_cents, bool)
+            or not isinstance(self.spent_cents, int)
+            or self.spent_cents < 0
+        ):
+            raise ValidationError("spent_cents must be a non-negative integer")
+        object.__setattr__(self, "created_at", normalize_timestamp(self.created_at))
+
+    @property
+    def authorization_request(self) -> AuthorizationRequest:
+        """Reconstruct the exact immutable request represented by this use."""
+
+        return AuthorizationRequest(
+            mission_id=self.mission_id,
+            grant_id=self.grant_id,
+            action=self.action,
+            resource=self.resource,
+            action_count=self.action_count,
+            spent_cents=self.spent_cents,
+            idempotency_key=self.idempotency_key,
+        )
 
 
 @dataclass(frozen=True, slots=True)

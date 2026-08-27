@@ -1,23 +1,32 @@
 # Portion 1 Mission Control Plane
 
-**Status:** Proposed implementation design for the approved next engineering slice
-**Updated:** 2026-08-26
+**Status:** Accepted implementation slice and boundary design
+**Updated:** 2026-08-27
+**Canonical code commit:** `1754168ed09692ed1b5a611ad6b06a220b42543b`
 
-This document describes the Kora-owned mission control plane needed to prove a
-headless autonomous development loop. It is deliberately above the existing
-Hermes execution adapters and below future desktop, phone, connector, and
-deployment surfaces. It refines the existing PRD and architecture; it does not
-replace or amend their normative product decisions.
+This document describes the accepted Kora-owned mission control plane work
+cycle. It is deliberately above the existing Hermes execution adapters and
+below future desktop, phone, connector, and deployment surfaces. It refines the
+existing PRD and architecture; it does not replace or amend their normative
+product decisions or claim whole-product release readiness.
 
 ## 1. Purpose and scope
 
-Portion 1 should make one thing demonstrable:
+The accepted Portion 1 slice makes one thing demonstrable:
 
 > After the owner explicitly approves one bounded product-development mission,
 > Kora can select and execute the next valuable task in a disposable cloud
 > workspace, preserve intent and authority outside the model session, verify
 > the result with evidence, and stop or ask for the smallest human input when
 > the path is blocked.
+
+The verified dogfood fixture starts with an empty repository and a founder brief
+and produces a functional, zero-dependency waitlist MVP. At canonical commit
+`1754168ed09692ed1b5a611ad6b06a220b42543b`, the Sol High review verdict is
+**ACCEPT**; 27 focused acceptance/regression tests and 168 full-suite tests pass.
+No P0/P1/P2 findings were identified in the implemented verified work-cycle
+slice. This is a control-plane proof only, not a release claim for the complete
+Kora product.
 
 The control plane owns mission meaning, lifecycle, authority, prioritization,
 evidence, and recovery. The runtime owns execution mechanics. A model may
@@ -38,6 +47,11 @@ durable state and policy that define the product:
 - semantic permissions and decision authority;
 - evidence, evaluation, and completion criteria;
 - cloud-workspace policy, isolation, and recovery rules.
+
+The current code also proves durable task attempts, leases and fencing,
+budget reservation/settlement for private routes, descriptor-bound workspace
+execution, closed public projections, and bounded evidence for tracked,
+ignored, untracked, empty-directory, and nested-`.git` state.
 
 Hermes memory, scheduler, approvals, and self-improvement state are never
 authoritative. An adapter may use those capabilities to execute a Kora task,
@@ -75,6 +89,15 @@ Portion 1 includes:
 The proposed CLI and service operations are intentionally small. They are the
 headless contract that later desktop, phone, and cloud surfaces can call.
 
+The next live-runtime slice is a **NOT-YET-IMPLEMENTED Codex App Server
+adapter**. For founder dogfood/testing it is intended to use the founder's
+ChatGPT-managed Codex subscription authentication; Codex owns and refreshes
+credentials, tokens never enter Kora durable state or public projections, and
+Kora may privately observe plan/rate-limit state. Production uses
+company-owned API keys/provider accounts with metering, budgets, and billing,
+never a personal Codex subscription. The transport switch must preserve Kora's
+durable mission, permission, evidence, memory, and routing contracts.
+
 ## 2. Authority and behavior contract
 
 ### 2.1 Source authority order
@@ -103,9 +126,9 @@ cannot outrank the active mission or an explicit owner decision.
 
 ### 2.2 Behavioral rules enforced outside the model
 
-- **Align before action:** a mission starts in
-  `AWAITING_MISSION_APPROVAL`; only an explicit owner approval moves it to
-  `ACTIVE`.
+- **Align before action:** a mission starts in `PROPOSED`, becomes `ALIGNED`
+  after its contract is ready, and reaches `ACTIVE` only through an explicit
+  owner approval.
 - **One mission:** the controller permits at most one non-terminal overarching
   mission. Internal tasks and subgoals remain children of that mission.
 - **Intent fidelity:** safe reversible inferences are recorded as assumptions;
@@ -116,6 +139,13 @@ cannot outrank the active mission or an explicit owner decision.
 - **Authority separation:** a runtime capability is necessary but not
   sufficient for a consequential action. The controller also requires a
   matching, unexpired, in-scope permission grant.
+- **Exact semantic authority:** preflight and authorization must match the
+  active mission, permission grant, action class, resource scope, applicable
+  limits, and idempotency key. A connector, capability, or runtime request
+  cannot supply any missing part of that authority.
+- **Budget discipline:** a private model route is reserved before execution and
+  settled with actual usage or a bounded failure outcome; reservation and
+  settlement do not become user-facing routing controls.
 - **Evidence gate:** a runtime completion marker is only a candidate result.
   The controller requires attached and verified evidence before completing a
   task or mission.
@@ -124,9 +154,16 @@ cannot outrank the active mission or an explicit owner decision.
   affected work. No unrelated work is manufactured to look autonomous.
 - **One visible Kora:** records contain concise rationale, decisions,
   assumptions, evidence, and state. They do not expose prompts, chain of
-  thought, model/provider identity, worker topology, or raw runtime traces.
+  thought, model/provider identity, worker topology, route details, tokens, or
+  raw runtime traces. Public projections are closed Kora-owned allowlists.
 
 ## 3. Control-plane concepts
+
+The record definitions below are the intended stable application contract. The
+current implementation proves the durable mission/task/attempt/permission/
+evidence subset and the guards described in the accepted slice; fields or
+surfaces not present in the source remain target design, not current-state
+claims.
 
 ### 3.1 Common record rules
 
@@ -395,48 +432,47 @@ and an event in one database transaction.
 
 ### 4.1 Mission lifecycle
 
-The mission states preserve the architecture's canonical state names.
+The implemented mission states are the domain enum in
+[`src/kora/mission/domain.py`](../src/kora/mission/domain.py). Product labels
+such as context ingestion and external-action approval are future projections,
+not additional control-plane states.
 
 | From | To | Guard |
 |---|---|---|
-| `INGESTING` | `ALIGNING_CONTEXT` | Required initial context/mission inputs are discovered. |
-| `ALIGNING_CONTEXT` | `AWAITING_MISSION_APPROVAL` | Context receipt, exclusions, conflicts, proposed authority, and mission contract are ready for the owner. |
-| `AWAITING_MISSION_APPROVAL` | `ACTIVE` | The authoritative owner explicitly accepts the mission contract and approval scope. |
-| `ACTIVE` | `AWAITING_USER` | A critical-path escalation, missing artifact/access, unresolved judgment, or runtime `NEEDS_USER` result blocks progress. |
-| `ACTIVE` | `READY_FOR_REVIEW` | Mission-level acceptance evidence has been produced and awaits verification/review. |
-| `ACTIVE` | `AWAITING_EXTERNAL_ACTION_APPROVAL` | The next mission step is a consequential external action without an applicable grant. |
-| `ACTIVE` | `PAUSED` | The owner asks Kora to stop, a safety boundary is reached, or recovery cannot establish a safe workspace. |
-| `AWAITING_USER` | `ACTIVE` | The owner supplies the requested response/artifact or resolves the blocking decision. |
-| `AWAITING_USER` | `PAUSED` | The owner asks Kora to stop or the safety boundary remains unresolved. |
-| `AWAITING_EXTERNAL_ACTION_APPROVAL` | `ACTIVE` | The owner approves a bounded action or Kora selects a mission-consistent alternative. |
-| `AWAITING_EXTERNAL_ACTION_APPROVAL` | `AWAITING_USER` | The owner declines and an alternative requires another answer. |
-| `AWAITING_EXTERNAL_ACTION_APPROVAL` | `PAUSED` | The owner asks Kora to stop or the external-action boundary cannot be made safe. |
-| `READY_FOR_REVIEW` | `ACTIVE` | Review finds a gap and the controller creates corrective work. |
-| `READY_FOR_REVIEW` | `COMPLETE` | All definition-of-done conditions and required approvals have verified evidence. |
-| `READY_FOR_REVIEW` | `PAUSED` | The owner asks Kora to stop before review or completion. |
-| `PAUSED` | `ACTIVE` | The owner explicitly resumes and all safety/authority preconditions are still valid. |
+| `PROPOSED` | `ALIGNED` | The mission contract is aligned and ready for explicit owner activation. |
+| `PROPOSED` | `STOPPED` or `FAILED` | The proposed mission is stopped or cannot be formed safely. |
+| `ALIGNED` | `ACTIVE` | The authoritative owner explicitly accepts the mission contract and scope. |
+| `ALIGNED` | `STOPPED` or `FAILED` | The aligned mission is stopped or cannot activate safely. |
+| `ACTIVE` | `WAITING_FOR_USER` | A critical-path escalation, missing authority, or runtime `NEEDS_USER` result blocks progress. |
+| `ACTIVE` | `VERIFYING` | Mission-level acceptance evidence is ready for verification. |
+| `ACTIVE` | `STOPPED` or `FAILED` | The owner stops the mission or recovery cannot establish safe execution. |
+| `WAITING_FOR_USER` | `ACTIVE` | The owner supplies the response/artifact and all preconditions pass. |
+| `WAITING_FOR_USER` | `STOPPED` or `FAILED` | The owner stops or the blocked path cannot recover safely. |
+| `VERIFYING` | `ACTIVE` | Verification finds a gap and corrective work is created. |
+| `VERIFYING` | `COMPLETED` | All required evidence and completion guards pass. |
+| `VERIFYING` | `STOPPED` or `FAILED` | The owner stops or verification/recovery fails. |
 
-`COMPLETE` is terminal for that mission. A new overarching objective requires a
-new mission after the completed record is preserved. Portion 1 mainly exercises
-`AWAITING_MISSION_APPROVAL`, `ACTIVE`, `AWAITING_USER`, `READY_FOR_REVIEW`,
-`PAUSED`, and `COMPLETE`; the other states are defined now so later surfaces do
-not invent a conflicting lifecycle.
+`COMPLETED`, `STOPPED`, and `FAILED` are terminal for that mission. `WAITING`
+is a compatibility alias for `WAITING_FOR_USER`; `COMPLETE` is a compatibility
+alias for `COMPLETED`. A new overarching objective requires a new mission after
+the completed record is preserved.
 
 ### 4.2 Task lifecycle
 
 | From | To | Guard |
 |---|---|---|
-| `PROPOSED` | `READY` | Scope, acceptance criteria, capabilities, authority preflight, and dependencies are valid. |
-| `PROPOSED` | `BLOCKED` | A required dependency, decision, authority, or input is missing. |
-| `READY` | `IN_PROGRESS` | The controller claims the task with a lease and submits a scoped runtime job. |
-| `IN_PROGRESS` | `READY_FOR_REVIEW` | Runtime returns `COMPLETED` with a candidate result; evidence is still unverified. |
-| `IN_PROGRESS` | `WAITING_ON_USER` | Runtime returns `NEEDS_USER` or a user-owned action is required. |
-| `IN_PROGRESS` | `FAILED` | Runtime fails, times out, returns an unstructured result, or violates the runtime contract. |
-| `READY_FOR_REVIEW` | `COMPLETED` | Acceptance evidence is independently verified and attached. |
-| `READY_FOR_REVIEW` | `FAILED` | Review rejects the result or a required criterion is not met. |
+| `READY` | `IN_PROGRESS` | The controller claims the task with a leased, fenced attempt and submits a scoped runtime job. |
+| `READY` | `NEEDS_USER`, `BLOCKED`, or `CANCELLED` | Authority, dependency, user, or stop guards require a different state. |
+| `BLOCKED` | `READY`, `NEEDS_USER`, or `CANCELLED` | The blocker resolves, becomes a user request, or the task is cancelled. |
+| `IN_PROGRESS` | `NEEDS_USER` | Runtime or mission policy requires a user response. |
+| `IN_PROGRESS` | `VERIFYING` | Runtime returns a candidate result and Kora begins independent verification. |
+| `IN_PROGRESS` | `FAILED` or `CANCELLED` | Runtime/recovery fails or the task is stopped. |
+| `NEEDS_USER` | `READY`, `BLOCKED`, `IN_PROGRESS`, `FAILED`, or `CANCELLED` | The response is applied and preflight determines the next safe state. |
+| `VERIFYING` | `IN_PROGRESS` | Verification requires corrective execution. |
+| `VERIFYING` | `NEEDS_USER` | Verification needs a user decision or artifact. |
+| `VERIFYING` | `COMPLETED` | Acceptance evidence is independently verified and attached. |
+| `VERIFYING` | `FAILED` or `CANCELLED` | Review rejects the result or the task is stopped. |
 | `FAILED` | `READY` | A bounded retry or mission-consistent corrective plan is created. |
-| `BLOCKED` | `READY` | The dependency, decision, authority, or input is resolved. |
-| `WAITING_ON_USER` | `READY` | The user response resolves the request and no new preflight issue remains. |
 
 `COMPLETED` is terminal. A failed task is not silently marked complete; the
 controller either retries with evidence or escalates/pauses the mission.
@@ -452,6 +488,7 @@ controller either retries with evidence or escalates/pauses the mission.
 | Escalation | `OPEN`, `ACKNOWLEDGED`, `RESOLVED`, `DECLINED`, `EXPIRED`, `WITHDRAWN` | `OPEN -> ACKNOWLEDGED` on receipt; `ACKNOWLEDGED -> RESOLVED` when the response is applied; an owner decline, expiration, or withdrawal closes the request without pretending the work succeeded. |
 | Permission grant | `PROPOSED`, `ACTIVE`, `CONSUMED`, `DENIED`, `EXPIRED`, `REVOKED` | `PROPOSED -> ACTIVE` only through explicit owner approval; `PROPOSED -> DENIED/EXPIRED`; `ACTIVE -> CONSUMED` for a successful one-time action or `ACTIVE -> EXPIRED/REVOKED` when its limit or authority ends. |
 | Evidence/artifact | `DECLARED`, `ATTACHED`, `VERIFIED`, `REJECTED`, `SUPERSEDED` | `DECLARED -> ATTACHED` after the reference/hash is stored; `ATTACHED -> VERIFIED/REJECTED` through verification; rejected or old items are superseded by a new record rather than edited to look valid. |
+| Task attempt | `CREATED`, `RUNNING`, `VERIFYING`, `SUCCEEDED`, `FAILED`, `INTERRUPTED`, `UNKNOWN` | A fenced lease moves an attempt into execution; runtime/recovery records the outcome; `UNKNOWN` requires reconciliation before authoritative completion. |
 
 There is no implicit transition from a runtime response to a mission or task
 completion. The controller must apply the guard for the relevant record.
@@ -466,8 +503,9 @@ editing an old fact.
 
 | Record | Legal transitions |
 |---|---|
-| Mission | `INGESTING -> ALIGNING_CONTEXT`; `ALIGNING_CONTEXT -> AWAITING_MISSION_APPROVAL`; `AWAITING_MISSION_APPROVAL -> ACTIVE`; `ACTIVE -> AWAITING_USER`, `READY_FOR_REVIEW`, `AWAITING_EXTERNAL_ACTION_APPROVAL`, or `PAUSED`; `AWAITING_USER -> ACTIVE` or `PAUSED`; `AWAITING_EXTERNAL_ACTION_APPROVAL -> ACTIVE`, `AWAITING_USER`, or `PAUSED`; `READY_FOR_REVIEW -> ACTIVE`, `COMPLETE`, or `PAUSED`; `PAUSED -> ACTIVE`. |
-| Task | `PROPOSED -> READY` or `BLOCKED`; `READY -> IN_PROGRESS`; `IN_PROGRESS -> READY_FOR_REVIEW`, `WAITING_ON_USER`, or `FAILED`; `READY_FOR_REVIEW -> COMPLETED` or `FAILED`; `FAILED -> READY`; `BLOCKED -> READY`; `WAITING_ON_USER -> READY`. |
+| Mission | `PROPOSED -> ALIGNED`, `STOPPED`, or `FAILED`; `ALIGNED -> ACTIVE`, `STOPPED`, or `FAILED`; `ACTIVE -> WAITING_FOR_USER`, `VERIFYING`, `STOPPED`, or `FAILED`; `WAITING_FOR_USER -> ACTIVE`, `STOPPED`, or `FAILED`; `VERIFYING -> ACTIVE`, `COMPLETED`, `STOPPED`, or `FAILED`. |
+| Task | `READY -> IN_PROGRESS`, `NEEDS_USER`, `BLOCKED`, or `CANCELLED`; `BLOCKED -> READY`, `NEEDS_USER`, or `CANCELLED`; `IN_PROGRESS -> NEEDS_USER`, `VERIFYING`, `FAILED`, or `CANCELLED`; `NEEDS_USER -> READY`, `BLOCKED`, `IN_PROGRESS`, `FAILED`, or `CANCELLED`; `VERIFYING -> IN_PROGRESS`, `NEEDS_USER`, `COMPLETED`, `FAILED`, or `CANCELLED`; `FAILED -> READY`. |
+| Task attempt | `CREATED -> RUNNING` or `INTERRUPTED`; `RUNNING -> VERIFYING`, `FAILED`, `INTERRUPTED`, or `UNKNOWN`; `VERIFYING -> SUCCEEDED`, `FAILED`, `INTERRUPTED`, or `UNKNOWN`; `UNKNOWN -> FAILED`, `INTERRUPTED`, or `VERIFYING`. |
 | Dependency | `OPEN -> BLOCKED`, `SATISFIED`, `INVALIDATED`, or `SUPERSEDED`; `BLOCKED -> OPEN`, `INVALIDATED`, or `SUPERSEDED`; `SATISFIED -> SUPERSEDED`; `INVALIDATED -> SUPERSEDED`. |
 | Decision | `PROPOSED -> ACCEPTED`, `REJECTED`, or `WITHDRAWN`; `ACCEPTED -> SUPERSEDED`. |
 | Assumption | `PROPOSED -> ACTIVE`, `INVALIDATED`, or `SUPERSEDED`; `ACTIVE -> VALIDATED`, `INVALIDATED`, or `SUPERSEDED`; `VALIDATED -> SUPERSEDED`; `INVALIDATED -> SUPERSEDED`. |
@@ -476,7 +514,7 @@ editing an old fact.
 | Permission grant | `PROPOSED -> ACTIVE`, `DENIED`, or `EXPIRED`; `ACTIVE -> CONSUMED`, `EXPIRED`, or `REVOKED`. |
 | Evidence/artifact | `DECLARED -> ATTACHED`, `REJECTED`, or `SUPERSEDED`; `ATTACHED -> VERIFIED`, `REJECTED`, or `SUPERSEDED`; `VERIFIED -> SUPERSEDED`; `REJECTED -> SUPERSEDED`. |
 
-`COMPLETE`, `COMPLETED`, `ACCEPTED`, `REJECTED`, `WITHDRAWN`, `VALIDATED`,
+`COMPLETED`, `STOPPED`, `CANCELLED`, `SUCCEEDED`, `ACCEPTED`, `REJECTED`, `WITHDRAWN`, `VALIDATED`,
 `RESOLVED`, `DECLINED`, `EXPIRED`, `REVOKED`, and `CONSUMED` are terminal in
 their respective records unless the matrix explicitly provides an outgoing
 `SUPERSEDED` edge. A stale revision, wrong mission scope, or missing guard
@@ -489,8 +527,9 @@ control-plane error that must stop or quarantine the affected work.
 
 ### Scope and authority
 
-1. **At most one non-terminal mission:** historical `COMPLETE` missions may be
-   retained, but only one mission may be in any non-terminal state at a time.
+1. **At most one non-terminal mission:** historical `COMPLETED`, `STOPPED`, and
+   `FAILED` missions may be retained, but only one mission may be in any
+   non-terminal state at a time.
 2. **Explicit activation:** no mission enters `ACTIVE` without an explicit
    owner decision accepting its contract and scope.
 3. **Mission containment:** every task, dependency, decision, assumption,
@@ -534,8 +573,10 @@ control-plane error that must stop or quarantine the affected work.
 15. **No direct runtime writes to authority:** Hermes can return a result or
     permission request, but cannot write SQLite mission state or grant itself
     authority.
-16. **Bounded recovery:** a crashed or timed-out attempt is recoverable; it cannot
-    create two authoritative completions for the same task attempt.
+16. **Bounded recovery:** a crashed or timed-out attempt is recoverable; leases
+    and fencing prevent stale execution from creating two authoritative
+    completions for the same task attempt. An unresolved outcome becomes
+    `UNKNOWN` and requires reconciliation.
 
 ### Evidence and communication
 
@@ -555,7 +596,20 @@ control-plane error that must stop or quarantine the affected work.
     outside the semantic control-plane projection.
 22. **Correct stop:** a user stop, unresolved critical-path escalation, missing
     authority, unsafe workspace, or scope conflict stops the affected work and
-    transitions the mission to `AWAITING_USER` or `PAUSED` as appropriate.
+    transitions the mission to `WAITING_FOR_USER`, `STOPPED`, or `FAILED` as
+    appropriate.
+23. **Exact semantic authority:** every effect-bearing action matches the
+    active mission, grant, action, resource scope, limits, and idempotency key;
+    a capability or connector cannot fill a missing match.
+24. **Private economic routing:** route reservations enforce quality,
+    concurrency, and budget constraints before execution; settlement accounts
+    for actual usage or bounded failure without exposing model/provider choice.
+25. **Descriptor-bound workspace:** effect-bearing runtime execution and
+    verification use the captured workspace descriptor and live fence, not a
+    pathname that can be redirected after authorization.
+26. **Bounded workspace evidence:** verification bounds and hashes tracked,
+    ignored, untracked, empty-directory, and nested-`.git` state without
+    following symlinks; limits are safety controls, not optional telemetry.
 
 ## 6. SQLite persistence boundary
 
@@ -572,11 +626,10 @@ The SQLite database is the source of truth for Kora's semantic control plane:
 - opaque references to context snapshots, source documents, runtime sessions,
   workspace paths, and external receipts.
 
-The database should use tables corresponding to the domain records above, plus
-`schema_migrations` and `events`. Small supporting tables such as
-`record_sources`, `task_capabilities`, or `grant_uses` are allowed when they
-make foreign keys and uniqueness constraints explicit; they do not create a
-second authority model.
+The current database uses tables corresponding to the domain records above,
+including `task_attempts`, `task_dependencies`, `artifacts`, `evidence`,
+`permission_uses`, and `mission_events`, plus schema metadata/migrations. These
+names are Kora's semantic records; they do not create a second authority model.
 
 The semantic schema should keep stable fields relational and use canonical JSON
 only for bounded lists/maps such as options, exclusions, limits, and source
@@ -586,14 +639,17 @@ references. A useful minimum table set is:
 schema_migrations
 missions
 tasks
-dependencies
+task_attempts
+task_dependencies
 decisions
 assumptions
 checkpoints
 escalations
+artifacts
+evidence
 permission_grants
-evidence_artifacts
-events
+permission_uses
+mission_events
 ```
 
 An audit event minimally contains `event_id`, `mission_id`, aggregate type and
@@ -643,11 +699,11 @@ when the test runs locally.
 - If any validation, state update, event insert, or grant-use insert fails
   before commit, the whole transaction rolls back: no partial projection, task
   claim, decision, permission consumption, or audit event remains.
-- A task claim records a single-controller attempt marker and bounded lease
-  metadata before invoking the runtime. On restart, an expired marker becomes
-  retryable or escalates based on the last known result; it is not assumed
-  complete. The same committed rows and tie-break order must produce the same
-  next-task selection after restart.
+- A task claim creates a durable attempt with a bounded lease and fencing token
+  before invoking the runtime. On restart, an expired lease is recovered or
+  marked unknown based on the last known result; it is not assumed complete.
+  Stale fences cannot finalize work, and the same committed rows and tie-break
+  order produce the same next-task selection after restart.
 - For Portion 1's local/fake action fixture, an action-use record and one-time
   grant consumption commit atomically under the same SQLite transaction. A
   duplicate use key is rejected, and a failed transaction leaves the grant
@@ -662,23 +718,20 @@ when the test runs locally.
 
 ### 6.4 Follow-on hardening
 
-The first headless slice needs durable single-controller state and restart
-behavior, but it does not need a distributed production control plane. Treat
-the following as explicit follow-on hardening rather than hidden requirements
-of the mission-store implementation:
+The accepted local slice already has durable leases, fencing, and crash
+recovery. Explicit future hardening is:
 
+- hosted/distributed multi-worker ownership, database failover, and concurrent
+  writers beyond the local coordinator;
 - an external-action outbox, cross-system idempotency, delivery reconciliation,
   and retry semantics;
-- distributed worker leases, fencing tokens, and multi-worker ownership;
 - a credential/secret reference broker and OAuth/token lifecycle;
-- multi-process crash recovery, hosted database failover, and concurrent
-  writers;
+- an always-on daemon/scheduler and durable external timers/signals;
 - selection and validation of a tagged Hermes release plus an immutable
   container digest.
 
-Portion 1 may retain minimal local idempotency and a single-controller attempt
-marker where needed by its tests. None of these follow-on systems may become a
-second source of truth for mission, authority, or identity.
+None of these follow-on systems may become a second source of truth for
+mission, authority, identity, evidence, memory, or routing.
 
 ## 7. Headless control loop
 
@@ -686,27 +739,28 @@ The loop is an application service, not a prompt. A typical iteration is:
 
 1. Load the one current mission and verify its state, revision, exclusions,
    authority envelope, and workspace scope.
-2. If the mission is waiting, paused, complete, or ready for review, perform
+2. If the mission is waiting, stopped, completed, failed, or verifying, perform
    only the corresponding transition/checkpoint work; do not run a task.
 3. Recompute dependency readiness and preflight every candidate task.
 4. Choose the highest-value ready task using a stable ordering: critical path,
    mission-relative priority, dependency depth, then creation order/ID. Store
    the selection rationale as a checkpoint or event.
-5. Create a lease and construct a `RuntimeJob` from the task and approved
-   authority. The current contract maps `mission_id`, `task_id`, `objective`,
-   `instructions`, `workspace`, `toolsets`, `skills`, `capabilities`,
-   `isolation`, and `timeout_seconds`; it does not pass the whole database or
-   expose internal worker data.
+5. Capture the workspace identity, create a leased/fenced attempt, reserve the
+   private route budget, and construct a `RuntimeJob` from the task and
+   approved authority. The current contract maps `mission_id`, `task_id`,
+   `objective`, `instructions`, `workspace`, `toolsets`, `skills`,
+   `capabilities`, `isolation`, and `timeout_seconds`; it does not pass the
+   whole database or expose internal worker data.
 6. Invoke the existing Hermes adapter. Its current boundary validates the
-   cloud-root workspace, known toolsets, capability requirements, and
-   cloud-sandbox isolation for mutating toolsets. ACP permission callbacks stay
-   deny-by-default until Kora's authority resolver selects an allowed option.
+   descriptor-bound cloud-root workspace, known toolsets, capability
+   requirements, and cloud-sandbox isolation for mutating toolsets. ACP
+   permission callbacks stay deny-by-default until Kora's exact authority
+   resolver selects an allowed option. Fences are refreshed and checked before
+   effect-bearing work and finalization.
 7. Map the sanitized `RuntimeResult`:
-   - `COMPLETED`: create candidate evidence and move the task to
-     `READY_FOR_REVIEW`.
-   - `NEEDS_USER`: create an escalation, move the task to
-     `WAITING_ON_USER`, and move the mission to `AWAITING_USER` when the path is
-     blocked.
+   - `COMPLETED`: create candidate evidence and move the task to `VERIFYING`.
+   - `NEEDS_USER`: create an escalation, move the task to `NEEDS_USER`, and move
+     the mission to `WAITING_FOR_USER` when the path is blocked.
    - `FAILED`: record a failure event and bounded retry/escalation decision;
      never claim completion.
    - `UNSTRUCTURED`: treat as a contract failure and require retry or review;
@@ -714,9 +768,10 @@ The loop is an application service, not a prompt. A typical iteration is:
 8. Run an independent evaluator against task acceptance criteria. Attach test
    reports, diffs, walkthroughs, or other artifacts, then mark only verified
    evidence as `VERIFIED`.
-9. Complete the task only after the evidence guard passes. Recompute the graph,
-   emit the next semantic checkpoint, and either continue or transition to
-   review, waiting, paused, or complete.
+9. Settle the private route reservation with actual or bounded failure cost.
+   Complete the task only after the evidence guard and fence checks pass.
+   Recompute the graph, emit the next semantic checkpoint, and either continue
+   or transition to waiting, stopped, failed, or completed.
 10. On every iteration, persist the projection and event before reporting a
     user-facing checkpoint.
 
@@ -806,7 +861,7 @@ later phases. Portion 1 can keep it in-process behind the CLI.
 
 | Operation | Purpose and required guard |
 |---|---|
-| `create_mission(contract, workspace)` | Validate contract and workspace; create `AWAITING_MISSION_APPROVAL`. Reject if another non-terminal mission exists. |
+| `create_mission(contract, workspace)` | Validate contract and workspace; create `PROPOSED`. Reject if another non-terminal mission exists. |
 | `approve_mission(mission_id, owner_ref, expected_revision)` | Record an explicit accepted decision and transition to `ACTIVE`. |
 | `get_mission(mission_id)` | Return semantic projection, current revision, blocker, active checkpoint, and evidence summary. |
 | `select_next_task(mission_id)` | Recompute dependencies/preflight and return a deterministic ready task or a reason for waiting/pausing. |
@@ -829,13 +884,19 @@ authority, blocked dependency, unsafe workspace, and unavailable runtime.
 
 ## 10. Acceptance tests
 
-The tests below are the Portion 1 exit criteria. They should run against a
-disposable workspace and a fake or pinned Hermes runtime; they must not require
-live deployment, social, payment, or personal accounts.
+The table below is the Portion 1 target acceptance design. The current accepted
+proof is narrower and is recorded by the repository tests: the empty-repository
+founder-brief dogfood in `tests/test_dogfood_acceptance.py`, the 14 tests in
+`tests/test_execution_boundaries_adversarial.py`, and the 12 tests in
+`tests/test_execution_boundary_review_regressions.py` (27 focused tests total).
+The full suite has 168 passing tests. These results validate the implemented
+local control-plane slice; they do not certify every whole-product row below.
+All tests use disposable or fake workspaces and do not require live deployment,
+social, payment, or personal accounts.
 
 | ID | Scenario | Acceptance condition |
 |---|---|---|
-| P1-AT-01 | Create then approve | A mission is created in `AWAITING_MISSION_APPROVAL`; only an explicit owner approval moves it to `ACTIVE`. A model/runtime response cannot do so. |
+| P1-AT-01 | Create then approve | A mission is created in `PROPOSED`/`ALIGNED`; only an explicit owner decision moves it to `ACTIVE`. A model/runtime response cannot do so. |
 | P1-AT-02 | Single mission guard | Creating a second non-terminal mission is rejected. A completed mission remains historical and does not lose its events. |
 | P1-AT-03 | Mission containment and graph safety | A task or dependency referencing another mission is rejected; a direct or transitive dependency cycle, including a cross-mission bridge, is rejected before commit. |
 | P1-AT-04 | Immutable/versioned approved contract | Attempting to mutate an active objective, definition of done, exclusion, or authority envelope fails with a re-alignment requirement; the prior `scope_version`, hash, and revision remain intact. |
@@ -843,17 +904,17 @@ live deployment, social, payment, or personal accounts.
 | P1-AT-06 | Deterministic next task | Given ready, blocked, and unrelated tasks, the controller selects the highest-value mission-critical ready task and explains why; it never selects a blocked or unrelated task. |
 | P1-AT-07 | Headless autonomous loop | After approval, `loop run` selects a task without a new prompt, submits a scoped `RuntimeJob`, changes the disposable repository, and records a semantic checkpoint. |
 | P1-AT-08 | Runtime boundary | A workspace outside `cloud_root`, unknown toolset, missing capability, or mutating toolset without cloud-sandbox isolation is rejected by the adapter/control plane. |
-| P1-AT-09 | Runtime status mapping | `COMPLETED` becomes review-ready, `NEEDS_USER` creates a blocking escalation, `FAILED` is retryable/escalatable, and `UNSTRUCTURED` never completes the task. |
+| P1-AT-09 | Runtime status mapping | `COMPLETED` enters `VERIFYING`, `NEEDS_USER` creates a blocking escalation, `FAILED` is retryable/escalatable, and `UNSTRUCTURED` never completes the task. |
 | P1-AT-10 | Ambiguous intent | A fixture with two materially different interpretations creates an escalation and leaves the task waiting; no silent product reinterpretation is committed. |
 | P1-AT-11 | Capability versus authority | A task with `workspace.write` capability but no matching active grant is blocked. Read access alone cannot authorize a write. |
 | P1-AT-12 | One-time and standing grants | A one-time grant authorizes exactly one local/fake action, atomically records its use, and then becomes consumed; repeated use is rejected. A standing grant remains limited to its original scope and can expire/revoke. |
 | P1-AT-13 | Evidence gate | A `KORA_TASK_COMPLETE` response without a verified diff/test/acceptance artifact cannot complete a task or mission. Rejected evidence leaves the task review-failed. |
 | P1-AT-14 | Independent review | An evaluator catches a deliberately failing acceptance criterion, records the finding, and returns the task to corrective work rather than accepting the runtime claim. |
-| P1-AT-15 | Blocked stop | When the critical path has no ready task and an escalation is unanswered, the mission enters `AWAITING_USER` or `PAUSED` with a concise blocker; no unrelated task is created or run. |
-| P1-AT-16 | Restart recovery and selection | Kill and restart the single controller between lease creation and result handling. SQLite preserves mission/task state; the expired attempt is recoverable; the same committed graph and tie-break order select the same next task; a completed attempt is not duplicated. |
+| P1-AT-15 | Blocked stop | When the critical path has no ready task and an escalation is unanswered, the mission enters `WAITING_FOR_USER` or a terminal stop/failure state with a concise blocker; no unrelated task is created or run. |
+| P1-AT-16 | Restart recovery and selection | Kill and restart the coordinator between lease creation and result handling. SQLite preserves mission/task/attempt state; the expired fenced attempt is recoverable or reconciled; the same committed graph and tie-break order select the same next task; a completed attempt is not duplicated. |
 | P1-AT-17 | Atomic rollback and audit | Every successful state transition has its corresponding append-only event in the same transaction. A forced failure rolls back projection, inserts, grant use, and event together, leaving no half-updated state or misleading audit record. |
 | P1-AT-18 | Provenance and sanitization | Decisions, assumptions, evidence, and consequential actions include source/decision references; serialized product output omits model/provider identity, prompts, private thought, and worker topology. |
-| P1-AT-19 | User stop and resume | A user pause prevents new runtime work. Explicit resume rechecks authority, workspace, dependencies, scope version, and revision before continuing. |
+| P1-AT-19 | User stop and resume | A user stop prevents new runtime work and invalidates the live fence. Explicit resume rechecks authority, workspace, dependencies, scope version, and revision before continuing. |
 
 The end-to-end fixture should preserve a compact run artifact containing the
 mission contract, owner approval, task selection, runtime result, evidence,
@@ -876,23 +937,31 @@ Portion 1 intentionally does not implement or decide:
   posting, customer outreach, or other live external actions;
 - a connector marketplace, OAuth/secret broker, billing, accounts, or monthly
   allowances;
+- a Codex App Server adapter; the next live-runtime adapter is explicitly
+  **NOT-YET-IMPLEMENTED**. Founder dogfood/testing may use the founder's
+  ChatGPT-managed Codex subscription authentication, while production must use
+  company-owned API keys/provider accounts with metering, budgets, and billing;
+  tokens never enter Kora durable state or public projections;
 - multiple simultaneous missions, user-created company goals, or arbitrary
   user task-manager behavior such as dragging priorities;
 - automatic standing permissions, inferred authority, or a `--force` escape
   hatch;
-- external-action outboxes, cross-system idempotency/reconciliation, distributed
-  worker leases or fencing, credential/secret references, and multi-process
-  crash recovery; these are follow-on runtime hardening beyond the single
-  controller and local/fake action fixtures;
+- hosted/distributed worker ownership, database failover, external-action
+  outboxes and cross-system reconciliation, credential/secret references, and
+  always-on scheduling; the local slice already proves leases, fencing, and
+  crash recovery;
 - full Context OS graph ingestion, personalized skill compilation, or reliable
   taste imitation; Portion 1 stores references and tests the authority shape;
 - exposing Hermes, models, providers, prompts, subagents, tokens, worker
   topology, or raw execution traces to the user;
 - replacing Hermes or rebuilding commodity runtime infrastructure;
+- desktop/mobile/iMessage/voice/connectors, cloud workspace/VM fleet, external
+  actions, and the full skill-tree/self-learning UX;
 - changing any normative product decision in the PRD, architecture, behavior
   contract, identity, or decision ledger.
 
 The success condition is not that Portion 1 looks like the final Kora product.
-It is that the final product can be built on a durable, inspectable mission
-and authority boundary that already proves intent fidelity, autonomous progress,
-evidence, and correct stopping.
+The accepted slice is the durable, inspectable mission and authority boundary
+that proves one offline dogfood work cycle, intent fidelity, bounded progress,
+evidence, recovery, and correct stopping. It is not whole-product release
+readiness.

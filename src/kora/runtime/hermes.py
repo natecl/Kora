@@ -20,11 +20,17 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping
 
+from kora._workspace import (
+    WorkspaceIdentity,
+    WorkspaceIdentityError,
+    descriptor_cwd_kwargs,
+)
 from kora.runtime.contracts import (
     Capability,
     IsolationMode,
+    RuntimeContractError,
     RuntimeJob,
     RuntimeResult,
     RuntimeStatus,
@@ -57,6 +63,40 @@ MUTATING_CAPABILITIES = frozenset(
 )
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INHERITED_ENVIRONMENT_KEYS = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
+
+
+def _build_runtime_environment(
+    explicit_environment: Mapping[object, object] | None = None,
+) -> dict[str, str]:
+    """Build a child environment from the narrow host allowlist and overrides."""
+
+    explicit = dict(explicit_environment or {})
+    for key, value in explicit.items():
+        if not isinstance(key, str) or _ENVIRONMENT_KEY_PATTERN.fullmatch(key) is None:
+            raise HermesRuntimeError(
+                f"Invalid environment variable name: {key!r}"
+            )
+        if not isinstance(value, str):
+            raise HermesRuntimeError(
+                f"Environment variable {key!r} must have a string value"
+            )
+
+    environment = {
+        key: os.environ[key]
+        for key in _INHERITED_ENVIRONMENT_KEYS
+        if key in os.environ
+    }
+    environment.update(explicit)
+    return environment
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +119,9 @@ class HermesRuntimeAdapter:
         self.cloud_root = cloud_root.expanduser().resolve()
         self.hermes_executable = str(hermes_executable)
         self.environment = dict(environment or {})
+
+    def _build_environment(self) -> dict[str, str]:
+        return _build_runtime_environment(self.environment)
 
     def check_health(self) -> RuntimeHealth:
         executable = self._resolve_executable()
@@ -106,7 +149,12 @@ class HermesRuntimeAdapter:
     def run(self, job: RuntimeJob) -> RuntimeResult:
         """Run one task after Kora validates workspace and authority scope."""
 
-        workspace = self._validate_job(job)
+        self._validate_job(job)
+        workspace_identity = job._workspace_identity
+        if workspace_identity is None:
+            raise HermesRuntimeError(
+                "Workspace identity is unavailable for effect-bearing execution"
+            )
         executable = self._resolve_executable()
         envelope = self._build_prompt(job)
 
@@ -124,19 +172,39 @@ class HermesRuntimeAdapter:
             if job.skills:
                 command.extend(["-s", ",".join(job.skills)])
 
-            environment = os.environ.copy()
-            environment.update(self.environment)
-            completed = subprocess.run(
-                command,
-                cwd=workspace,
-                env=environment,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=job.timeout_seconds,
-                check=False,
-            )
+            environment = self._build_environment()
+            # This is deliberately adjacent to the subprocess launch.  The
+            # earlier validation protects setup, while this check closes the
+            # stop/wait and lease-expiry window immediately before Hermes can
+            # create effects.
+            try:
+                with workspace_identity.open_descriptor() as descriptor:
+                    spawn_kwargs = descriptor_cwd_kwargs(descriptor)
+                    # Keep the process-local fence check immediately before
+                    # the descriptor-bound spawn; no workspace pathname is
+                    # resolved by the effect-bearing subprocess.
+                    job.validate_execution_fence()
+                    completed = subprocess.run(
+                        command,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=job.timeout_seconds,
+                        check=False,
+                        **spawn_kwargs,
+                    )
+            except WorkspaceIdentityError as exc:
+                raise HermesRuntimeError(
+                    "Workspace identity changed before Hermes launch"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - adapter boundary
+                if isinstance(exc, HermesRuntimeError):
+                    raise
+                raise HermesRuntimeError(
+                    "Kora execution fence rejected Hermes launch"
+                ) from exc
             usage = self._read_usage(usage_path)
 
         response = completed.stdout.strip()
@@ -155,6 +223,7 @@ class HermesRuntimeAdapter:
             estimated_cost_usd=self._optional_float(
                 usage.get("estimated_cost_usd")
             ),
+            session_id=job.session_id,
         )
 
     def _resolve_executable(self) -> str:
@@ -178,8 +247,9 @@ class HermesRuntimeAdapter:
             ("mission_id", job.mission_id),
             ("task_id", job.task_id),
         ):
-            if not _ID_PATTERN.fullmatch(value):
-                raise HermesRuntimeError(f"Invalid {label}: {value!r}")
+            self._validate_identifier(value, label)
+        if job.session_id is not None:
+            self._validate_identifier(job.session_id, "session_id")
 
         if not job.objective.strip():
             raise HermesRuntimeError("Runtime job objective cannot be empty")
@@ -188,9 +258,27 @@ class HermesRuntimeAdapter:
         if job.timeout_seconds <= 0:
             raise HermesRuntimeError("Runtime timeout must be positive")
 
-        workspace = job.workspace.expanduser().resolve()
+        try:
+            workspace = job.workspace.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise HermesRuntimeError("Workspace must resolve to an existing directory") from exc
         if not workspace.is_dir():
             raise HermesRuntimeError(f"Workspace is not a directory: {workspace}")
+        workspace_identity = job._workspace_identity
+        if not isinstance(workspace_identity, WorkspaceIdentity):
+            raise HermesRuntimeError(
+                "Workspace identity is unavailable for effect-bearing execution"
+            )
+        try:
+            workspace_identity.assert_path(workspace)
+        except WorkspaceIdentityError as exc:
+            raise HermesRuntimeError(
+                "Workspace no longer resolves to its authorized identity"
+            ) from exc
+        if workspace_identity.canonical_path != workspace:
+            raise HermesRuntimeError(
+                "Workspace no longer resolves to its authorized identity"
+            )
         try:
             workspace.relative_to(self.cloud_root)
         except ValueError as exc:
@@ -220,7 +308,18 @@ class HermesRuntimeAdapter:
                     "Mutating Hermes toolsets require cloud-sandbox isolation"
                 )
 
+        try:
+            job.validate_execution_fence()
+        except RuntimeContractError as exc:
+            raise HermesRuntimeError(str(exc)) from exc
+
         return workspace
+
+    @staticmethod
+    def _validate_identifier(value: object, label: str) -> str:
+        if not isinstance(value, str) or _ID_PATTERN.fullmatch(value) is None:
+            raise HermesRuntimeError(f"Invalid {label}: {value!r}")
+        return value
 
     @staticmethod
     def _build_prompt(job: RuntimeJob) -> str:

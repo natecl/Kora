@@ -1,19 +1,40 @@
 # Kora Portion 1 Roadmap
 
-**Status:** Approved next-step sequence
-**Updated:** 2026-08-26
+**Status:** Accepted work-cycle slice complete; next-step sequence
+**Updated:** 2026-08-27
+**Canonical code commit:** `1754168ed09692ed1b5a611ad6b06a220b42543b`
 
 This roadmap turns the existing PRD, technical architecture, and current-state
 recommendation into an execution order. It does not change Kora's product
-decisions. The first proof must be that Kora can keep an approved product
-mission moving without a human continuously steering an agent session. Product
-surfaces and additional channels follow that proof.
+decisions. The accepted local proof is a bounded Kora-owned work cycle; it is
+not whole-product release readiness. Product surfaces and additional channels
+follow that proof.
+
+## Accepted current slice
+
+The accepted work-cycle slice starts with an empty repository and a founder
+brief and produces a functional, zero-dependency waitlist MVP through a
+deterministic dogfood runtime. Kora durably owns the mission, task attempt,
+permission, evidence, lease, fencing, and recovery state; enforces exact
+mission/grant/action/resource/limit/idempotency authority; reserves and settles
+private route budgets; and exposes closed public projections. Execution uses a
+descriptor-bound workspace cwd, and verification bounds and hashes tracked,
+ignored, untracked, empty-directory, and nested-`.git` state without following
+symlinks.
+
+At canonical commit `1754168ed09692ed1b5a611ad6b06a220b42543b`, the Sol High
+review verdict is **ACCEPT**. The repository passes 27 focused
+acceptance/regression tests and 168 full-suite tests. This proves the
+control-plane boundary and offline dogfood path only; no P0/P1/P2 findings were
+identified in the implemented verified work-cycle slice. Deployment, outreach,
+desktop, phone, cloud-fleet, connector, and production-runtime readiness remain
+future work.
 
 ## The sequence
 
 | Order | Phase | Primary question | Exit gate |
 |---|---|---|---|
-| 1 | **Headless autonomous development loop** | Can Kora preserve intent, choose the next unblocked task, run it safely, verify the result, and stop or escalate correctly? | A disposable sample product mission runs from explicit approval to verified code/test/artifact evidence, survives process restart, and stops on ambiguity or missing authority without inventing work. |
+| 1 | **Headless autonomous development loop** | Can Kora preserve intent, choose the next unblocked task, run it safely, verify the result, and stop or escalate correctly? | **Accepted for the bounded offline dogfood slice:** an empty-repo founder brief produces a verified waitlist MVP with durable state, recovery, and evidence. The broader product loop remains a target. |
 | 2 | **Desktop and context productization** | Can a person understand, correct, and approve Kora's interpretation without configuring an agent workforce? | A five-to-ten-minute desktop onboarding produces a context-alignment receipt, an approved mission contract, a readable Kora skill/context view, and a semantic work projection. |
 | 3 | **Cloud and phone continuity** | Can Kora keep working while the user's Mac is closed and handle normal interaction from a phone? | A persistent logical cloud workspace resumes approved work while the Mac is offline; iMessage, calls, daily alignment, and mobile review/approval preserve the same mission state. |
 | 4 | **Deployment and approved outreach** | Can Kora carry a verified MVP through consequential external actions with bounded authority? | The user can approve production deployment and a bounded initial outreach campaign; Kora executes, records receipts, reports outcomes, and never treats connector access as authority. |
@@ -24,15 +45,15 @@ forward before the preceding proof is credible.
 
 ## Phase 1: headless autonomous development loop
 
-Portion 1 is the control-plane slice that makes the first phase testable. It
-should add the smallest Kora-owned layer above the existing Hermes runtime
-adapter. Hermes is only Kora's replaceable initial execution harness, not
-Kora's product foundation: the mission store and authority boundary must remain
-valid if the harness is replaced.
+Portion 1 is the control-plane slice that makes the first phase testable. The
+accepted implementation is the smallest Kora-owned layer above the existing
+Hermes runtime adapter. Hermes is only Kora's replaceable initial execution
+harness, not Kora's product foundation: the mission store and authority
+boundary remain valid if the harness is replaced.
 
 1. A durable SQLite mission store for the approved mission contract, tasks,
-   dependencies, decisions, assumptions, checkpoints, escalations, permission
-   grants, and evidence/artifacts.
+   dependencies, durable attempts, decisions, assumptions, checkpoints,
+   escalations, permission grants, and evidence/artifacts.
 2. A mission controller that enforces one overarching mission, chooses the
    highest-value unblocked task on the critical path, and owns stop conditions.
 3. A separate authority check that turns a task's required capabilities into a
@@ -44,19 +65,20 @@ valid if the harness is replaced.
 5. Evidence and evaluation gates that reject an unsupported
    `KORA_TASK_COMPLETE`, attach tests/diffs/artifacts, and expose unresolved
    risk before completion.
-6. A disposable sample product repository and scripted ambiguity, failure, and
-   permission fixtures so the behavior can be proven without external
-   accounts.
+6. An empty-repository founder-brief dogfood fixture plus scripted ambiguity,
+   failure, permission, recovery, routing, budget, and workspace-verification
+   fixtures so the behavior can be proven without external accounts.
 
 Hermes memory, scheduling, approvals, and self-improvement state are never
 authoritative. They may support commodity execution behind `RuntimeAdapter`,
 but Kora's SQLite state, controller, semantic permissions, evidence, and stop
 conditions are the source of truth.
 
-The loop is headless, not authority-free. A mission is created in
-`AWAITING_MISSION_APPROVAL` and becomes active only after an explicit owner
-approval through the CLI or application service. The initial sample mission
-may use a pre-reviewed contract, but it still exercises that approval boundary.
+The loop is headless, not authority-free. The implemented mission lifecycle
+uses `PROPOSED`, `ALIGNED`, and `ACTIVE` before verification or terminal states;
+an explicit owner decision is required before active work. The initial sample
+mission may use a pre-reviewed contract, but it still exercises that approval
+boundary.
 
 ### Phase 1 definition of proof
 
@@ -82,6 +104,17 @@ following in one preserved run record:
 The detailed data model, state machine, persistence boundary, and proposed
 interfaces for this phase are in
 [`PORTION_1_MISSION_CONTROL_PLANE.md`](./PORTION_1_MISSION_CONTROL_PLANE.md).
+
+## Next live-runtime slice
+
+The next live-runtime slice is a **NOT-YET-IMPLEMENTED Codex App Server
+adapter**. For dogfood/testing it should use the founder's ChatGPT-managed
+Codex subscription authentication: Codex owns and refreshes credentials,
+tokens never enter Kora durable state or public projections, and Kora may
+privately observe plan/rate-limit state. Production uses company-owned API keys
+and provider accounts with metering, budgets, and billing, never a personal
+Codex subscription. The transport switch must not alter Kora's durable mission,
+permission, evidence, memory, or routing contracts.
 
 ## Phase 2: desktop and context productization
 
@@ -156,6 +189,10 @@ tested against the replaceable `RuntimeAdapter` boundary, not coupled to a
 particular Hermes release or container image. OpenHands is only a gated
 fallback if Hermes fails concrete vertical-slice gates, and must satisfy the
 same Kora-owned adapter and authority contract.
+
+Other explicit future gaps are an always-on daemon/scheduler, a cloud
+workspace/VM fleet, desktop/mobile/iMessage/voice/connectors, external actions,
+and the full skill-tree/self-learning UX.
 
 ## Governing constraints for every phase
 

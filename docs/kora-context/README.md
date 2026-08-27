@@ -1,7 +1,9 @@
 # Kora Context Pack
 
-**Version:** 1.0  
-**Approved:** 2026-08-26  
+**Version:** 1.1
+
+**Approved:** 2026-08-27
+
 **Purpose:** Preserve the durable product, founder, behavioral, and historical
 context behind Kora so future humans and agents do not have to reconstruct her
 from a chat transcript.
@@ -9,6 +11,15 @@ from a chat transcript.
 This directory is Kora's canonical context pack. It complements the product
 requirements and technical architecture; it does not replace them and it does
 not grant runtime authority.
+
+The current-state documents describe only the accepted bounded work-cycle slice
+at canonical code commit `1754168ed09692ed1b5a611ad6b06a220b42543b` (Sol High
+**ACCEPT**, 27 focused tests, 168 full-suite tests). They are not a declaration
+of whole-product release readiness. The next live-runtime slice is a
+**NOT-YET-IMPLEMENTED Codex App Server adapter**; founder dogfood/testing may
+use founder ChatGPT-managed Codex subscription authentication, while production
+uses company-owned API keys/provider accounts with metering, budgets, and
+billing. Tokens never enter Kora durable state or public projections.
 
 ## Authority order
 
@@ -68,6 +79,8 @@ evidence, or stop-condition records.
   removing safety boundaries.
 - The final approved product decisions outweigh abandoned brainstorms.
 - Unknowns stay explicit. Do not silently convert them into product decisions.
+- Runtime transport changes must preserve Kora's durable mission, permission,
+  evidence, memory, and routing contracts.
 
 ## Updating the pack
 
@@ -80,4 +93,7 @@ A material correction should:
 5. require approval before a behavior-changing interpretation becomes active.
 
 This pack is designed to become an input to Kora's future Context OS. The
-current repository does not yet ingest it automatically.
+current repository does not yet ingest it automatically. `manifest.json`
+retains schema version 1.0 and the existing inventory/authority structure; its
+validation checks JSON semantics and referenced paths rather than inventing a
+new integrity scheme.

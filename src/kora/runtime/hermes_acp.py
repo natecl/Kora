@@ -9,17 +9,26 @@ resolver selects one of the offered options.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator, Mapping
 
 import acp
 import acp.schema as schema
 
 from kora import __version__
-from kora.runtime.contracts import RuntimeJob, RuntimeResult, RuntimeStatus
+from kora._workspace import (
+    WorkspaceIdentity,
+    descriptor_cwd_kwargs,
+)
+from kora.runtime.contracts import (
+    RuntimeContractError,
+    RuntimeJob,
+    RuntimeResult,
+    RuntimeStatus,
+)
 from kora.runtime.hermes import HermesRuntimeAdapter
 
 
@@ -37,14 +46,100 @@ class ACPPermissionRequest:
 PermissionResolver = Callable[[ACPPermissionRequest], str | None]
 
 
+@asynccontextmanager
+async def _spawn_descriptor_bound_agent_process(
+    client: Any,
+    executable: str,
+    *arguments: str,
+    workspace_identity: WorkspaceIdentity,
+    environment: Mapping[str, str],
+    before_spawn: Callable[[], object] | None = None,
+) -> AsyncIterator[tuple[Any, asyncio.subprocess.Process]]:
+    """Spawn ACP with a descriptor-bound cwd and bounded handle lifetime."""
+
+    with workspace_identity.open_descriptor() as descriptor:
+        spawn_kwargs = descriptor_cwd_kwargs(descriptor)
+        if before_spawn is not None:
+            before_spawn()
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            *arguments,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=dict(environment),
+            **spawn_kwargs,
+        )
+
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("descriptor-bound ACP launch requires stdio pipes")
+
+    connection: Any | None = None
+    try:
+        connection = acp.connect_to_agent(
+            client,
+            process.stdin,
+            process.stdout,
+            use_unstable_protocol=True,
+        )
+        yield connection, process
+    finally:
+        if connection is not None:
+            with suppress(Exception):
+                await connection.close()
+        if process.stdin is not None:
+            try:
+                process.stdin.write_eof()
+            except (AttributeError, OSError, RuntimeError):
+                process.stdin.close()
+            with suppress(Exception):
+                await process.stdin.drain()
+            with suppress(Exception):
+                process.stdin.close()
+            with suppress(Exception):
+                await process.stdin.wait_closed()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+
+
 class _KoraACPClient:
     """Minimal ACP client that collects semantic events and gates permissions."""
 
-    def __init__(self, permission_resolver: PermissionResolver | None = None) -> None:
+    def __init__(
+        self,
+        permission_resolver: PermissionResolver | None = None,
+        live_fence_validator: Callable[[], object] | None = None,
+    ) -> None:
         self.permission_resolver = permission_resolver
+        self.live_fence_validator = live_fence_validator
         self.message_chunks: list[str] = []
         self.tool_events: list[dict[str, str | None]] = []
         self.connection: Any = None
+
+    def _validate_effect_boundary(self) -> None:
+        if self.live_fence_validator is None:
+            return
+        try:
+            result = self.live_fence_validator()
+        except Exception as exc:  # noqa: BLE001 - ACP authority boundary
+            if isinstance(exc, RuntimeContractError):
+                raise
+            raise RuntimeContractError(
+                "live Kora execution fence validation failed"
+            ) from exc
+        if result is False:
+            raise RuntimeContractError(
+                "live Kora execution fence validation was rejected"
+            )
 
     def on_connect(self, conn: Any) -> None:
         self.connection = conn
@@ -56,6 +151,7 @@ class _KoraACPClient:
         tool_call: schema.ToolCallUpdate,
         **_: Any,
     ) -> schema.RequestPermissionResponse:
+        self._validate_effect_boundary()
         option_ids = tuple(option.option_id for option in options)
         request = ACPPermissionRequest(
             session_id=session_id,
@@ -104,26 +200,33 @@ class _KoraACPClient:
             )
 
     async def read_text_file(self, **_: Any) -> schema.ReadTextFileResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client filesystem access is disabled")
 
     async def write_text_file(self, **_: Any) -> schema.WriteTextFileResponse | None:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client filesystem access is disabled")
 
     async def create_terminal(self, **_: Any) -> schema.CreateTerminalResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def terminal_output(self, **_: Any) -> schema.TerminalOutputResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def release_terminal(self, **_: Any) -> schema.ReleaseTerminalResponse | None:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def wait_for_terminal_exit(
         self, **_: Any
     ) -> schema.WaitForTerminalExitResponse:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def kill_terminal(self, **_: Any) -> schema.KillTerminalResponse | None:
+        self._validate_effect_boundary()
         raise PermissionError("Kora ACP client terminal access is disabled")
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -146,7 +249,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
         *,
         cloud_root: Path,
         hermes_executable: str | Path = "hermes",
-        environment: dict[str, str] | None = None,
+        environment: Mapping[str, str] | None = None,
         permission_resolver: PermissionResolver | None = None,
     ) -> None:
         super().__init__(
@@ -167,25 +270,34 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
 
     async def run_async(self, job: RuntimeJob) -> RuntimeResult:
         workspace = self._validate_job(job)
+        workspace_identity = job._workspace_identity
+        if not isinstance(workspace_identity, WorkspaceIdentity):
+            raise RuntimeError("Workspace identity is unavailable for ACP launch")
         executable = self._resolve_executable()
         prompt = self._build_prompt(job)
-        client = _KoraACPClient(self.permission_resolver)
+        client = _KoraACPClient(
+            self.permission_resolver,
+            live_fence_validator=job.validate_execution_fence,
+        )
 
-        environment = os.environ.copy()
-        environment.update(self.environment)
+        environment = self._build_environment()
         environment["HERMES_ACP_SKIP_CONFIGURED_MCP"] = "1"
+        session_id = job.session_id
 
         try:
+            # Keep the structural and live checks adjacent to ACP process
+            # creation; setup-time validation cannot close a stop/wait race.
+            job.validate_execution_fence()
             async with asyncio.timeout(job.timeout_seconds):
-                async with acp.spawn_agent_process(
+                async with _spawn_descriptor_bound_agent_process(
                     client,
                     executable,
                     "acp",
-                    cwd=workspace,
-                    env=environment,
-                    transport_kwargs={"stderr": asyncio.subprocess.DEVNULL},
-                    use_unstable_protocol=True,
+                    workspace_identity=workspace_identity,
+                    environment=environment,
+                    before_spawn=job.validate_execution_fence,
                 ) as (connection, _process):
+                    job.validate_execution_fence()
                     await connection.initialize(
                         protocol_version=acp.PROTOCOL_VERSION,
                         client_capabilities=schema.ClientCapabilities(
@@ -201,12 +313,27 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                             version=__version__,
                         ),
                     )
-                    session = await connection.new_session(
-                        cwd=str(workspace),
-                        mcp_servers=[],
-                    )
+                    if job.session_id is not None:
+                        # ACP 0.9 acknowledges a loaded session without
+                        # repeating its already-known session ID.
+                        job.validate_execution_fence()
+                        await connection.load_session(
+                            cwd=str(workspace),
+                            session_id=job.session_id,
+                            mcp_servers=[],
+                        )
+                    else:
+                        job.validate_execution_fence()
+                        session = await connection.new_session(
+                            cwd=str(workspace),
+                            mcp_servers=[],
+                        )
+                        session_id = self._validate_identifier(
+                            session.session_id, "session_id"
+                        )
+                    job.validate_execution_fence()
                     response = await connection.prompt(
-                        session_id=session.session_id,
+                        session_id=session_id,
                         prompt=[
                             schema.TextContentBlock(
                                 type="text",
@@ -221,6 +348,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                 status=RuntimeStatus.FAILED,
                 response="Hermes ACP runtime timed out.",
                 exit_code=124,
+                session_id=session_id,
             )
         except Exception as exc:
             return RuntimeResult(
@@ -229,6 +357,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                 status=RuntimeStatus.FAILED,
                 response=f"Hermes ACP runtime failed: {type(exc).__name__}",
                 exit_code=1,
+                session_id=session_id,
             )
 
         final_text = client.final_text
@@ -253,4 +382,5 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
             response=final_text,
             exit_code=0,
             total_tokens=total_tokens,
+            session_id=session_id,
         )

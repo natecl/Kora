@@ -1,7 +1,7 @@
 # Product Decision Ledger
 
 **Status:** Historical rationale and approved decisions  
-**Updated:** 2026-08-26
+**Updated:** 2026-08-27
 
 Statuses:
 
@@ -46,6 +46,9 @@ Statuses:
 | K-030 | Retain strong consent and safety despite natural language. | Human tone cannot become a route around permission, truth, or computer safety. |
 | K-031 | Treat a tagged Hermes release plus an immutable container image digest as the planned runtime-hardening pin; evaluate OpenHands only as a gated fallback if Hermes fails concrete vertical-slice gates. | Reproducibility and a credible replacement path are both required without broadening the current technology decision or coupling mission state to a harness. |
 | K-032 | Adopt the staged technology stack in [`KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md): Python control plane, SQLite now/PostgreSQL beta, Kora-owned coordination with Temporal Cloud at the durability trigger, native Swift macOS, Twilio phone continuity, and a small managed cloud surface. | Preserves Kora's model-agnostic, authority-first architecture while deferring rewrites and infrastructure whose cost is not yet justified. |
+| K-033 | For founder dogfood/testing, keep Hermes as the replaceable bootstrap harness until Kora should default to a **NOT-YET-IMPLEMENTED Codex App Server adapter** using founder ChatGPT-managed Codex subscription authentication. Codex owns and refreshes credentials; tokens never enter Kora durable state or public projections, while Kora may privately observe plan/rate-limit state. Production uses company-owned API keys/provider accounts with metering, budgets, and billing, never a personal Codex subscription. | The runtime transport can evolve without making a harness or personal subscription the source of truth. Kora's durable mission, permission, evidence, memory, and routing contracts must remain unchanged. |
+| K-034 | Treat the accepted implementation as a bounded Kora-owned work-cycle proof, not whole-product release readiness: an empty-repository founder brief can produce a functional waitlist MVP with durable control-plane state and verified evidence. | The slice validates intent fidelity, authority, recovery, and evidence before the desktop, cloud, phone, connector, external-action, and production-runtime product surfaces exist. |
+| K-035 | Keep the founder-first wedge while designing Kora as a generalized professional coworker, never as a coding agent. | Role charters and private workforce/model routes should specialize Kora across professional work without changing her identity or semantic control plane. |
 
 ## Rejected initial directions
 
@@ -106,3 +109,9 @@ Statuses:
   [`docs/KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md), including
   Python, SQLite/PostgreSQL, Temporal-at-trigger, native Swift, Twilio phone
   continuity, beta cloud defaults, and explicit replacement gates.
+- **2026-08-27:** Reconciled the ledger with canonical code commit
+  `1754168ed09692ed1b5a611ad6b06a220b42543b`: Sol High **ACCEPT**, 27 focused
+  tests, and 168 full-suite tests for the bounded work-cycle slice, with no
+  P0/P1/P2 findings in the implemented verified work-cycle slice. Recorded the
+  founder's Codex App Server decision and the production company-account
+  boundary without changing the existing context-pack authority model.

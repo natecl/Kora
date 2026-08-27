@@ -496,6 +496,72 @@ class FinalSolRereviewRegressionTests(unittest.TestCase):
                 self.assertTrue(unchanged_result.accepted)
                 self.assertTrue(unchanged_result.checks[0].passed)
 
+    def test_ignored_empty_descendant_directory_is_fingerprinted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kora-rereview-ignored-tree-") as directory:
+            root = Path(directory)
+            workspace = _git_repository(root / "workspace", ignored_name="ignored/")
+            ignored = workspace / "ignored"
+            ignored.mkdir()
+            (ignored / "keep").write_text("keep\n", encoding="utf-8")
+            verifier = WorkspaceVerifier(cloud_root=root)
+
+            def request(
+                commands: tuple[VerificationCommand, ...],
+            ) -> WorkspaceVerificationRequest:
+                return WorkspaceVerificationRequest(
+                    workspace=workspace,
+                    commands=commands,
+                    require_changes=False,
+                    execution_authorized=True,
+                    execution_capability=True,
+                    execution_granted=True,
+                    require_execution_authority=True,
+                    live_fence_validator=lambda: True,
+                )
+
+            before = verifier.verify(request(()))
+            self.assertTrue(before.accepted)
+            self.assertIsNotNone(before.change_fingerprint)
+
+            unchanged = _python_command(
+                "authorized unchanged ignored tree check",
+                "from pathlib import Path; "
+                "assert Path('ignored/keep').read_text(encoding='utf-8') == 'keep\\n'",
+            )
+            unchanged_result = verifier.verify(request((unchanged,)))
+            with self.subTest(case="unchanged-tree-control"):
+                self.assertTrue(unchanged_result.accepted)
+                self.assertEqual(
+                    unchanged_result.change_fingerprint,
+                    before.change_fingerprint,
+                )
+
+            create_empty = _python_command(
+                "authorized ignored empty directory mutation",
+                "from pathlib import Path; Path('ignored/created-empty').mkdir()",
+            )
+            mutation_result = verifier.verify(request((create_empty,)))
+            with self.subTest(case="empty-descendant-mutation-rejected"):
+                self.assertFalse(mutation_result.accepted)
+                self.assertIn("mutated the workspace", mutation_result.summary)
+                self.assertTrue(mutation_result.checks[0].passed)
+                self.assertNotEqual(
+                    mutation_result.change_fingerprint,
+                    before.change_fingerprint,
+                )
+
+            after = _python_command(
+                "authorized created empty directory check",
+                "from pathlib import Path; assert Path('ignored/created-empty').is_dir()",
+            )
+            after_result = verifier.verify(request((after,)))
+            with self.subTest(case="unchanged-created-empty-tree-control"):
+                self.assertTrue(after_result.accepted)
+                self.assertEqual(
+                    after_result.change_fingerprint,
+                    mutation_result.change_fingerprint,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

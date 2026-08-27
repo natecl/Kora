@@ -57,6 +57,9 @@ _PIPE_READ_SIZE = 16 * 1024
 _GIT_TIMEOUT_SECONDS = 30.0
 _GIT_CAPTURE_LIMIT = 4096
 _UNTRACKED_PATH_CAPTURE_LIMIT = 1024 * 1024
+_UNTRACKED_ENTRY_LIMIT = 100_000
+_UNTRACKED_DEPTH_LIMIT = 64
+_UNTRACKED_BYTE_LIMIT = 64 * 1024 * 1024
 
 
 def _non_empty_string(value: object, field_name: str) -> str:
@@ -400,6 +403,14 @@ class _WorkspaceSnapshot:
     fingerprint: str
     has_changes: bool
     relative_workspace: Path
+
+
+@dataclass(slots=True)
+class _UntrackedHashBudget:
+    """Shared limits for one bounded untracked-tree observation."""
+
+    entries: int = 0
+    data_bytes: int = 0
 
 
 def _read_pipe(
@@ -810,13 +821,16 @@ class WorkspaceVerifier:
                 ignored_result.stdout_bytes,
                 ignored_directory_result.stdout_bytes,
             )
+            untracked_roots = self._untracked_roots(untracked_paths)
+            hash_budget = _UntrackedHashBudget()
             with workspace_identity.open_descriptor() as workspace_descriptor:
-                for path in untracked_paths:
+                for path in untracked_roots:
                     self._hash_untracked_entry(
                         digest,
                         workspace,
                         path,
                         workspace_descriptor=workspace_descriptor,
+                        budget=hash_budget,
                     )
         except (OSError, TypeError, ValueError) as exc:
             return None, str(exc)
@@ -859,11 +873,16 @@ class WorkspaceVerifier:
                     raise WorkspaceVerificationError(
                         "untracked path is not a safe workspace-relative entry"
                     )
+                if len(path.parts) > _UNTRACKED_DEPTH_LIMIT:
+                    raise WorkspaceVerificationError(
+                        "untracked workspace tree exceeds the inspection depth limit"
+                    )
                 paths.add(path)
 
         # Git reports files, not their untracked parent directories.  Include
-        # those parents so their lstat type/mode is part of the same complete
-        # snapshot, while retaining a bounded set derived from bounded output.
+        # those parents so a directory root can be recursively inspected as
+        # part of the same complete snapshot, while retaining a bounded set
+        # derived from bounded output.
         for path in tuple(paths):
             paths.update(parent for parent in path.parents if parent != Path("."))
 
@@ -874,6 +893,17 @@ class WorkspaceVerifier:
                     "utf-8", errors="surrogateescape"
                 ),
             )
+        )
+
+    @staticmethod
+    def _untracked_roots(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+        """Return the minimal roots that cover every parsed untracked path."""
+
+        path_set = set(paths)
+        return tuple(
+            path
+            for path in paths
+            if not any(parent in path_set for parent in path.parents)
         )
 
     @staticmethod
@@ -891,8 +921,12 @@ class WorkspaceVerifier:
         relative_path: Path,
         *,
         workspace_descriptor: int | None = None,
+        budget: _UntrackedHashBudget | None = None,
     ) -> None:
         """Hash one untracked entry without following links or buffering files."""
+
+        if budget is None:
+            budget = _UntrackedHashBudget()
 
         if workspace_descriptor is None:
             try:
@@ -907,17 +941,13 @@ class WorkspaceVerifier:
                     identity.canonical_path,
                     relative_path,
                     workspace_descriptor=descriptor,
+                    budget=budget,
                 )
 
-        if (
-            relative_path.is_absolute()
-            or not relative_path.parts
-            or any(part in {"", ".", ".."} for part in relative_path.parts)
-            or any(part == ".git" for part in relative_path.parts)
-            or any("\0" in part for part in relative_path.parts)
-        ):
+        WorkspaceVerifier._validate_untracked_relative_path(relative_path)
+        if len(relative_path.parts) > _UNTRACKED_DEPTH_LIMIT:
             raise WorkspaceVerificationError(
-                "untracked path is not a safe workspace-relative entry"
+                "untracked workspace tree exceeds the inspection depth limit"
             )
 
         # Walk from the already verified workspace descriptor.  Every parent
@@ -953,115 +983,12 @@ class WorkspaceVerifier:
                     ) from exc
                 parent_descriptor = next_descriptor
 
-            name = relative_path.parts[-1]
-            try:
-                entry_stat = os.stat(
-                    name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            except (OSError, TypeError, ValueError) as exc:
-                raise WorkspaceVerificationError(
-                    "untracked workspace entry could not be inspected safely"
-                ) from exc
-
-            path_bytes = relative_path.as_posix().encode(
-                "utf-8", errors="surrogateescape"
-            )
-            mode = entry_stat.st_mode
-            digest.update(b"\0KORA-UNTRACKED\0")
-            digest.update(len(path_bytes).to_bytes(8, "big"))
-            digest.update(path_bytes)
-            digest.update(stat.S_IFMT(mode).to_bytes(4, "big"))
-            digest.update((mode & 0o7777).to_bytes(4, "big"))
-
-            if stat.S_ISREG(mode):
-                digest.update(b"F")
-                digest.update(entry_stat.st_size.to_bytes(8, "big", signed=False))
-                nofollow_flag = getattr(os, "O_NOFOLLOW", None)
-                if not isinstance(nofollow_flag, int):
-                    raise WorkspaceVerificationError(
-                        "untracked files cannot be opened safely on this platform"
-                    )
-                flags = os.O_RDONLY | nofollow_flag
-                try:
-                    descriptor = os.open(
-                        name,
-                        flags,
-                        dir_fd=parent_descriptor,
-                    )
-                except (OSError, TypeError, ValueError) as exc:
-                    raise WorkspaceVerificationError(
-                        "untracked file could not be opened without following links"
-                    ) from exc
-                try:
-                    opened_stat = os.fstat(descriptor)
-                    if not WorkspaceVerifier._same_entry(entry_stat, opened_stat):
-                        raise WorkspaceVerificationError(
-                            "untracked file changed while it was being inspected"
-                        )
-                    with os.fdopen(descriptor, "rb", closefd=True) as stream:
-                        while True:
-                            chunk = stream.read(_PIPE_READ_SIZE)
-                            if not chunk:
-                                break
-                            digest.update(chunk)
-                        descriptor = -1
-                    final_stat = os.stat(
-                        name,
-                        dir_fd=parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                    if not WorkspaceVerifier._same_entry(entry_stat, final_stat):
-                        raise WorkspaceVerificationError(
-                            "untracked file changed while it was being inspected"
-                        )
-                finally:
-                    if descriptor >= 0:
-                        os.close(descriptor)
-                return
-
-            if stat.S_ISLNK(mode):
-                digest.update(b"L")
-                try:
-                    target = os.readlink(name, dir_fd=parent_descriptor)
-                    target_again = os.readlink(name, dir_fd=parent_descriptor)
-                    final_stat = os.stat(
-                        name,
-                        dir_fd=parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                except (OSError, TypeError, ValueError) as exc:
-                    raise WorkspaceVerificationError(
-                        "untracked symlink could not be inspected safely"
-                    ) from exc
-                if target != target_again or not WorkspaceVerifier._same_entry(
-                    entry_stat, final_stat
-                ):
-                    raise WorkspaceVerificationError(
-                        "untracked symlink changed while it was being inspected"
-                    )
-                if isinstance(target, str):
-                    target = target.encode("utf-8", errors="surrogateescape")
-                digest.update(len(target).to_bytes(8, "big"))
-                digest.update(target)
-                return
-
-            if stat.S_ISDIR(mode):
-                digest.update(b"D")
-                final_stat = os.stat(
-                    name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if not WorkspaceVerifier._same_entry(entry_stat, final_stat):
-                    raise WorkspaceVerificationError(
-                        "untracked directory changed while it was being inspected"
-                    )
-                return
-
-            raise WorkspaceVerificationError(
-                "special untracked workspace entries are not permitted"
+            WorkspaceVerifier._hash_untracked_entry_at(
+                digest,
+                parent_descriptor,
+                relative_path.parts[-1],
+                relative_path,
+                budget,
             )
         except WorkspaceVerificationError:
             raise
@@ -1076,6 +1003,295 @@ class WorkspaceVerifier:
                 raise WorkspaceVerificationError(
                     "workspace descriptor could not be closed safely"
                 ) from exc
+
+    @staticmethod
+    def _hash_untracked_entry_at(
+        digest: Any,
+        parent_descriptor: int,
+        name: str,
+        relative_path: Path,
+        budget: _UntrackedHashBudget,
+    ) -> None:
+        """Hash one named entry relative to an already-open directory."""
+
+        if len(relative_path.parts) > _UNTRACKED_DEPTH_LIMIT:
+            raise WorkspaceVerificationError(
+                "untracked workspace tree exceeds the inspection depth limit"
+            )
+        try:
+            entry_stat = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise WorkspaceVerificationError(
+                "untracked workspace entry could not be inspected safely"
+            ) from exc
+
+        if budget.entries >= _UNTRACKED_ENTRY_LIMIT:
+            raise WorkspaceVerificationError(
+                "untracked workspace tree exceeds the inspection entry limit"
+            )
+        budget.entries += 1
+
+        path_bytes = relative_path.as_posix().encode(
+            "utf-8", errors="surrogateescape"
+        )
+        mode = entry_stat.st_mode
+        digest.update(b"\0KORA-UNTRACKED\0")
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(stat.S_IFMT(mode).to_bytes(4, "big"))
+        digest.update((mode & 0o7777).to_bytes(4, "big"))
+
+        if stat.S_ISREG(mode):
+            digest.update(b"F")
+            file_size = entry_stat.st_size
+            if not isinstance(file_size, int) or file_size < 0:
+                raise WorkspaceVerificationError(
+                    "untracked regular file has an invalid size"
+                )
+            if budget.data_bytes + file_size > _UNTRACKED_BYTE_LIMIT:
+                raise WorkspaceVerificationError(
+                    "untracked workspace tree exceeds the inspection byte limit"
+                )
+            digest.update(file_size.to_bytes(8, "big", signed=False))
+            nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+            if not isinstance(nofollow_flag, int):
+                raise WorkspaceVerificationError(
+                    "untracked files cannot be opened safely on this platform"
+                )
+            flags = os.O_RDONLY | nofollow_flag
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    name,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+                opened_stat = os.fstat(descriptor)
+                if not WorkspaceVerifier._same_entry(entry_stat, opened_stat):
+                    raise WorkspaceVerificationError(
+                        "untracked file changed while it was being inspected"
+                    )
+                with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                    descriptor = -1
+                    while True:
+                        chunk = stream.read(_PIPE_READ_SIZE)
+                        if not chunk:
+                            break
+                        budget.data_bytes += len(chunk)
+                        if budget.data_bytes > _UNTRACKED_BYTE_LIMIT:
+                            raise WorkspaceVerificationError(
+                                "untracked workspace tree exceeds the inspection byte limit"
+                            )
+                        digest.update(chunk)
+                final_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if not WorkspaceVerifier._same_entry(entry_stat, final_stat):
+                    raise WorkspaceVerificationError(
+                        "untracked file changed while it was being inspected"
+                    )
+            except (OSError, TypeError, ValueError) as exc:
+                if isinstance(exc, WorkspaceVerificationError):
+                    raise
+                raise WorkspaceVerificationError(
+                    "untracked file could not be inspected safely"
+                ) from exc
+            finally:
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError as exc:
+                        raise WorkspaceVerificationError(
+                            "untracked file descriptor could not be closed safely"
+                        ) from exc
+            return
+
+        if stat.S_ISLNK(mode):
+            digest.update(b"L")
+            try:
+                target = os.readlink(name, dir_fd=parent_descriptor)
+                target_again = os.readlink(name, dir_fd=parent_descriptor)
+                final_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise WorkspaceVerificationError(
+                    "untracked symlink could not be inspected safely"
+                ) from exc
+            if target != target_again or not WorkspaceVerifier._same_entry(
+                entry_stat, final_stat
+            ):
+                raise WorkspaceVerificationError(
+                    "untracked symlink changed while it was being inspected"
+                )
+            if isinstance(target, str):
+                target = target.encode("utf-8", errors="surrogateescape")
+            elif not isinstance(target, bytes):
+                raise WorkspaceVerificationError(
+                    "untracked symlink target could not be inspected safely"
+                )
+            if budget.data_bytes + len(target) > _UNTRACKED_BYTE_LIMIT:
+                raise WorkspaceVerificationError(
+                    "untracked workspace tree exceeds the inspection byte limit"
+                )
+            budget.data_bytes += len(target)
+            digest.update(len(target).to_bytes(8, "big"))
+            digest.update(target)
+            return
+
+        if stat.S_ISDIR(mode):
+            digest.update(b"D")
+            try:
+                directory_descriptor = os.open(
+                    name,
+                    _directory_open_flags(),
+                    dir_fd=parent_descriptor,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise WorkspaceVerificationError(
+                    "untracked directory could not be opened safely"
+                ) from exc
+            try:
+                opened_stat = os.fstat(directory_descriptor)
+                if not WorkspaceVerifier._same_entry(entry_stat, opened_stat):
+                    raise WorkspaceVerificationError(
+                        "untracked directory changed while it was being inspected"
+                    )
+                WorkspaceVerifier._hash_untracked_directory(
+                    digest,
+                    directory_descriptor,
+                    relative_path,
+                    budget,
+                )
+                final_descriptor_stat = os.fstat(directory_descriptor)
+                if not WorkspaceVerifier._same_directory_observation(
+                    entry_stat, final_descriptor_stat
+                ):
+                    raise WorkspaceVerificationError(
+                        "untracked directory changed while it was being inspected"
+                    )
+            finally:
+                try:
+                    os.close(directory_descriptor)
+                except OSError as exc:
+                    raise WorkspaceVerificationError(
+                        "untracked directory descriptor could not be closed safely"
+                    ) from exc
+            try:
+                final_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise WorkspaceVerificationError(
+                    "untracked directory could not be rechecked safely"
+                ) from exc
+            if not WorkspaceVerifier._same_directory_observation(
+                entry_stat, final_stat
+            ):
+                raise WorkspaceVerificationError(
+                    "untracked directory changed while it was being inspected"
+                )
+            return
+
+        raise WorkspaceVerificationError(
+            "special untracked workspace entries are not permitted"
+        )
+
+    @staticmethod
+    def _hash_untracked_directory(
+        digest: Any,
+        directory_descriptor: int,
+        relative_path: Path,
+        budget: _UntrackedHashBudget,
+    ) -> None:
+        """Hash sorted children from one open directory descriptor."""
+
+        names: list[str] = []
+        try:
+            with os.scandir(directory_descriptor) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if name == ".git":
+                        continue
+                    WorkspaceVerifier._validate_untracked_child_name(name)
+                    if len(names) >= _UNTRACKED_ENTRY_LIMIT - budget.entries:
+                        raise WorkspaceVerificationError(
+                            "untracked workspace tree exceeds the inspection entry limit"
+                        )
+                    names.append(name)
+        except WorkspaceVerificationError:
+            raise
+        except (OSError, TypeError, ValueError) as exc:
+            raise WorkspaceVerificationError(
+                "untracked directory could not be listed safely"
+            ) from exc
+
+        names.sort(
+            key=lambda name: name.encode("utf-8", errors="surrogateescape")
+        )
+        for name in names:
+            child_path = relative_path / name
+            WorkspaceVerifier._validate_untracked_relative_path(child_path)
+            WorkspaceVerifier._hash_untracked_entry_at(
+                digest,
+                directory_descriptor,
+                name,
+                child_path,
+                budget,
+            )
+
+    @staticmethod
+    def _validate_untracked_relative_path(relative_path: Path) -> None:
+        if (
+            relative_path.is_absolute()
+            or not relative_path.parts
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+            or any(part == ".git" for part in relative_path.parts)
+            or any("\0" in part for part in relative_path.parts)
+        ):
+            raise WorkspaceVerificationError(
+                "untracked path is not a safe workspace-relative entry"
+            )
+
+    @staticmethod
+    def _validate_untracked_child_name(name: object) -> None:
+        if not isinstance(name, str):
+            raise WorkspaceVerificationError(
+                "untracked directory entry name is not safe"
+            )
+        path = Path(name)
+        if (
+            not name
+            or path.is_absolute()
+            or path.parts != (name,)
+            or path.as_posix() != name
+            or "\0" in name
+            or name in {".", ".."}
+        ):
+            raise WorkspaceVerificationError(
+                "untracked directory entry name is not safe"
+            )
+
+    @staticmethod
+    def _same_directory_observation(
+        first: os.stat_result,
+        second: os.stat_result,
+    ) -> bool:
+        return (
+            WorkspaceVerifier._same_entry(first, second)
+            and first.st_mtime_ns == second.st_mtime_ns
+            and first.st_ctime_ns == second.st_ctime_ns
+        )
 
     @staticmethod
     def _same_entry(first: os.stat_result, second: os.stat_result) -> bool:

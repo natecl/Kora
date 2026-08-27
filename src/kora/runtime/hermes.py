@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from kora.runtime.contracts import (
     Capability,
@@ -57,6 +57,40 @@ MUTATING_CAPABILITIES = frozenset(
 )
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INHERITED_ENVIRONMENT_KEYS = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
+
+
+def _build_runtime_environment(
+    explicit_environment: Mapping[object, object] | None = None,
+) -> dict[str, str]:
+    """Build a child environment from the narrow host allowlist and overrides."""
+
+    explicit = dict(explicit_environment or {})
+    for key, value in explicit.items():
+        if not isinstance(key, str) or _ENVIRONMENT_KEY_PATTERN.fullmatch(key) is None:
+            raise HermesRuntimeError(
+                f"Invalid environment variable name: {key!r}"
+            )
+        if not isinstance(value, str):
+            raise HermesRuntimeError(
+                f"Environment variable {key!r} must have a string value"
+            )
+
+    environment = {
+        key: os.environ[key]
+        for key in _INHERITED_ENVIRONMENT_KEYS
+        if key in os.environ
+    }
+    environment.update(explicit)
+    return environment
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +113,9 @@ class HermesRuntimeAdapter:
         self.cloud_root = cloud_root.expanduser().resolve()
         self.hermes_executable = str(hermes_executable)
         self.environment = dict(environment or {})
+
+    def _build_environment(self) -> dict[str, str]:
+        return _build_runtime_environment(self.environment)
 
     def check_health(self) -> RuntimeHealth:
         executable = self._resolve_executable()
@@ -124,8 +161,7 @@ class HermesRuntimeAdapter:
             if job.skills:
                 command.extend(["-s", ",".join(job.skills)])
 
-            environment = os.environ.copy()
-            environment.update(self.environment)
+            environment = self._build_environment()
             completed = subprocess.run(
                 command,
                 cwd=workspace,
@@ -155,6 +191,7 @@ class HermesRuntimeAdapter:
             estimated_cost_usd=self._optional_float(
                 usage.get("estimated_cost_usd")
             ),
+            session_id=job.session_id,
         )
 
     def _resolve_executable(self) -> str:
@@ -178,8 +215,9 @@ class HermesRuntimeAdapter:
             ("mission_id", job.mission_id),
             ("task_id", job.task_id),
         ):
-            if not _ID_PATTERN.fullmatch(value):
-                raise HermesRuntimeError(f"Invalid {label}: {value!r}")
+            self._validate_identifier(value, label)
+        if job.session_id is not None:
+            self._validate_identifier(job.session_id, "session_id")
 
         if not job.objective.strip():
             raise HermesRuntimeError("Runtime job objective cannot be empty")
@@ -221,6 +259,12 @@ class HermesRuntimeAdapter:
                 )
 
         return workspace
+
+    @staticmethod
+    def _validate_identifier(value: object, label: str) -> str:
+        if not isinstance(value, str) or _ID_PATTERN.fullmatch(value) is None:
+            raise HermesRuntimeError(f"Invalid {label}: {value!r}")
+        return value
 
     @staticmethod
     def _build_prompt(job: RuntimeJob) -> str:

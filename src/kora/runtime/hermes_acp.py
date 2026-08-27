@@ -9,11 +9,10 @@ resolver selects one of the offered options.
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import acp
 import acp.schema as schema
@@ -146,7 +145,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
         *,
         cloud_root: Path,
         hermes_executable: str | Path = "hermes",
-        environment: dict[str, str] | None = None,
+        environment: Mapping[str, str] | None = None,
         permission_resolver: PermissionResolver | None = None,
     ) -> None:
         super().__init__(
@@ -171,9 +170,9 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
         prompt = self._build_prompt(job)
         client = _KoraACPClient(self.permission_resolver)
 
-        environment = os.environ.copy()
-        environment.update(self.environment)
+        environment = self._build_environment()
         environment["HERMES_ACP_SKIP_CONFIGURED_MCP"] = "1"
+        session_id = job.session_id
 
         try:
             async with asyncio.timeout(job.timeout_seconds):
@@ -201,12 +200,24 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                             version=__version__,
                         ),
                     )
-                    session = await connection.new_session(
-                        cwd=str(workspace),
-                        mcp_servers=[],
-                    )
+                    if job.session_id is not None:
+                        # ACP 0.9 acknowledges a loaded session without
+                        # repeating its already-known session ID.
+                        await connection.load_session(
+                            cwd=str(workspace),
+                            session_id=job.session_id,
+                            mcp_servers=[],
+                        )
+                    else:
+                        session = await connection.new_session(
+                            cwd=str(workspace),
+                            mcp_servers=[],
+                        )
+                        session_id = self._validate_identifier(
+                            session.session_id, "session_id"
+                        )
                     response = await connection.prompt(
-                        session_id=session.session_id,
+                        session_id=session_id,
                         prompt=[
                             schema.TextContentBlock(
                                 type="text",
@@ -221,6 +232,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                 status=RuntimeStatus.FAILED,
                 response="Hermes ACP runtime timed out.",
                 exit_code=124,
+                session_id=session_id,
             )
         except Exception as exc:
             return RuntimeResult(
@@ -229,6 +241,7 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
                 status=RuntimeStatus.FAILED,
                 response=f"Hermes ACP runtime failed: {type(exc).__name__}",
                 exit_code=1,
+                session_id=session_id,
             )
 
         final_text = client.final_text
@@ -253,4 +266,5 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
             response=final_text,
             exit_code=0,
             total_tokens=total_tokens,
+            session_id=session_id,
         )

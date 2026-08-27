@@ -53,6 +53,7 @@ class RuntimeJob:
     capabilities: frozenset[Capability] = field(default_factory=frozenset)
     isolation: IsolationMode = IsolationMode.READ_ONLY
     timeout_seconds: float = 300.0
+    session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +68,7 @@ class RuntimeResult:
     api_calls: int | None = None
     total_tokens: int | None = None
     estimated_cost_usd: float | None = None
+    session_id: str | None = None
 
     @property
     def completed(self) -> bool:

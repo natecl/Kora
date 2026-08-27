@@ -39,9 +39,9 @@ current stack decision.
 
 ```bash
 uv sync --no-editable
-uv run --no-sync python -m unittest discover -s tests -v
-uv run --no-sync kora-hermes-spike health
-uv run --no-sync kora-hermes-spike acp-smoke --workspace "$PWD"
+PYTHONPATH=src uv run --no-sync python -m unittest discover -s tests -v
+PYTHONPATH=src uv run --no-sync kora-hermes-spike health
+PYTHONPATH=src uv run --no-sync kora-hermes-spike acp-smoke --workspace "$PWD"
 ```
 
 ## Canonical context

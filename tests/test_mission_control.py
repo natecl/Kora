@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from kora.mission import (
     EvidenceKind,
     EventType,
     InvalidTransitionError,
+    Mission,
     MissionService,
     MissionState,
     NotFoundError,
@@ -189,6 +191,13 @@ class MissionControlTests(unittest.TestCase):
         )
         self.service.resume_mission("mission-1")
         self.service.begin_verification("mission-1")
+        evidence = self.service.record_evidence(
+            "mission-1",
+            "The mission acceptance review passed.",
+            kind=EvidenceKind.REVIEW,
+            evidence_id="mission-review",
+        )
+        self.service.verify_evidence(evidence.evidence_id, "independent review")
         completed = self.service.complete_mission("mission-1")
         self.assertEqual(completed.state, MissionState.COMPLETED)
         with self.assertRaises(InvalidTransitionError):
@@ -213,16 +222,32 @@ class MissionControlTests(unittest.TestCase):
 
     def test_only_one_overarching_mission_can_be_active(self) -> None:
         self._activate()
-        other = self.service.create_mission(
+        other_service = MissionService(self.store, owner_ref="other-owner")
+        other = other_service.create_mission(
             "Other", "Other objective", "Other done", mission_id="mission-2"
         )
-        self.service.align_mission(other.mission_id)
+        other_service.align_mission(other.mission_id)
         with self.assertRaises(ConflictError):
-            self.service.activate_mission(other.mission_id)
+            other_service.activate_mission(other.mission_id)
         self.assertEqual(
             self.store.require_mission(other.mission_id).state,
             MissionState.ALIGNED,
         )
+
+    def test_nonterminal_mission_and_records_are_owner_contained(self) -> None:
+        with self.assertRaises(ConflictError):
+            self.service.create_mission(
+                "Second", "Another objective", "Another done", mission_id="same-owner"
+            )
+
+        other_service = MissionService(self.store, owner_ref="other-owner")
+        other = other_service.create_mission(
+            "Other", "Other objective", "Other done", mission_id="other-mission"
+        )
+        with self.assertRaises(ConflictError):
+            self.service.get_mission(other.mission_id)
+        with self.assertRaises(ConflictError):
+            self.service.add_task(other.mission_id, "Foreign task")
 
     def test_alignment_freezes_objective_and_stale_revision_fails(self) -> None:
         self.service.align_mission("mission-1")
@@ -240,6 +265,50 @@ class MissionControlTests(unittest.TestCase):
             self.store.update_mission(aligned, expected_revision=aligned.revision - 1)
         self.assertEqual(
             self.store.require_mission("mission-1").revision, aligned.revision
+        )
+
+    def test_repository_cannot_bypass_lifecycle_or_contract_guards(self) -> None:
+        with self.assertRaises(InvalidTransitionError):
+            self.store.create_mission(
+                Mission(
+                    mission_id="direct-active",
+                    title="Direct active",
+                    objective="Do not bypass approval",
+                    definition_of_done="The guard rejects direct activation",
+                    state=MissionState.ACTIVE,
+                )
+            )
+
+        with self.assertRaises(InvalidTransitionError):
+            self.store.update_mission(
+                replace(self.mission, state=MissionState.COMPLETED)
+            )
+        with self.assertRaises(ConflictError):
+            self.store.update_mission(
+                replace(self.mission, objective="Broadened without re-alignment")
+            )
+        self.assertEqual(
+            self.store.require_mission(self.mission.mission_id).objective,
+            self.mission.objective,
+        )
+        self.service.align_mission("mission-1")
+        aligned = self.store.require_mission("mission-1")
+        with self.assertRaises(ConflictError):
+            self.store.update_mission(replace(aligned, exclusions=("new scope",)))
+
+        task = self.service.add_task("mission-1", "Direct completion", task_id="direct")
+        with self.assertRaises(InvalidTransitionError):
+            self.store.update_task(replace(task, state=TaskStatus.COMPLETED))
+        self.assertEqual(self.store.require_task(task.task_id).state, TaskStatus.READY)
+
+    def test_task_revision_is_compare_and_set_protected(self) -> None:
+        task = self.service.add_task("mission-1", "Revisioned task", task_id="revisioned")
+        updated = self.store.update_task(replace(task, title="Updated title"))
+        self.assertEqual(updated.revision, task.revision + 1)
+        with self.assertRaises(ConflictError):
+            self.store.update_task(replace(task, title="Stale overwrite"))
+        self.assertEqual(
+            self.store.require_task(task.task_id).title, "Updated title"
         )
 
     def test_invalid_multi_write_escalation_rolls_back_everything(self) -> None:
@@ -298,6 +367,14 @@ class MissionControlTests(unittest.TestCase):
             self.service.start_task("b")
         self.service.start_task("a")
         self.service.begin_task_verification("a")
+        evidence_a = self.service.record_evidence(
+            "mission-1",
+            "The prerequisite verification passed.",
+            kind=EvidenceKind.TEST,
+            task_id="a",
+            evidence_id="evidence-a",
+        )
+        self.service.verify_evidence(evidence_a.evidence_id, "test runner")
         self.service.complete_task("a")
         self.assertEqual(self.store.require_task("b").state, TaskStatus.READY)
         self.service.start_task("b")
@@ -305,6 +382,14 @@ class MissionControlTests(unittest.TestCase):
         self.assertIsNone(self.service.select_next_task("mission-1"))
         self.service.start_task("b")
         self.service.begin_task_verification("b")
+        evidence_b = self.service.record_evidence(
+            "mission-1",
+            "The dependent verification passed.",
+            kind=EvidenceKind.TEST,
+            task_id="b",
+            evidence_id="evidence-b",
+        )
+        self.service.verify_evidence(evidence_b.evidence_id, "test runner")
         self.service.complete_task("b")
         self.assertEqual(self.store.require_task("b").state, TaskStatus.COMPLETED)
 
@@ -323,34 +408,77 @@ class MissionControlTests(unittest.TestCase):
         )
         self.assertEqual(self.service.select_next_task("mission-1").task_id, "a")
 
+    def test_task_completion_requires_independently_verified_evidence(self) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Review me", task_id="review-me")
+        self.service.start_task(task.task_id)
+        self.service.begin_task_verification(task.task_id)
+        with self.assertRaises(ConflictError):
+            self.service.complete_task(task.task_id)
+
+        evidence = self.service.record_evidence(
+            "mission-1",
+            "The runtime reported success.",
+            kind=EvidenceKind.TEST,
+            task_id=task.task_id,
+            evidence_id="candidate-evidence",
+        )
+        with self.assertRaises(ConflictError):
+            self.service.complete_task(task.task_id)
+        verified = self.service.verify_evidence(
+            evidence.evidence_id, "independent acceptance test"
+        )
+        self.assertIsNotNone(verified.verified_at)
+        self.assertEqual(
+            self.service.complete_task(task.task_id).state, TaskStatus.COMPLETED
+        )
+
+    def test_failed_task_can_be_retried_only_through_ready(self) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Retryable", task_id="retryable")
+        self.service.start_task(task.task_id)
+        failed = self.service.fail_task(task.task_id)
+        self.assertEqual(failed.state, TaskStatus.FAILED)
+        with self.assertRaises(InvalidTransitionError):
+            self.service.start_task(task.task_id)
+        ready = self.service.transition_task(task.task_id, TaskStatus.READY)
+        self.assertEqual(ready.state, TaskStatus.READY)
+        self.assertEqual(
+            self.service.start_task(task.task_id).state, TaskStatus.IN_PROGRESS
+        )
+
     def test_cross_mission_and_transitive_cycles_are_rejected(self) -> None:
         self._activate()
-        second = self.service.create_mission(
+        other_service = MissionService(self.store, owner_ref="other-owner")
+        second = other_service.create_mission(
             "Second", "Second", "Second done", mission_id="mission-2"
         )
         a = self.service.add_task("mission-1", "A", task_id="a")
         b = self.service.add_task("mission-1", "B", task_id="b")
         c = self.service.add_task("mission-1", "C", task_id="c")
-        foreign = self.service.add_task(second.mission_id, "Foreign", task_id="foreign")
         self.service.add_dependency("mission-1", b.task_id, a.task_id)
         self.service.add_dependency("mission-1", c.task_id, b.task_id)
         with self.assertRaises(DependencyError):
             self.service.add_dependency("mission-1", a.task_id, c.task_id)
+        foreign = other_service.add_task(
+            second.mission_id, "Foreign", task_id="foreign"
+        )
         with self.assertRaises(DependencyError):
             self.service.add_dependency("mission-1", a.task_id, foreign.task_id)
         self.assertEqual(len(self.store.list_dependencies("mission-1")), 2)
 
     def test_repository_also_rejects_cross_mission_and_cycle_edges(self) -> None:
         self._activate()
-        second = self.service.create_mission(
+        other_service = MissionService(self.store, owner_ref="other-owner")
+        second = other_service.create_mission(
             "Second", "Second", "Done", mission_id="mission-2"
         )
         self.service.add_task("mission-1", "A", task_id="a")
         self.service.add_task("mission-1", "B", task_id="b")
-        self.service.add_task(second.mission_id, "Foreign", task_id="foreign")
         self.store.create_dependency(
             TaskDependency("mission-1", "b", "a", created_at=utc_now())
         )
+        other_service.add_task(second.mission_id, "Foreign", task_id="foreign")
         with self.assertRaises(DependencyError):
             self.store.create_dependency(
                 TaskDependency("mission-1", "a", "foreign", created_at=utc_now())
@@ -399,14 +527,97 @@ class MissionControlTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_next_task_prefers_critical_path_before_priority(self) -> None:
+        self._activate()
+        self.service.add_task(
+            "mission-1", "Unrelated high priority", task_id="unrelated", priority=100
+        )
+        self.service.add_task(
+            "mission-1",
+            "Critical path",
+            task_id="critical",
+            priority=1,
+            critical_path=True,
+        )
+        self.assertEqual(self.service.select_next_task("mission-1").task_id, "critical")
+
+    def test_verified_evidence_and_permission_usage_survive_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic-state.sqlite3"
+            first = MissionService(path)
+            mission = first.create_mission("Persistent", "Objective", "Done")
+            first.align_mission(mission.mission_id)
+            first.activate_mission(mission.mission_id)
+            task = first.add_task(mission.mission_id, "Persistent task", task_id="persist-task")
+            first.start_task(task.task_id)
+            first.begin_task_verification(task.task_id)
+            evidence = first.record_evidence(
+                mission.mission_id,
+                "A persistent acceptance result.",
+                kind=EvidenceKind.TEST,
+                task_id=task.task_id,
+                evidence_id="persist-evidence",
+            )
+            first.verify_evidence(evidence.evidence_id, "independent test")
+            grant = first.grant_permission(
+                mission.mission_id,
+                PermissionAction.SPEND,
+                "budget:persistent",
+                "Use the bounded test budget",
+                mode=PermissionMode.BOUNDED_INDEFINITE,
+                scope="persistent test only",
+                max_actions=2,
+                budget_limit_cents=50,
+                grant_id="persist-grant",
+            )
+            first.use_permission(
+                mission.mission_id,
+                grant.grant_id,
+                spent_cents=25,
+                idempotency_key="persist-use",
+            )
+            first.close()
+
+            reopened = MissionService(path)
+            try:
+                persisted_evidence = reopened.store.get_evidence(evidence.evidence_id)
+                persisted_grant = reopened.store.get_permission_grant(grant.grant_id)
+                self.assertIsNotNone(persisted_evidence.verified_at)
+                self.assertEqual(persisted_evidence.verification_method, "independent test")
+                self.assertEqual(
+                    (persisted_grant.actions_used, persisted_grant.spent_cents), (1, 25)
+                )
+            finally:
+                reopened.close()
+
     def test_no_selection_while_waiting_verifying_or_terminal(self) -> None:
         self._activate()
         self.service.add_task("mission-1", "Work", task_id="work")
+        self.service.start_task("work")
         self.service.wait_for_user("mission-1")
         self.assertIsNone(self.service.select_next_task("mission-1"))
         self.service.resume_mission("mission-1")
         self.service.begin_verification("mission-1")
         self.assertIsNone(self.service.select_next_task("mission-1"))
+        self.service.begin_task_verification("work")
+        evidence = self.service.record_evidence(
+            "mission-1",
+            "The work passed review.",
+            kind=EvidenceKind.REVIEW,
+            task_id="work",
+            evidence_id="work-evidence",
+        )
+        self.service.verify_evidence(evidence.evidence_id, "independent review")
+        self.service.complete_task("work")
+        mission_evidence = self.service.record_evidence(
+            "mission-1",
+            "The mission acceptance criteria passed.",
+            kind=EvidenceKind.REVIEW,
+            evidence_id="mission-evidence",
+        )
+        self.service.verify_evidence(
+            mission_evidence.evidence_id, "independent review"
+        )
         self.service.complete_mission("mission-1")
         self.assertIsNone(self.service.select_next_task("mission-1"))
 
@@ -440,8 +651,32 @@ class MissionControlTests(unittest.TestCase):
             self.store.require_mission("mission-1").state, MissionState.ACTIVE
         )
         self.assertEqual(
+            self.store.require_task(task.task_id).state, TaskStatus.READY
+        )
+
+    def test_declining_escalation_does_not_auto_resume_mission(self) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Blocked work", task_id="declined")
+        escalation = self.service.escalate(
+            "mission-1",
+            "Choose",
+            "A material choice is unresolved.",
+            "The result could change.",
+            task_id=task.task_id,
+            escalation_id="declined-escalation",
+        )
+        resolved = self.service.resolve_escalation(
+            escalation.escalation_id, status=EscalationStatus.DECLINED
+        )
+        self.assertEqual(resolved.status, EscalationStatus.DECLINED)
+        self.assertEqual(
+            self.store.require_mission("mission-1").state,
+            MissionState.WAITING_FOR_USER,
+        )
+        self.assertEqual(
             self.store.require_task(task.task_id).state, TaskStatus.NEEDS_USER
         )
+        self.assertIsNone(self.service.select_next_task("mission-1"))
 
     def test_permission_modes_and_atomic_one_time_consumption(self) -> None:
         self._activate()
@@ -459,6 +694,7 @@ class MissionControlTests(unittest.TestCase):
             "Run the approved bounded campaign",
             mode=PermissionMode.BOUNDED_INDEFINITE,
             scope="approved audience only",
+            max_actions=10,
             grant_id="standing",
         )
         self.assertTrue(
@@ -518,6 +754,117 @@ class MissionControlTests(unittest.TestCase):
                 "mission-1", PermissionAction.DEPLOY, "staging/project-a"
             )
         )
+
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM permission_uses WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_standing_permission_use_is_bounded_and_idempotency_protected(self) -> None:
+        self._activate()
+        grant = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.SPEND,
+            "budget:test",
+            "Use the approved test budget",
+            mode=PermissionMode.BOUNDED_INDEFINITE,
+            scope="test budget only",
+            max_actions=3,
+            budget_limit_cents=100,
+            grant_id="bounded",
+        )
+        first = self.service.use_permission(
+            "mission-1", grant.grant_id, spent_cents=60, idempotency_key="use-1"
+        )
+        self.assertEqual((first.actions_used, first.spent_cents), (1, 60))
+        with self.assertRaises(ConflictError):
+            self.service.use_permission(
+                "mission-1", grant.grant_id, spent_cents=60, idempotency_key="use-1"
+            )
+        second = self.service.use_permission(
+            "mission-1", grant.grant_id, spent_cents=40, idempotency_key="use-2"
+        )
+        self.assertEqual((second.actions_used, second.spent_cents), (2, 100))
+        self.assertFalse(
+            self.service.has_permission(
+                "mission-1", PermissionAction.SPEND, "budget:test"
+            )
+        )
+        with self.assertRaises(PermissionUnavailableError):
+            self.service.use_permission(
+                "mission-1", grant.grant_id, idempotency_key="use-3"
+            )
+
+    def test_permission_grants_require_bounded_scope_and_owner_approval(self) -> None:
+        with self.assertRaises(InvalidTransitionError):
+            self.service.grant_permission(
+                "mission-1",
+                PermissionAction.DEPLOY,
+                "staging/project-a",
+                "Deploy before alignment",
+            )
+        self._activate()
+        with self.assertRaises(ValidationError):
+            self.service.grant_permission(
+                "mission-1",
+                PermissionAction.OUTREACH,
+                "audience:test",
+                "Unbounded campaign",
+                mode=PermissionMode.BOUNDED_INDEFINITE,
+                scope="audience only",
+            )
+        with self.assertRaises(ValidationError):
+            self.service.grant_permission(
+                "mission-1",
+                PermissionAction.OUTREACH,
+                "*",
+                "Wildcard campaign",
+                mode=PermissionMode.BOUNDED_INDEFINITE,
+                scope="*",
+                max_actions=1,
+            )
+        with self.assertRaises(ConflictError):
+            self.service.grant_permission(
+                "mission-1",
+                PermissionAction.DEPLOY,
+                "staging/project-a",
+                "Another user's grant",
+                approved_by="another-user",
+            )
+
+    def test_future_schema_is_rejected_on_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "future.sqlite3"
+            store = SQLiteMissionStore(path)
+            store.connection.execute(
+                "UPDATE schema_meta SET value = '999' WHERE key = 'version'"
+            )
+            store.close()
+            with self.assertRaises(ValidationError):
+                SQLiteMissionStore(path)
+
+    def test_audit_events_are_append_only_and_semantic_payloads_are_sanitized(self) -> None:
+        event = self.store.list_events("mission-1")[0]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "UPDATE mission_events SET payload_json = '{}' WHERE event_id = ?",
+                (event.event_id,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "DELETE FROM mission_events WHERE event_id = ?", (event.event_id,)
+            )
+        with self.assertRaises(ValidationError):
+            self.store.create_event(
+                replace(
+                    event,
+                    event_id="leaky-event",
+                    payload={"provider": "secret-provider"},
+                )
+            )
 
 
 if __name__ == "__main__":

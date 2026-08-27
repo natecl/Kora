@@ -12,10 +12,11 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from dataclasses import replace
 from typing import Any, Iterator, Mapping
+from uuid import uuid4
 
 from kora.mission.domain import (
     Artifact,
@@ -45,12 +46,13 @@ from kora.mission.domain import (
 from kora.mission.errors import (
     ConflictError,
     DependencyError,
+    InvalidTransitionError,
     NotFoundError,
     ValidationError,
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _timestamp(value: datetime) -> str:
@@ -130,6 +132,8 @@ class SQLiteMissionStore:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 30000")
+        self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA synchronous = FULL")
         self._initialize_schema()
 
     @property
@@ -138,13 +142,41 @@ class SQLiteMissionStore:
 
         return self._connection
 
+    def _read_schema_version(self) -> int | None:
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'version'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if row is None:
+            return None
+        try:
+            version = int(row[0])
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("persisted schema version is invalid") from exc
+        if version < 0:
+            raise ValidationError("persisted schema version cannot be negative")
+        return version
+
     def _initialize_schema(self) -> None:
         with self._lock:
+            current_version = self._read_schema_version()
+            if current_version is not None and current_version > SCHEMA_VERSION:
+                raise ValidationError(
+                    "database schema is newer than this Kora mission store: "
+                    f"{current_version} > {SCHEMA_VERSION}"
+                )
             self._connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS missions (
@@ -161,7 +193,8 @@ class SQLiteMissionStore:
                     updated_at TEXT NOT NULL,
                     failure_reason TEXT,
                     stop_reason TEXT,
-                    revision INTEGER NOT NULL DEFAULT 0
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    owner_ref TEXT NOT NULL DEFAULT 'owner'
                 );
 
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -170,6 +203,7 @@ class SQLiteMissionStore:
                     title TEXT NOT NULL,
                     description TEXT NOT NULL,
                     priority INTEGER NOT NULL,
+                    critical_path INTEGER NOT NULL DEFAULT 0 CHECK (critical_path IN (0, 1)),
                     state TEXT NOT NULL CHECK (state IN (
                         'ready', 'blocked', 'in_progress', 'needs_user',
                         'verifying', 'completed', 'failed', 'cancelled'
@@ -178,6 +212,7 @@ class SQLiteMissionStore:
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
                     UNIQUE (mission_id, task_id),
                     FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
                         ON DELETE CASCADE
@@ -293,6 +328,8 @@ class SQLiteMissionStore:
                     )),
                     locator TEXT,
                     created_at TEXT NOT NULL,
+                    verified_at TEXT,
+                    verification_method TEXT,
                     FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
                         ON DELETE CASCADE,
                     FOREIGN KEY (mission_id, task_id)
@@ -325,8 +362,21 @@ class SQLiteMissionStore:
                     expires_at TEXT,
                     revoked_at TEXT,
                     consumed_at TEXT,
+                    actions_used INTEGER NOT NULL DEFAULT 0,
+                    spent_cents INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
                         ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS permission_uses (
+                    use_id TEXT PRIMARY KEY,
+                    grant_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    action_count INTEGER NOT NULL CHECK (action_count > 0),
+                    spent_cents INTEGER NOT NULL CHECK (spent_cents >= 0),
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (grant_id) REFERENCES permission_grants(grant_id)
+                        ON DELETE RESTRICT
                 );
 
                 CREATE TABLE IF NOT EXISTS mission_events (
@@ -338,8 +388,9 @@ class SQLiteMissionStore:
                         'decision_recorded', 'assumption_recorded',
                         'checkpoint_recorded', 'escalation_recorded',
                         'permission_granted', 'permission_consumed',
-                        'permission_revoked', 'artifact_recorded',
-                        'evidence_recorded'
+                        'permission_used', 'permission_revoked',
+                        'artifact_recorded', 'evidence_recorded',
+                        'evidence_verified'
                     )),
                     entity_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
@@ -350,16 +401,14 @@ class SQLiteMissionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_missions_order
                     ON missions (created_at, mission_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_mission
-                    ON missions (state) WHERE state = 'active';
-                CREATE INDEX IF NOT EXISTS idx_tasks_selection
-                    ON tasks (mission_id, state, priority DESC, created_at, task_id);
                 CREATE INDEX IF NOT EXISTS idx_dependencies_task
                     ON task_dependencies (mission_id, task_id, depends_on_task_id);
                 CREATE INDEX IF NOT EXISTS idx_events_order
                     ON mission_events (mission_id, created_at, event_id);
                 CREATE INDEX IF NOT EXISTS idx_permissions_lookup
                     ON permission_grants (mission_id, action, resource, mode);
+                CREATE INDEX IF NOT EXISTS idx_permission_uses_grant
+                    ON permission_uses (grant_id, created_at, use_id);
                 """
             )
             mission_columns = {
@@ -370,6 +419,35 @@ class SQLiteMissionStore:
                 self._connection.execute(
                     "ALTER TABLE missions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
                 )
+            if "owner_ref" not in mission_columns:
+                self._connection.execute(
+                    "ALTER TABLE missions ADD COLUMN owner_ref TEXT NOT NULL DEFAULT 'owner'"
+                )
+
+            task_columns = {
+                row[1]
+                for row in self._connection.execute("PRAGMA table_info(tasks)")
+            }
+            if "critical_path" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN critical_path INTEGER NOT NULL DEFAULT 0"
+                )
+            if "revision" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+                )
+
+            evidence_columns = {
+                row[1]
+                for row in self._connection.execute("PRAGMA table_info(evidence)")
+            }
+            if "verified_at" not in evidence_columns:
+                self._connection.execute("ALTER TABLE evidence ADD COLUMN verified_at TEXT")
+            if "verification_method" not in evidence_columns:
+                self._connection.execute(
+                    "ALTER TABLE evidence ADD COLUMN verification_method TEXT"
+                )
+
             permission_columns = {
                 row[1]
                 for row in self._connection.execute(
@@ -384,12 +462,127 @@ class SQLiteMissionStore:
                 self._connection.execute(
                     "ALTER TABLE permission_grants ADD COLUMN kora_id TEXT NOT NULL DEFAULT 'kora'"
                 )
+            if "actions_used" not in permission_columns:
+                self._connection.execute(
+                    "ALTER TABLE permission_grants ADD COLUMN actions_used INTEGER NOT NULL DEFAULT 0"
+                )
+            if "spent_cents" not in permission_columns:
+                self._connection.execute(
+                    "ALTER TABLE permission_grants ADD COLUMN spent_cents INTEGER NOT NULL DEFAULT 0"
+                )
+
+            event_table = self._connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mission_events'"
+            ).fetchone()
+            if event_table is not None and "permission_used" not in (event_table[0] or ""):
+                self._connection.execute("DROP INDEX IF EXISTS idx_events_order")
+                self._connection.execute(
+                    "ALTER TABLE mission_events RENAME TO mission_events_legacy"
+                )
+                self._connection.execute(
+                    """
+                    CREATE TABLE mission_events (
+                        event_id TEXT PRIMARY KEY,
+                        mission_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL CHECK (event_type IN (
+                            'mission_created', 'mission_transitioned', 'task_created',
+                            'task_transitioned', 'task_dependency_added',
+                            'decision_recorded', 'assumption_recorded',
+                            'checkpoint_recorded', 'escalation_recorded',
+                            'permission_granted', 'permission_consumed',
+                            'permission_used', 'permission_revoked',
+                            'artifact_recorded', 'evidence_recorded',
+                            'evidence_verified'
+                        )),
+                        entity_id TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
+                            ON DELETE CASCADE
+                    )
+                    """
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO mission_events(
+                        event_id, mission_id, event_type, entity_id,
+                        payload_json, created_at
+                    )
+                    SELECT event_id, mission_id, event_type, entity_id,
+                           payload_json, created_at
+                    FROM mission_events_legacy
+                    """
+                )
+                self._connection.execute("DROP TABLE mission_events_legacy")
+
+            self._connection.execute("DROP INDEX IF EXISTS idx_one_active_mission")
+            self._connection.execute("DROP INDEX IF EXISTS idx_one_nonterminal_mission")
+            duplicate = self._connection.execute(
+                """
+                SELECT owner_ref
+                FROM missions
+                WHERE state NOT IN ('completed', 'stopped', 'failed')
+                GROUP BY owner_ref
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if duplicate is not None:
+                raise ConflictError(
+                    "database contains multiple non-terminal missions for owner "
+                    f"{duplicate[0]!r}; resolve the ambiguity before reopening"
+                )
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_nonterminal_mission
+                    ON missions (owner_ref)
+                    WHERE state NOT IN ('completed', 'stopped', 'failed')
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_mission
+                    ON missions (state) WHERE state = 'active'
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_selection
+                    ON tasks (mission_id, state, critical_path DESC,
+                              priority DESC, created_at, task_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS mission_events_append_only_update
+                BEFORE UPDATE ON mission_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'mission events are append-only');
+                END
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS mission_events_append_only_delete
+                BEFORE DELETE ON mission_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'mission events are append-only');
+                END
+                """
+            )
             self._connection.execute(
                 """
                 INSERT INTO schema_meta(key, value) VALUES('version', ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
                 (str(SCHEMA_VERSION),),
+            )
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                VALUES (?, ?)
+                """,
+                (SCHEMA_VERSION, _timestamp(utc_now())),
             )
             self._connection.commit()
 
@@ -434,6 +627,12 @@ class SQLiteMissionStore:
     # Missions -------------------------------------------------------------
 
     def create_mission(self, mission: Mission) -> Mission:
+        if mission.state is not MissionState.PROPOSED:
+            raise InvalidTransitionError(
+                "a mission must be created in the proposed state"
+            )
+        if mission.revision != 0:
+            raise ValidationError("a new mission must start at revision zero")
         with self.transaction():
             try:
                 self._connection.execute(
@@ -441,8 +640,8 @@ class SQLiteMissionStore:
                     INSERT INTO missions(
                         mission_id, title, objective, definition_of_done, state,
                         exclusions_json, created_at, updated_at, failure_reason,
-                        stop_reason, revision
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        stop_reason, revision, owner_ref
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         mission.mission_id,
@@ -456,18 +655,29 @@ class SQLiteMissionStore:
                         mission.failure_reason,
                         mission.stop_reason,
                         mission.revision,
+                        mission.owner_ref,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                if mission.state is MissionState.ACTIVE and self.list_missions(
-                    MissionState.ACTIVE
-                ):
+                existing = self.get_mission(mission.mission_id)
+                if existing is not None:
                     raise ConflictError(
-                        "only one overarching mission may be active at a time"
+                        f"mission already exists: {mission.mission_id}"
                     ) from exc
-                raise ConflictError(
-                    f"mission already exists: {mission.mission_id}"
-                ) from exc
+                owner_conflict = self._connection.execute(
+                    """
+                    SELECT 1 FROM missions
+                    WHERE owner_ref = ?
+                      AND state NOT IN ('completed', 'stopped', 'failed')
+                    LIMIT 1
+                    """,
+                    (mission.owner_ref,),
+                ).fetchone()
+                if owner_conflict is not None:
+                    raise ConflictError(
+                        "only one non-terminal mission may exist per owner"
+                    ) from exc
+                raise ConflictError("mission violates a persistence constraint") from exc
         return mission
 
     add_mission = create_mission
@@ -490,6 +700,7 @@ class SQLiteMissionStore:
         mission: Mission,
         *,
         expected_revision: int | None = None,
+        _allow_state_change: bool = False,
     ) -> Mission:
         with self.transaction():
             current = self.require_mission(mission.mission_id)
@@ -500,12 +711,19 @@ class SQLiteMissionStore:
                     f"stale mission revision for {mission.mission_id}: "
                     f"expected {expected_revision}, current {current.revision}"
                 )
-            if current.state is not MissionState.PROPOSED and (
+            if mission.owner_ref != current.owner_ref:
+                raise ConflictError("mission owner cannot change")
+            if mission.state != current.state and not _allow_state_change:
+                raise InvalidTransitionError(
+                    "mission state changes must go through MissionService"
+                )
+            if (
                 mission.objective != current.objective
                 or mission.definition_of_done != current.definition_of_done
+                or mission.exclusions != current.exclusions
             ):
                 raise ConflictError(
-                    "mission objective and definition_of_done are immutable after alignment"
+                    "mission contract changes require explicit re-alignment"
                 )
             persisted = replace(mission, revision=current.revision + 1)
             cursor = self._connection.execute(
@@ -554,14 +772,19 @@ class SQLiteMissionStore:
     # Tasks and dependencies ----------------------------------------------
 
     def create_task(self, task: Task) -> Task:
+        if task.state is not TaskStatus.READY:
+            raise InvalidTransitionError("a task must be created in the ready state")
+        if task.revision != 0:
+            raise ValidationError("a new task must start at revision zero")
         with self.transaction():
             try:
                 self._connection.execute(
                     """
                     INSERT INTO tasks(
-                        task_id, mission_id, title, description, priority, state,
-                        created_at, updated_at, started_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        task_id, mission_id, title, description, priority,
+                        critical_path, state, created_at, updated_at, started_at,
+                        finished_at, revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.task_id,
@@ -569,11 +792,13 @@ class SQLiteMissionStore:
                         task.title,
                         task.description,
                         task.priority,
+                        int(task.critical_path),
                         task.state.value,
                         _timestamp(task.created_at),
                         _timestamp(task.updated_at),
                         _timestamp(task.started_at) if task.started_at else None,
                         _timestamp(task.finished_at) if task.finished_at else None,
+                        task.revision,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -599,35 +824,59 @@ class SQLiteMissionStore:
             raise NotFoundError(f"task not found: {task_id}")
         return task
 
-    def update_task(self, task: Task) -> Task:
+    def update_task(
+        self,
+        task: Task,
+        *,
+        expected_revision: int | None = None,
+        _allow_state_change: bool = False,
+    ) -> Task:
         with self.transaction():
             current = self.require_task(task.task_id)
             if current.mission_id != task.mission_id:
                 raise ConflictError("task mission identity cannot change")
+            if expected_revision is None:
+                expected_revision = task.revision
+            if expected_revision != current.revision:
+                raise ConflictError(
+                    f"stale task revision for {task.task_id}: "
+                    f"expected {expected_revision}, current {current.revision}"
+                )
+            if task.state != current.state and not _allow_state_change:
+                raise InvalidTransitionError(
+                    "task state changes must go through MissionService"
+                )
+            persisted = replace(task, revision=current.revision + 1)
             cursor = self._connection.execute(
                 """
                 UPDATE tasks
                 SET mission_id = ?, title = ?, description = ?, priority = ?,
-                    state = ?, created_at = ?, updated_at = ?, started_at = ?,
-                    finished_at = ?
-                WHERE task_id = ?
+                    critical_path = ?, state = ?, created_at = ?, updated_at = ?,
+                    started_at = ?, finished_at = ?, revision = ?
+                WHERE task_id = ? AND revision = ?
                 """,
                 (
-                    task.mission_id,
-                    task.title,
-                    task.description,
-                    task.priority,
-                    task.state.value,
-                    _timestamp(task.created_at),
-                    _timestamp(task.updated_at),
-                    _timestamp(task.started_at) if task.started_at else None,
-                    _timestamp(task.finished_at) if task.finished_at else None,
-                    task.task_id,
+                    persisted.mission_id,
+                    persisted.title,
+                    persisted.description,
+                    persisted.priority,
+                    int(persisted.critical_path),
+                    persisted.state.value,
+                    _timestamp(persisted.created_at),
+                    _timestamp(persisted.updated_at),
+                    _timestamp(persisted.started_at) if persisted.started_at else None,
+                    _timestamp(persisted.finished_at) if persisted.finished_at else None,
+                    persisted.revision,
+                    persisted.task_id,
+                    expected_revision,
                 ),
             )
             if cursor.rowcount != 1:
-                raise NotFoundError(f"task not found: {task.task_id}")
-        return task
+                raise ConflictError(
+                    f"stale task revision for {task.task_id}: "
+                    f"expected {expected_revision}"
+                )
+        return persisted
 
     def list_tasks(
         self,
@@ -641,7 +890,9 @@ class SQLiteMissionStore:
                 state = TaskStatus(state)
             query += " AND state = ?"
             params.append(state.value)
-        query += " ORDER BY priority DESC, created_at ASC, task_id ASC"
+        query += (
+            " ORDER BY critical_path DESC, priority DESC, created_at ASC, task_id ASC"
+        )
         with self._lock:
             rows = self._connection.execute(query, tuple(params)).fetchall()
         return [self._task_from_row(row) for row in rows]
@@ -735,7 +986,8 @@ class SQLiteMissionStore:
                   ON d.mission_id = t.mission_id
                  AND d.depends_on_task_id = t.task_id
                 WHERE d.task_id = ?
-                ORDER BY t.priority DESC, t.created_at ASC, t.task_id ASC
+                ORDER BY t.critical_path DESC, t.priority DESC,
+                         t.created_at ASC, t.task_id ASC
                 """,
                 (task_id,),
             ).fetchall()
@@ -886,6 +1138,10 @@ class SQLiteMissionStore:
         ]
 
     def create_escalation(self, escalation: Escalation) -> Escalation:
+        if escalation.status is not EscalationStatus.OPEN:
+            raise InvalidTransitionError(
+                "an escalation must be created in the open state"
+            )
         with self.transaction():
             self._insert_mission_record(
                 """
@@ -919,13 +1175,24 @@ class SQLiteMissionStore:
 
     record_escalation = create_escalation
 
-    def update_escalation(self, escalation: Escalation) -> Escalation:
+    def update_escalation(
+        self,
+        escalation: Escalation,
+        *,
+        _allow_status_change: bool = False,
+    ) -> Escalation:
         with self.transaction():
             current = self.get_escalation(escalation.escalation_id)
             if current is None:
                 raise NotFoundError(f"escalation not found: {escalation.escalation_id}")
             if current.mission_id != escalation.mission_id:
                 raise ConflictError("escalation mission identity cannot change")
+            if escalation.status != current.status and not _allow_status_change:
+                raise InvalidTransitionError(
+                    "escalation status changes must go through MissionService"
+                )
+            if current.status is not EscalationStatus.OPEN and escalation != current:
+                raise ConflictError("resolved escalation records are immutable")
             cursor = self._connection.execute(
                 """
                 UPDATE escalations
@@ -1028,13 +1295,17 @@ class SQLiteMissionStore:
         ]
 
     def create_evidence(self, evidence: Evidence) -> Evidence:
+        if evidence.verified_at is not None or evidence.verification_method is not None:
+            raise InvalidTransitionError(
+                "evidence must be independently verified after it is recorded"
+            )
         with self.transaction():
             self._insert_mission_record(
                 """
                 INSERT INTO evidence(
                     evidence_id, mission_id, task_id, artifact_id, summary, kind,
-                    locator, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    locator, created_at, verified_at, verification_method
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evidence.evidence_id,
@@ -1045,6 +1316,8 @@ class SQLiteMissionStore:
                     evidence.kind.value,
                     evidence.locator,
                     _timestamp(evidence.created_at),
+                    _timestamp(evidence.verified_at) if evidence.verified_at else None,
+                    evidence.verification_method,
                 ),
                 evidence.mission_id,
                 evidence.evidence_id,
@@ -1073,21 +1346,106 @@ class SQLiteMissionStore:
                 kind=EvidenceKind(row["kind"]),
                 locator=row["locator"],
                 created_at=_parse_timestamp(row["created_at"]),
+                verified_at=_parse_timestamp(row["verified_at"])
+                if row["verified_at"]
+                else None,
+                verification_method=row["verification_method"],
             )
             for row in rows
         ]
+
+    def update_evidence(self, evidence: Evidence) -> Evidence:
+        """Record one irreversible verification outcome for an evidence claim."""
+
+        with self.transaction():
+            current = self._get_evidence(evidence.evidence_id)
+            if current is None:
+                raise NotFoundError(f"evidence not found: {evidence.evidence_id}")
+            if current.mission_id != evidence.mission_id:
+                raise ConflictError("evidence mission identity cannot change")
+            if (
+                current.task_id != evidence.task_id
+                or current.artifact_id != evidence.artifact_id
+                or current.summary != evidence.summary
+                or current.kind != evidence.kind
+                or current.locator != evidence.locator
+                or current.created_at != evidence.created_at
+            ):
+                raise ConflictError("evidence claims are immutable after recording")
+            if current.verified_at is not None:
+                raise ConflictError("evidence has already been verified")
+            if evidence.verified_at is None or evidence.verification_method is None:
+                raise ValidationError("evidence verification requires a method and time")
+            cursor = self._connection.execute(
+                """
+                UPDATE evidence
+                SET verified_at = ?, verification_method = ?
+                WHERE evidence_id = ? AND verified_at IS NULL
+                """,
+                (
+                    _timestamp(evidence.verified_at),
+                    evidence.verification_method,
+                    evidence.evidence_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("evidence verification lost a race")
+        return evidence
+
+    def get_evidence(self, evidence_id: str) -> Evidence | None:
+        with self._lock:
+            return self._get_evidence(evidence_id)
+
+    def _get_evidence(self, evidence_id: str) -> Evidence | None:
+        row = self._connection.execute(
+            "SELECT * FROM evidence WHERE evidence_id = ?", (evidence_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return Evidence(
+            evidence_id=row["evidence_id"],
+            mission_id=row["mission_id"],
+            task_id=row["task_id"],
+            artifact_id=row["artifact_id"],
+            summary=row["summary"],
+            kind=EvidenceKind(row["kind"]),
+            locator=row["locator"],
+            created_at=_parse_timestamp(row["created_at"]),
+            verified_at=_parse_timestamp(row["verified_at"])
+            if row["verified_at"]
+            else None,
+            verification_method=row["verification_method"],
+        )
 
     # Permissions ----------------------------------------------------------
 
     def create_permission_grant(self, grant: PermissionGrant) -> PermissionGrant:
         with self.transaction():
+            mission = self.require_mission(grant.mission_id)
+            if mission.state in {
+                MissionState.PROPOSED,
+                MissionState.COMPLETED,
+                MissionState.STOPPED,
+                MissionState.FAILED,
+            }:
+                raise InvalidTransitionError(
+                    "permission grants require an aligned, non-terminal mission"
+                )
+            if (
+                grant.approved_by != mission.owner_ref
+                or grant.user_id != mission.owner_ref
+            ):
+                raise ConflictError(
+                    "only the mission owner may activate a permission grant"
+                )
             self._insert_mission_record(
                 """
                 INSERT INTO permission_grants(
                     grant_id, mission_id, action, resource, purpose, mode, scope,
                     max_actions, budget_limit_cents, approved_by, user_id, kora_id,
-                    approved_at, expires_at, revoked_at, consumed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    approved_at, expires_at, revoked_at, consumed_at,
+                    actions_used, spent_cents
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     grant.grant_id,
@@ -1106,6 +1464,8 @@ class SQLiteMissionStore:
                     _timestamp(grant.expires_at) if grant.expires_at else None,
                     _timestamp(grant.revoked_at) if grant.revoked_at else None,
                     _timestamp(grant.consumed_at) if grant.consumed_at else None,
+                    grant.actions_used,
+                    grant.spent_cents,
                 ),
                 grant.mission_id,
                 grant.grant_id,
@@ -1145,77 +1505,140 @@ class SQLiteMissionStore:
                 raise NotFoundError(f"permission grant not found: {grant.grant_id}")
             if current.mission_id != grant.mission_id:
                 raise ConflictError("permission grant mission identity cannot change")
+            if grant != current:
+                raise ConflictError(
+                    "permission grants are append-only; use the permission "
+                    "broker to record use or revocation"
+                )
+        return grant
+
+    def use_permission(
+        self,
+        grant_id: str,
+        *,
+        idempotency_key: str,
+        action_count: int = 1,
+        spent_cents: int = 0,
+        used_at: datetime | None = None,
+    ) -> PermissionGrant | None:
+        """Atomically record a bounded action against a semantic grant.
+
+        A ``None`` result means the grant is not usable at the requested time.
+        The usage row and grant counters commit together, so an audit failure or
+        duplicate write cannot leave a partially consumed grant.
+        """
+
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValidationError("idempotency_key must be a non-empty string")
+        if (
+            isinstance(action_count, bool)
+            or not isinstance(action_count, int)
+            or action_count <= 0
+        ):
+            raise ValidationError("action_count must be a positive integer")
+        if (
+            isinstance(spent_cents, bool)
+            or not isinstance(spent_cents, int)
+            or spent_cents < 0
+        ):
+            raise ValidationError("spent_cents must be a non-negative integer")
+        used = normalize_timestamp(used_at or utc_now())
+        used_text = _timestamp(used)
+        with self.transaction(immediate=True):
+            existing_use = self._connection.execute(
+                "SELECT grant_id FROM permission_uses WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing_use is not None:
+                raise ConflictError(
+                    f"permission use idempotency key already exists: {idempotency_key}"
+                )
+            row = self._connection.execute(
+                "SELECT * FROM permission_grants WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"permission grant not found: {grant_id}")
+            if row["mode"] == PermissionMode.APPROVE_ONCE.value and action_count != 1:
+                raise ValidationError("approve-once grants permit exactly one action")
             cursor = self._connection.execute(
                 """
                 UPDATE permission_grants
-                SET mission_id = ?, action = ?, resource = ?, purpose = ?, mode = ?,
-                    scope = ?, max_actions = ?, budget_limit_cents = ?,
-                    approved_by = ?, user_id = ?, kora_id = ?, approved_at = ?, expires_at = ?,
-                    revoked_at = ?, consumed_at = ?
+                SET actions_used = actions_used + ?,
+                    spent_cents = spent_cents + ?,
+                    consumed_at = CASE
+                        WHEN mode = ? THEN ?
+                        ELSE consumed_at
+                    END
                 WHERE grant_id = ?
+                  AND revoked_at IS NULL
+                  AND approved_at <= ?
+                  AND (expires_at IS NULL OR expires_at > ?)
+                  AND (consumed_at IS NULL)
+                  AND EXISTS (
+                      SELECT 1 FROM missions
+                      WHERE missions.mission_id = permission_grants.mission_id
+                        AND missions.state = 'active'
+                  )
+                  AND (max_actions IS NULL OR actions_used + ? <= max_actions)
+                  AND (budget_limit_cents IS NULL OR spent_cents < budget_limit_cents)
+                  AND (budget_limit_cents IS NULL
+                       OR spent_cents + ? <= budget_limit_cents)
                 """,
                 (
-                    grant.mission_id,
-                    grant.action.value,
-                    grant.resource,
-                    grant.purpose,
-                    grant.mode.value,
-                    grant.scope,
-                    grant.max_actions,
-                    grant.budget_limit_cents,
-                    grant.approved_by,
-                    grant.user_id,
-                    grant.kora_id,
-                    _timestamp(grant.approved_at),
-                    _timestamp(grant.expires_at) if grant.expires_at else None,
-                    _timestamp(grant.revoked_at) if grant.revoked_at else None,
-                    _timestamp(grant.consumed_at) if grant.consumed_at else None,
-                    grant.grant_id,
+                    action_count,
+                    spent_cents,
+                    PermissionMode.APPROVE_ONCE.value,
+                    used_text,
+                    grant_id,
+                    used_text,
+                    used_text,
+                    action_count,
+                    spent_cents,
                 ),
             )
             if cursor.rowcount != 1:
-                raise NotFoundError(f"permission grant not found: {grant.grant_id}")
-        return grant
+                return None
+            self._connection.execute(
+                """
+                INSERT INTO permission_uses(
+                    use_id, grant_id, idempotency_key, action_count,
+                    spent_cents, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"use-{uuid4().hex}",
+                    grant_id,
+                    idempotency_key,
+                    action_count,
+                    spent_cents,
+                    used_text,
+                ),
+            )
+            updated_row = self._connection.execute(
+                "SELECT * FROM permission_grants WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+        return (
+            self._permission_from_row(updated_row)
+            if updated_row is not None
+            else None
+        )
 
     def consume_permission(
         self,
         grant_id: str,
         *,
         consumed_at: datetime | None = None,
+        idempotency_key: str | None = None,
     ) -> PermissionGrant | None:
-        """Atomically consume an available approve-once grant.
-
-        Returning ``None`` means another caller consumed it first or the grant
-        is not currently usable.  No caller can observe a partial consumption.
-        """
+        """Atomically consume an available approve-once grant."""
 
         consumed = normalize_timestamp(consumed_at or utc_now())
-        with self.transaction(immediate=True):
-            cursor = self._connection.execute(
-                """
-                UPDATE permission_grants
-                SET consumed_at = ?
-                WHERE grant_id = ?
-                  AND mode = ?
-                  AND consumed_at IS NULL
-                  AND revoked_at IS NULL
-                  AND approved_at <= ?
-                  AND (expires_at IS NULL OR expires_at > ?)
-                """,
-                (
-                    _timestamp(consumed),
-                    grant_id,
-                    PermissionMode.APPROVE_ONCE.value,
-                    _timestamp(consumed),
-                    _timestamp(consumed),
-                ),
-            )
-            if cursor.rowcount != 1:
-                return None
-            row = self._connection.execute(
-                "SELECT * FROM permission_grants WHERE grant_id = ?", (grant_id,)
-            ).fetchone()
-        return self._permission_from_row(row) if row is not None else None
+        return self.use_permission(
+            grant_id,
+            idempotency_key=idempotency_key
+            or f"consume:{grant_id}:{_timestamp(consumed)}",
+            used_at=consumed,
+        )
 
     def revoke_permission(
         self,
@@ -1337,6 +1760,7 @@ class SQLiteMissionStore:
             definition_of_done=row["definition_of_done"],
             state=MissionState(row["state"]),
             exclusions=_text_tuple(row["exclusions_json"], "exclusions"),
+            owner_ref=row["owner_ref"],
             created_at=_parse_timestamp(row["created_at"]),
             updated_at=_parse_timestamp(row["updated_at"]),
             failure_reason=row["failure_reason"],
@@ -1352,6 +1776,7 @@ class SQLiteMissionStore:
             title=row["title"],
             description=row["description"],
             priority=row["priority"],
+            critical_path=bool(row["critical_path"]),
             state=TaskStatus(row["state"]),
             created_at=_parse_timestamp(row["created_at"]),
             updated_at=_parse_timestamp(row["updated_at"]),
@@ -1361,6 +1786,7 @@ class SQLiteMissionStore:
             finished_at=_parse_timestamp(row["finished_at"])
             if row["finished_at"]
             else None,
+            revision=row["revision"],
         )
 
     @staticmethod
@@ -1408,6 +1834,8 @@ class SQLiteMissionStore:
             consumed_at=_parse_timestamp(row["consumed_at"])
             if row["consumed_at"]
             else None,
+            actions_used=row["actions_used"],
+            spent_cents=row["spent_cents"],
         )
 
 

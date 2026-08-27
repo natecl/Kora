@@ -94,7 +94,6 @@ TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
         {
             TaskStatus.NEEDS_USER,
             TaskStatus.VERIFYING,
-            TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         }
@@ -102,6 +101,7 @@ TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.NEEDS_USER: frozenset(
         {
             TaskStatus.READY,
+            TaskStatus.BLOCKED,
             TaskStatus.IN_PROGRESS,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
@@ -117,7 +117,7 @@ TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
         }
     ),
     TaskStatus.COMPLETED: frozenset(),
-    TaskStatus.FAILED: frozenset(),
+    TaskStatus.FAILED: frozenset({TaskStatus.READY}),
     TaskStatus.CANCELLED: frozenset(),
 }
 
@@ -180,7 +180,15 @@ def _coerce_permission_mode(value: PermissionMode | str) -> PermissionMode:
 class MissionService:
     """Create and advance one Kora mission without consulting Hermes state."""
 
-    def __init__(self, store: SQLiteMissionStore | str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        store: SQLiteMissionStore | str | Path = ":memory:",
+        *,
+        owner_ref: str = "owner",
+    ) -> None:
+        if not isinstance(owner_ref, str) or not owner_ref.strip():
+            raise ValidationError("owner_ref must be a non-empty string")
+        self.owner_ref = owner_ref
         self.store = (
             store
             if isinstance(store, SQLiteMissionStore)
@@ -217,6 +225,7 @@ class MissionService:
             objective=objective,
             definition_of_done=definition_of_done,
             exclusions=tuple(exclusions),
+            owner_ref=self.owner_ref,
             created_at=timestamp,
             updated_at=timestamp,
         )
@@ -237,13 +246,21 @@ class MissionService:
         target: MissionState | str,
         *,
         reason: str | None = None,
+        expected_revision: int | None = None,
         at: datetime | None = None,
     ) -> Mission:
         target_state = _coerce_mission_state(target)
         timestamp = normalize_timestamp(at or utc_now())
         with self.store.transaction(immediate=True):
-            current = self.store.require_mission(mission_id)
+            current = self._require_owned_mission(mission_id)
+            if expected_revision is not None and expected_revision != current.revision:
+                raise ConflictError(
+                    f"stale mission revision for {mission_id}: expected "
+                    f"{expected_revision}, current {current.revision}"
+                )
             self._validate_mission_transition(current.state, target_state)
+            if target_state is MissionState.COMPLETED:
+                self._ensure_mission_completion_ready(current.mission_id)
             updated = self._transition_mission_in_transaction(
                 current,
                 target_state,
@@ -304,7 +321,7 @@ class MissionService:
         )
 
     def resume_mission(self, mission_id: str, *, at: datetime | None = None) -> Mission:
-        current = self.store.require_mission(mission_id)
+        current = self._require_owned_mission(mission_id)
         if current.state not in {
             MissionState.WAITING_FOR_USER,
             MissionState.VERIFYING,
@@ -315,10 +332,12 @@ class MissionService:
         return self.transition_mission(mission_id, MissionState.ACTIVE, at=at)
 
     def get_mission(self, mission_id: str) -> Mission:
-        return self.store.require_mission(mission_id)
+        return self._require_owned_mission(mission_id)
 
     def get_task(self, task_id: str) -> Task:
-        return self.store.require_task(task_id)
+        task = self.store.require_task(task_id)
+        self._require_owned_mission(task.mission_id)
+        return task
 
     # Task graph -----------------------------------------------------------
 
@@ -329,6 +348,7 @@ class MissionService:
         *,
         description: str = "",
         priority: int = 0,
+        critical_path: bool = False,
         task_id: str | None = None,
         depends_on: Iterable[str] = (),
         created_at: datetime | None = None,
@@ -342,7 +362,7 @@ class MissionService:
         ):
             raise ValidationError("depends_on must contain non-empty task IDs")
         with self.store.transaction(immediate=True):
-            mission = self.store.require_mission(mission_id)
+            mission = self._require_owned_mission(mission_id)
             self._ensure_mission_accepts_work(mission)
             task = Task(
                 task_id=task_id or self._new_id("task"),
@@ -350,6 +370,7 @@ class MissionService:
                 title=title,
                 description=description,
                 priority=priority,
+                critical_path=critical_path,
                 created_at=timestamp,
                 updated_at=timestamp,
             )
@@ -358,7 +379,11 @@ class MissionService:
                 mission_id=mission_id,
                 event_type=EventType.TASK_CREATED,
                 entity_id=task.task_id,
-                payload={"priority": task.priority, "state": task.state.value},
+                payload={
+                    "priority": task.priority,
+                    "critical_path": task.critical_path,
+                    "state": task.state.value,
+                },
                 created_at=timestamp,
             )
             for prerequisite_id in dependency_ids:
@@ -381,7 +406,7 @@ class MissionService:
     ) -> TaskDependency:
         timestamp = normalize_timestamp(created_at or utc_now())
         with self.store.transaction(immediate=True):
-            mission = self.store.require_mission(mission_id)
+            mission = self._require_owned_mission(mission_id)
             self._ensure_mission_accepts_work(mission)
             dependency = self._add_dependency_in_transaction(
                 mission_id,
@@ -397,17 +422,32 @@ class MissionService:
         task_id: str,
         target: TaskStatus | str,
         *,
+        expected_revision: int | None = None,
         at: datetime | None = None,
     ) -> Task:
         target_status = _coerce_task_status(target)
         timestamp = normalize_timestamp(at or utc_now())
         with self.store.transaction(immediate=True):
             current = self.store.require_task(task_id)
-            mission = self.store.require_mission(current.mission_id)
+            mission = self._require_owned_mission(current.mission_id)
+            if expected_revision is not None and expected_revision != current.revision:
+                raise ConflictError(
+                    f"stale task revision for {task_id}: expected "
+                    f"{expected_revision}, current {current.revision}"
+                )
             self._ensure_mission_accepts_work(mission)
             self._refresh_task_states_in_transaction(current.mission_id, at=timestamp)
             current = self.store.require_task(task_id)
+            if expected_revision is not None and expected_revision != current.revision:
+                raise ConflictError(
+                    f"task {task_id} changed while refreshing dependencies"
+                )
             self._validate_task_transition(current.state, target_status)
+            if self._task_has_open_escalation(task_id):
+                if target_status in {TaskStatus.READY, TaskStatus.IN_PROGRESS}:
+                    raise InvalidTransitionError(
+                        f"task {task_id} is blocked by an open escalation"
+                    )
             prerequisites = self.store.list_prerequisites(task_id)
             resolved = all(task.state is TaskStatus.COMPLETED for task in prerequisites)
             if target_status is TaskStatus.READY and not resolved:
@@ -427,6 +467,15 @@ class MissionService:
                     raise InvalidTransitionError(
                         f"task {task_id} is blocked by an incomplete dependency"
                     )
+            if target_status is TaskStatus.COMPLETED:
+                if current.state is not TaskStatus.VERIFYING:
+                    raise InvalidTransitionError(
+                        "a task must be verifying before it can be completed"
+                    )
+                if not self._has_verified_evidence_for_task(current):
+                    raise ConflictError(
+                        f"task {task_id} cannot complete without verified evidence"
+                    )
             updated = self._transition_task_in_transaction(
                 current,
                 target_status,
@@ -438,51 +487,107 @@ class MissionService:
                 )
         return updated
 
-    def start_task(self, task_id: str, *, at: datetime | None = None) -> Task:
-        return self.transition_task(task_id, TaskStatus.IN_PROGRESS, at=at)
+    def start_task(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> Task:
+        return self.transition_task(
+            task_id, TaskStatus.IN_PROGRESS, expected_revision=expected_revision, at=at
+        )
 
-    def mark_task_needs_user(self, task_id: str, *, at: datetime | None = None) -> Task:
-        return self.transition_task(task_id, TaskStatus.NEEDS_USER, at=at)
+    def mark_task_needs_user(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> Task:
+        return self.transition_task(
+            task_id, TaskStatus.NEEDS_USER, expected_revision=expected_revision, at=at
+        )
 
     def begin_task_verification(
-        self, task_id: str, *, at: datetime | None = None
+        self,
+        task_id: str,
+        *,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
     ) -> Task:
-        return self.transition_task(task_id, TaskStatus.VERIFYING, at=at)
+        return self.transition_task(
+            task_id, TaskStatus.VERIFYING, expected_revision=expected_revision, at=at
+        )
 
-    def complete_task(self, task_id: str, *, at: datetime | None = None) -> Task:
-        return self.transition_task(task_id, TaskStatus.COMPLETED, at=at)
+    def complete_task(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> Task:
+        return self.transition_task(
+            task_id, TaskStatus.COMPLETED, expected_revision=expected_revision, at=at
+        )
 
-    def fail_task(self, task_id: str, *, at: datetime | None = None) -> Task:
-        return self.transition_task(task_id, TaskStatus.FAILED, at=at)
+    def fail_task(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> Task:
+        return self.transition_task(
+            task_id, TaskStatus.FAILED, expected_revision=expected_revision, at=at
+        )
 
-    def cancel_task(self, task_id: str, *, at: datetime | None = None) -> Task:
-        return self.transition_task(task_id, TaskStatus.CANCELLED, at=at)
+    def cancel_task(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> Task:
+        return self.transition_task(
+            task_id, TaskStatus.CANCELLED, expected_revision=expected_revision, at=at
+        )
 
     def select_next_task(self, mission_id: str) -> Task | None:
         """Select the highest-priority ready task, or none outside ACTIVE."""
 
         with self.store.transaction(immediate=True):
-            mission = self.store.require_mission(mission_id)
+            mission = self._require_owned_mission(mission_id)
             if mission.state is not MissionState.ACTIVE:
                 return None
             self._refresh_task_states_in_transaction(mission_id)
             ready = self.store.list_tasks(mission_id, TaskStatus.READY)
-            return ready[0] if ready else None
+            return self._choose_ready_task(ready, mission_id)
 
     next_task = select_next_task
 
     def get_status(self, mission_id: str) -> MissionStatusReport:
-        mission = self.store.require_mission(mission_id)
-        next_task = self.select_next_task(mission_id)
-        mission = self.store.require_mission(mission_id)
-        return MissionStatusReport(
-            mission=mission,
-            tasks=tuple(self.store.list_tasks(mission_id)),
-            open_escalations=tuple(
+        with self.store.transaction(immediate=True):
+            mission = self._require_owned_mission(mission_id)
+            if mission.state is MissionState.ACTIVE:
+                self._refresh_task_states_in_transaction(mission_id)
+                mission = self._require_owned_mission(mission_id)
+            tasks = tuple(self.store.list_tasks(mission_id))
+            open_escalations = tuple(
                 self.store.list_escalations(mission_id, EscalationStatus.OPEN)
-            ),
-            next_task=next_task,
-        )
+            )
+            ready = [task for task in tasks if task.state is TaskStatus.READY]
+            next_task = (
+                self._choose_ready_task(ready, mission_id)
+                if mission.state is MissionState.ACTIVE
+                else None
+            )
+            return MissionStatusReport(
+                mission=mission,
+                tasks=tasks,
+                open_escalations=open_escalations,
+                next_task=next_task,
+            )
 
     status = get_status
 
@@ -508,7 +613,7 @@ class MissionService:
             created_at=timestamp,
         )
         with self.store.transaction(immediate=True):
-            self.store.require_mission(mission_id)
+            self._require_owned_mission(mission_id)
             self.store.create_decision(record)
             self._record_event(
                 mission_id=mission_id,
@@ -543,7 +648,7 @@ class MissionService:
             resolved_at=resolved_at,
         )
         with self.store.transaction(immediate=True):
-            self.store.require_mission(mission_id)
+            self._require_owned_mission(mission_id)
             self.store.create_assumption(record)
             self._record_event(
                 mission_id=mission_id,
@@ -576,7 +681,7 @@ class MissionService:
             created_at=timestamp,
         )
         with self.store.transaction(immediate=True):
-            self.store.require_mission(mission_id)
+            self._require_owned_mission(mission_id)
             self._ensure_task_belongs_to_mission(task_id, mission_id)
             self.store.create_checkpoint(record)
             self._record_event(
@@ -593,8 +698,10 @@ class MissionService:
     def record_escalation(self, escalation: Escalation) -> Escalation:
         """Persist an escalation without changing mission state."""
 
+        if escalation.status is not EscalationStatus.OPEN:
+            raise InvalidTransitionError("an escalation must be recorded as open")
         with self.store.transaction(immediate=True):
-            self.store.require_mission(escalation.mission_id)
+            self._require_owned_mission(escalation.mission_id)
             self._ensure_task_belongs_to_mission(
                 escalation.task_id, escalation.mission_id
             )
@@ -642,7 +749,7 @@ class MissionService:
             created_at=timestamp,
         )
         with self.store.transaction(immediate=True):
-            mission = self.store.require_mission(mission_id)
+            mission = self._require_owned_mission(mission_id)
             if mission.state not in {
                 MissionState.ACTIVE,
                 MissionState.WAITING_FOR_USER,
@@ -698,10 +805,11 @@ class MissionService:
             current = self.store.get_escalation(escalation_id)
             if current is None:
                 raise NotFoundError(f"escalation not found: {escalation_id}")
+            mission = self._require_owned_mission(current.mission_id)
             if current.status is not EscalationStatus.OPEN:
                 raise ConflictError(f"escalation already resolved: {escalation_id}")
             updated = replace(current, status=status_value, resolved_at=timestamp)
-            self.store.update_escalation(updated)
+            self.store.update_escalation(updated, _allow_status_change=True)
             self._record_event(
                 mission_id=updated.mission_id,
                 event_type=EventType.ESCALATION_RECORDED,
@@ -709,12 +817,38 @@ class MissionService:
                 payload={"status": updated.status.value},
                 created_at=timestamp,
             )
-            mission = self.store.require_mission(updated.mission_id)
             remaining = self.store.list_escalations(
                 updated.mission_id,
                 EscalationStatus.OPEN,
             )
-            if mission.state is MissionState.WAITING_FOR_USER and not remaining:
+            if (
+                status_value is EscalationStatus.RESOLVED
+                and updated.task_id is not None
+                and not any(
+                    escalation.task_id == updated.task_id for escalation in remaining
+                )
+            ):
+                task = self.store.get_task(updated.task_id)
+                if task is not None and task.state is TaskStatus.NEEDS_USER:
+                    prerequisites = self.store.list_prerequisites(task.task_id)
+                    desired = (
+                        TaskStatus.READY
+                        if all(
+                            prerequisite.state is TaskStatus.COMPLETED
+                            for prerequisite in prerequisites
+                        )
+                        else TaskStatus.BLOCKED
+                    )
+                    self._transition_task_in_transaction(
+                        task,
+                        desired,
+                        at=timestamp,
+                    )
+            if (
+                status_value is EscalationStatus.RESOLVED
+                and mission.state is MissionState.WAITING_FOR_USER
+                and not remaining
+            ):
                 self._transition_mission_in_transaction(
                     mission,
                     MissionState.ACTIVE,
@@ -745,7 +879,7 @@ class MissionService:
             created_at=timestamp,
         )
         with self.store.transaction(immediate=True):
-            self.store.require_mission(mission_id)
+            self._require_owned_mission(mission_id)
             self._ensure_task_belongs_to_mission(task_id, mission_id)
             self.store.create_artifact(record)
             self._record_event(
@@ -783,7 +917,7 @@ class MissionService:
             created_at=timestamp,
         )
         with self.store.transaction(immediate=True):
-            self.store.require_mission(mission_id)
+            self._require_owned_mission(mission_id)
             self._ensure_task_belongs_to_mission(task_id, mission_id)
             if artifact_id is not None:
                 artifacts = {
@@ -804,6 +938,36 @@ class MissionService:
 
     add_evidence = record_evidence
 
+    def verify_evidence(
+        self,
+        evidence_id: str,
+        verification_method: str,
+        *,
+        verified_at: datetime | None = None,
+    ) -> Evidence:
+        timestamp = normalize_timestamp(verified_at or utc_now())
+        with self.store.transaction(immediate=True):
+            evidence = self.store.get_evidence(evidence_id)
+            if evidence is None:
+                raise NotFoundError(f"evidence not found: {evidence_id}")
+            self._require_owned_mission(evidence.mission_id)
+            updated = replace(
+                evidence,
+                verified_at=timestamp,
+                verification_method=verification_method,
+            )
+            self.store.update_evidence(updated)
+            self._record_event(
+                mission_id=updated.mission_id,
+                event_type=EventType.EVIDENCE_VERIFIED,
+                entity_id=updated.evidence_id,
+                payload={"method": updated.verification_method},
+                created_at=timestamp,
+            )
+            return updated
+
+    verify_artifact = verify_evidence
+
     # Semantic permissions -------------------------------------------------
 
     def grant_permission(
@@ -817,14 +981,20 @@ class MissionService:
         scope: str = "",
         max_actions: int | None = None,
         budget_limit_cents: int | None = None,
-        approved_by: str = "user",
-        user_id: str = "owner",
+        approved_by: str | None = None,
+        user_id: str | None = None,
         kora_id: str = "kora",
         grant_id: str | None = None,
         approved_at: datetime | None = None,
         expires_at: datetime | None = None,
     ) -> PermissionGrant:
         timestamp = normalize_timestamp(approved_at or utc_now())
+        effective_approved_by = (
+            self.owner_ref if approved_by in (None, "user") else approved_by
+        )
+        effective_user_id = self.owner_ref if user_id in (None, "owner") else user_id
+        if effective_approved_by != self.owner_ref or effective_user_id != self.owner_ref:
+            raise ConflictError("only the mission owner may activate a permission grant")
         record = PermissionGrant(
             grant_id=grant_id or self._new_id("grant"),
             mission_id=mission_id,
@@ -835,15 +1005,23 @@ class MissionService:
             scope=scope,
             max_actions=max_actions,
             budget_limit_cents=budget_limit_cents,
-            approved_by=approved_by,
-            user_id=user_id,
+            approved_by=effective_approved_by,
+            user_id=effective_user_id,
             kora_id=kora_id,
             approved_at=timestamp,
             expires_at=expires_at,
         )
         with self.store.transaction(immediate=True):
-            mission = self.store.require_mission(mission_id)
-            self._ensure_mission_accepts_work(mission)
+            mission = self._require_owned_mission(mission_id)
+            if mission.state in {
+                MissionState.PROPOSED,
+                MissionState.COMPLETED,
+                MissionState.STOPPED,
+                MissionState.FAILED,
+            }:
+                raise InvalidTransitionError(
+                    "permission grants require an aligned, non-terminal mission"
+                )
             self.store.create_permission_grant(record)
             self._record_event(
                 mission_id=mission_id,
@@ -866,15 +1044,13 @@ class MissionService:
     ) -> bool:
         action_value = _coerce_permission_action(action)
         moment = normalize_timestamp(at or utc_now())
-        mission = self.store.require_mission(mission_id)
-        if mission.state in {
-            MissionState.COMPLETED,
-            MissionState.STOPPED,
-            MissionState.FAILED,
-        }:
+        mission = self._require_owned_mission(mission_id)
+        if mission.state is not MissionState.ACTIVE:
             return False
         return any(
-            grant.resource == resource and grant.is_active(moment)
+            grant.resource == resource
+            and grant.user_id == self.owner_ref
+            and grant.is_active(moment)
             for grant in self.store.list_permission_grants(mission_id, action_value)
         )
 
@@ -883,15 +1059,23 @@ class MissionService:
         grant_id: str,
         *,
         consumed_at: datetime | None = None,
+        idempotency_key: str | None = None,
     ) -> PermissionGrant:
         timestamp = normalize_timestamp(consumed_at or utc_now())
         with self.store.transaction(immediate=True):
             existing = self.store.get_permission_grant(grant_id)
             if existing is None:
                 raise NotFoundError(f"permission grant not found: {grant_id}")
-            mission = self.store.require_mission(existing.mission_id)
-            self._ensure_mission_accepts_work(mission)
-            grant = self.store.consume_permission(grant_id, consumed_at=timestamp)
+            mission = self._require_owned_mission(existing.mission_id)
+            if mission.state is not MissionState.ACTIVE:
+                raise PermissionUnavailableError(
+                    f"mission is not active: {mission.mission_id}"
+                )
+            grant = self.store.consume_permission(
+                grant_id,
+                consumed_at=timestamp,
+                idempotency_key=idempotency_key,
+            )
             if grant is None:
                 raise PermissionUnavailableError(
                     f"permission grant is not available: {grant_id}"
@@ -905,6 +1089,58 @@ class MissionService:
             )
         return grant
 
+    def use_permission(
+        self,
+        mission_id: str,
+        grant_id: str,
+        *,
+        action_count: int = 1,
+        spent_cents: int = 0,
+        idempotency_key: str | None = None,
+        used_at: datetime | None = None,
+    ) -> PermissionGrant:
+        timestamp = normalize_timestamp(used_at or utc_now())
+        key = idempotency_key or f"use:{grant_id}:{uuid4().hex}"
+        with self.store.transaction(immediate=True):
+            mission = self._require_owned_mission(mission_id)
+            if mission.state is not MissionState.ACTIVE:
+                raise PermissionUnavailableError(
+                    f"mission is not active: {mission_id}"
+                )
+            existing = self.store.get_permission_grant(grant_id)
+            if existing is None:
+                raise NotFoundError(f"permission grant not found: {grant_id}")
+            if existing.mission_id != mission_id:
+                raise ConflictError("permission grant belongs to another mission")
+            grant = self.store.use_permission(
+                grant_id,
+                idempotency_key=key,
+                action_count=action_count,
+                spent_cents=spent_cents,
+                used_at=timestamp,
+            )
+            if grant is None:
+                raise PermissionUnavailableError(
+                    f"permission grant is not available: {grant_id}"
+                )
+            event_type = (
+                EventType.PERMISSION_CONSUMED
+                if grant.mode is PermissionMode.APPROVE_ONCE
+                else EventType.PERMISSION_USED
+            )
+            self._record_event(
+                mission_id=mission_id,
+                event_type=event_type,
+                entity_id=grant.grant_id,
+                payload={
+                    "mode": grant.mode.value,
+                    "action_count": action_count,
+                    "spent_cents": spent_cents,
+                },
+                created_at=timestamp,
+            )
+            return grant
+
     def revoke_permission(
         self,
         grant_id: str,
@@ -913,6 +1149,10 @@ class MissionService:
     ) -> PermissionGrant:
         timestamp = normalize_timestamp(revoked_at or utc_now())
         with self.store.transaction(immediate=True):
+            existing = self.store.get_permission_grant(grant_id)
+            if existing is None:
+                raise NotFoundError(f"permission grant not found: {grant_id}")
+            self._require_owned_mission(existing.mission_id)
             grant = self.store.revoke_permission(grant_id, revoked_at=timestamp)
             self._record_event(
                 mission_id=grant.mission_id,
@@ -959,6 +1199,7 @@ class MissionService:
                 stop_reason=stop_reason,
             ),
             expected_revision=current.revision,
+            _allow_state_change=True,
         )
         self._record_event(
             mission_id=current.mission_id,
@@ -1005,13 +1246,19 @@ class MissionService:
                 updated_at=at,
                 started_at=started_at,
                 finished_at=finished_at,
-            )
+            ),
+            expected_revision=current.revision,
+            _allow_state_change=True,
         )
         self._record_event(
             mission_id=current.mission_id,
             event_type=EventType.TASK_TRANSITIONED,
             entity_id=current.task_id,
-            payload={"from": current.state.value, "to": target.value},
+            payload={
+                "from": current.state.value,
+                "to": target.value,
+                "revision": updated.revision,
+            },
             created_at=at,
         )
         return updated
@@ -1091,12 +1338,21 @@ class MissionService:
             desired = TaskStatus.READY if resolved else TaskStatus.BLOCKED
             if desired is task.state:
                 continue
-            self.store.update_task(replace(task, state=desired, updated_at=timestamp))
+            self.store.update_task(
+                replace(task, state=desired, updated_at=timestamp),
+                expected_revision=task.revision,
+                _allow_state_change=True,
+            )
+            updated = self.store.require_task(task.task_id)
             self._record_event(
                 mission_id=mission_id,
                 event_type=EventType.TASK_TRANSITIONED,
                 entity_id=task.task_id,
-                payload={"from": task.state.value, "to": desired.value},
+                payload={
+                    "from": task.state.value,
+                    "to": desired.value,
+                    "revision": updated.revision,
+                },
                 created_at=timestamp,
             )
 
@@ -1153,6 +1409,78 @@ class MissionService:
     @staticmethod
     def _new_id(prefix: str) -> str:
         return f"{prefix}-{uuid4().hex}"
+
+    def _require_owned_mission(self, mission_id: str) -> Mission:
+        mission = self.store.require_mission(mission_id)
+        if mission.owner_ref != self.owner_ref:
+            raise ConflictError(f"mission belongs to another owner: {mission_id}")
+        return mission
+
+    def _task_has_open_escalation(self, task_id: str) -> bool:
+        task = self.store.require_task(task_id)
+        return any(
+            escalation.task_id == task_id
+            for escalation in self.store.list_escalations(
+                task.mission_id, EscalationStatus.OPEN
+            )
+        )
+
+    def _has_verified_evidence_for_task(self, task: Task) -> bool:
+        return any(
+            evidence.task_id == task.task_id and evidence.verified_at is not None
+            for evidence in self.store.list_evidence(task.mission_id)
+        )
+
+    def _ensure_mission_completion_ready(self, mission_id: str) -> None:
+        open_escalations = self.store.list_escalations(
+            mission_id, EscalationStatus.OPEN
+        )
+        if open_escalations:
+            raise ConflictError("mission cannot complete while an escalation is open")
+        tasks = self.store.list_tasks(mission_id)
+        incomplete = [task.task_id for task in tasks if task.state is not TaskStatus.COMPLETED]
+        if incomplete:
+            raise ConflictError(
+                "mission cannot complete with incomplete tasks: "
+                + ", ".join(incomplete)
+            )
+        if tasks and not all(self._has_verified_evidence_for_task(task) for task in tasks):
+            raise ConflictError("every completed task requires verified evidence")
+        if not any(
+            evidence.verified_at is not None
+            for evidence in self.store.list_evidence(mission_id)
+        ):
+            raise ConflictError("mission cannot complete without verified evidence")
+
+    def _choose_ready_task(self, ready: Iterable[Task], mission_id: str) -> Task | None:
+        candidates = tuple(ready)
+        if not candidates:
+            return None
+        memo: dict[str, int] = {}
+
+        def depth(task_id: str, visiting: frozenset[str] = frozenset()) -> int:
+            if task_id in memo:
+                return memo[task_id]
+            if task_id in visiting:
+                return 0
+            prerequisites = self.store.list_prerequisites(task_id)
+            result = max(
+                (1 + depth(task.task_id, visiting | {task_id}) for task in prerequisites),
+                default=0,
+            )
+            memo[task_id] = result
+            return result
+
+        return min(
+            candidates,
+            key=lambda task: (
+                -int(task.critical_path),
+                -task.priority,
+                -depth(task.task_id),
+                task.created_at,
+                task.task_id,
+            ),
+        )
 
     @staticmethod
     def _ensure_mission_accepts_work(mission: Mission) -> None:

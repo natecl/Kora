@@ -129,10 +129,10 @@ adapter contract.
 
 ```bash
 uv sync --no-editable
-uv run --no-sync python -m unittest discover -s tests -v
-uv run --no-sync kora-hermes-spike health
-uv run --no-sync kora-hermes-spike smoke --workspace "$PWD"
-uv run --no-sync kora-hermes-spike acp-smoke --workspace "$PWD"
+PYTHONPATH=src uv run --no-sync python -m unittest discover -s tests -v
+PYTHONPATH=src uv run --no-sync kora-hermes-spike health
+PYTHONPATH=src uv run --no-sync kora-hermes-spike smoke --workspace "$PWD"
+PYTHONPATH=src uv run --no-sync kora-hermes-spike acp-smoke --workspace "$PWD"
 docker build -t kora-hermes:68518c1f -f infra/hermes/Dockerfile .
 docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m kora-hermes:68518c1f acp --check
 ```

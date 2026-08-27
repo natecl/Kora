@@ -61,6 +61,50 @@ def _tuple_of_strings(
     return result
 
 
+_FORBIDDEN_SEMANTIC_KEYS = frozenset(
+    {
+        "api_calls",
+        "chain_of_thought",
+        "estimated_cost_usd",
+        "model",
+        "model_id",
+        "private_reasoning",
+        "prompt",
+        "provider",
+        "provider_id",
+        "raw_output",
+        "reasoning",
+        "runtime_result",
+        "session",
+        "session_id",
+        "token",
+        "tokens",
+        "total_tokens",
+        "trace",
+        "trace_id",
+        "worker",
+        "worker_id",
+        "worker_topology",
+    }
+)
+
+
+def _validate_semantic_payload(value: Any, path: str = "payload") -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise ValidationError(f"{path} keys must be strings")
+            normalized = key.strip().lower().replace("-", "_")
+            if normalized in _FORBIDDEN_SEMANTIC_KEYS:
+                raise ValidationError(
+                    f"{path} cannot contain runtime-internal field: {key}"
+                )
+            _validate_semantic_payload(nested, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _validate_semantic_payload(nested, f"{path}[{index}]")
+
+
 def _coerce_enum(value: Any, enum_type: type[StrEnum], field_name: str) -> StrEnum:
     if isinstance(value, enum_type):
         return value
@@ -215,9 +259,11 @@ class EventType(StrEnum):
     ESCALATION_RECORDED = "escalation_recorded"
     PERMISSION_GRANTED = "permission_granted"
     PERMISSION_CONSUMED = "permission_consumed"
+    PERMISSION_USED = "permission_used"
     PERMISSION_REVOKED = "permission_revoked"
     ARTIFACT_RECORDED = "artifact_recorded"
     EVIDENCE_RECORDED = "evidence_recorded"
+    EVIDENCE_VERIFIED = "evidence_verified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +281,7 @@ class Mission:
     failure_reason: str | None = None
     stop_reason: str | None = None
     revision: int = 0
+    owner_ref: str = "owner"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -253,6 +300,7 @@ class Mission:
         object.__setattr__(
             self, "exclusions", _tuple_of_strings(self.exclusions, "exclusions")
         )
+        object.__setattr__(self, "owner_ref", _non_empty(self.owner_ref, "owner_ref"))
         object.__setattr__(self, "created_at", normalize_timestamp(self.created_at))
         object.__setattr__(self, "updated_at", normalize_timestamp(self.updated_at))
         object.__setattr__(
@@ -291,6 +339,8 @@ class Task:
     updated_at: datetime = field(default_factory=utc_now)
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    revision: int = 0
+    critical_path: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", _non_empty(self.task_id, "task_id"))
@@ -302,6 +352,8 @@ class Task:
             raise ValidationError("description must be a string")
         if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise ValidationError("priority must be an integer")
+        if not isinstance(self.critical_path, bool):
+            raise ValidationError("critical_path must be a boolean")
         object.__setattr__(self, "state", _coerce_enum(self.state, TaskStatus, "state"))
         object.__setattr__(self, "created_at", normalize_timestamp(self.created_at))
         object.__setattr__(self, "updated_at", normalize_timestamp(self.updated_at))
@@ -311,6 +363,12 @@ class Task:
             object.__setattr__(
                 self, "finished_at", normalize_timestamp(self.finished_at)
             )
+        if (
+            isinstance(self.revision, bool)
+            or not isinstance(self.revision, int)
+            or self.revision < 0
+        ):
+            raise ValidationError("revision must be a non-negative integer")
 
     @property
     def status(self) -> TaskStatus:
@@ -531,6 +589,8 @@ class Evidence:
     task_id: str | None = None
     locator: str | None = None
     created_at: datetime = field(default_factory=utc_now)
+    verified_at: datetime | None = None
+    verification_method: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -551,6 +611,17 @@ class Evidence:
             self, "locator", _optional_non_empty(self.locator, "locator")
         )
         object.__setattr__(self, "created_at", normalize_timestamp(self.created_at))
+        object.__setattr__(
+            self,
+            "verification_method",
+            _optional_non_empty(self.verification_method, "verification_method"),
+        )
+        if self.verified_at is not None:
+            object.__setattr__(self, "verified_at", normalize_timestamp(self.verified_at))
+        if (self.verified_at is None) != (self.verification_method is None):
+            raise ValidationError(
+                "verified_at and verification_method must be provided together"
+            )
 
     @property
     def evidence_type(self) -> EvidenceKind:
@@ -577,6 +648,8 @@ class PermissionGrant:
     expires_at: datetime | None = None
     revoked_at: datetime | None = None
     consumed_at: datetime | None = None
+    actions_used: int = 0
+    spent_cents: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "grant_id", _non_empty(self.grant_id, "grant_id"))
@@ -619,6 +692,43 @@ class PermissionGrant:
             value = getattr(self, field_name)
             if value is not None:
                 object.__setattr__(self, field_name, normalize_timestamp(value))
+        if self.expires_at is not None and self.expires_at <= self.approved_at:
+            raise ValidationError("expires_at must be after approved_at")
+        if "*" in self.scope:
+            raise ValidationError("permission scope cannot use wildcards")
+        if self.mode is PermissionMode.BOUNDED_INDEFINITE:
+            if not self.scope.strip():
+                raise ValidationError("bounded grants require a non-empty scope")
+            if (
+                self.max_actions is None
+                and self.budget_limit_cents is None
+                and self.expires_at is None
+            ):
+                raise ValidationError(
+                    "bounded grants require an action limit, budget, or expiry"
+                )
+        for field_name in ("actions_used", "spent_cents"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValidationError(f"{field_name} must be a non-negative integer")
+        if self.mode is PermissionMode.APPROVE_ONCE and self.actions_used > 1:
+            raise ValidationError("approve-once grants cannot use more than once")
+        if self.mode is PermissionMode.APPROVE_ONCE and self.max_actions not in {
+            None,
+            1,
+        }:
+            raise ValidationError("approve-once grants can have at most one action")
+        if self.max_actions is not None and self.actions_used > self.max_actions:
+            raise ValidationError("actions_used cannot exceed max_actions")
+        if (
+            self.budget_limit_cents is not None
+            and self.spent_cents > self.budget_limit_cents
+        ):
+            raise ValidationError("spent_cents cannot exceed budget_limit_cents")
         if (
             self.mode is PermissionMode.BOUNDED_INDEFINITE
             and self.consumed_at is not None
@@ -655,6 +765,13 @@ class PermissionGrant:
             or self.consumed_at is not None
         ):
             return False
+        if self.max_actions is not None and self.actions_used >= self.max_actions:
+            return False
+        if (
+            self.budget_limit_cents is not None
+            and self.spent_cents >= self.budget_limit_cents
+        ):
+            return False
         return self.expires_at is None or self.expires_at > now
 
 
@@ -680,6 +797,7 @@ class DomainEvent:
         object.__setattr__(self, "entity_id", _non_empty(self.entity_id, "entity_id"))
         if not isinstance(self.payload, Mapping):
             raise ValidationError("payload must be a mapping")
+        _validate_semantic_payload(self.payload)
         object.__setattr__(self, "payload", dict(self.payload))
         object.__setattr__(self, "created_at", normalize_timestamp(self.created_at))
 

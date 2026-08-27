@@ -19,11 +19,13 @@ When sources conflict, use this order:
 3. [`KORA_V1_PRD.md`](../../KORA_V1_PRD.md) for approved product behavior.
 4. [`KORA_TECHNICAL_ARCHITECTURE.md`](../../KORA_TECHNICAL_ARCHITECTURE.md)
    for system invariants and technical boundaries.
-5. [`BEHAVIOR_CONTRACT.md`](./BEHAVIOR_CONTRACT.md) and
+5. [`KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md) for the accepted
+   staged technology choices and migration gates.
+6. [`BEHAVIOR_CONTRACT.md`](./BEHAVIOR_CONTRACT.md) and
    [`KORA_IDENTITY.md`](./KORA_IDENTITY.md) for Kora's durable operating style.
-6. [`FOUNDER_CONTEXT.md`](./FOUNDER_CONTEXT.md) for personalization and
+7. [`FOUNDER_CONTEXT.md`](./FOUNDER_CONTEXT.md) for personalization and
    interpretation.
-7. [`PRODUCT_DECISION_LEDGER.md`](./PRODUCT_DECISION_LEDGER.md) and
+8. [`PRODUCT_DECISION_LEDGER.md`](./PRODUCT_DECISION_LEDGER.md) and
    [`SOURCE_CONTEXT.md`](./SOURCE_CONTEXT.md) for historical rationale.
 
 Historical context can explain a decision. It cannot approve spending,
@@ -49,6 +51,8 @@ evidence, or stop-condition records.
   the Allie Miller desiderata, and the founder's future thesis.
 - [`CURRENT_STATE.md`](./CURRENT_STATE.md): what exists in code today and what
   remains conceptual.
+- [`../KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md): accepted,
+  staged technology choices and migration gates.
 - [`manifest.json`](./manifest.json): machine-readable index and authority
   metadata.
 

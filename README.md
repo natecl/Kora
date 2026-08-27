@@ -54,6 +54,10 @@ implementation snapshot.
 The normative product and system specifications remain
 [KORA_V1_PRD.md](./KORA_V1_PRD.md) and
 [KORA_TECHNICAL_ARCHITECTURE.md](./KORA_TECHNICAL_ARCHITECTURE.md).
+The accepted, staged technology-stack decision is
+[docs/KORA_TECHNOLOGY_STACK.md](./docs/KORA_TECHNOLOGY_STACK.md); it records
+target choices and migration gates without implying that deferred components
+are implemented.
 
 ## Next engineering slice
 

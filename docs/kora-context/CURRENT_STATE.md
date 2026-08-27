@@ -6,6 +6,9 @@
 
 This file prevents future agents from confusing the designed Kora experience
 with the code that currently exists.
+The accepted but staged technology target is
+[`../KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md); selected target
+services are not evidence that those components are implemented.
 
 ## Implemented
 
@@ -59,6 +62,8 @@ route models invisibly at runtime.
 
 ## Documented but not implemented
 
+- The accepted staged technology-stack target and its hosted beta services;
+  see [`../KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md).
 - The headless loop that reconciles mission/task state with RuntimeAdapter
   jobs, evaluates results, and records evidence for a real development mission.
 - Context OS and versioned knowledge graph.

@@ -8,6 +8,7 @@
     "active_mission_and_authority",
     "KORA_V1_PRD.md",
     "KORA_TECHNICAL_ARCHITECTURE.md",
+    "docs/KORA_TECHNOLOGY_STACK.md",
     "docs/kora-context/BEHAVIOR_CONTRACT.md",
     "docs/kora-context/KORA_IDENTITY.md",
     "docs/kora-context/FOUNDER_CONTEXT.md",
@@ -49,6 +50,11 @@
       "path": "docs/kora-context/CURRENT_STATE.md",
       "kind": "implementation_snapshot",
       "authority": "descriptive_only"
+    },
+    {
+      "path": "docs/KORA_TECHNOLOGY_STACK.md",
+      "kind": "technology_stack_decision",
+      "authority": "canonical_technical_decision"
     }
   ],
   "safety": {

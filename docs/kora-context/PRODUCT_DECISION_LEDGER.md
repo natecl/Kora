@@ -45,6 +45,7 @@ Statuses:
 | K-029 | Preserve a candid, human, non-condescending personality. | The relationship should feel like a coworker, not an aligned corporate chatbot. |
 | K-030 | Retain strong consent and safety despite natural language. | Human tone cannot become a route around permission, truth, or computer safety. |
 | K-031 | Treat a tagged Hermes release plus an immutable container image digest as the planned runtime-hardening pin; evaluate OpenHands only as a gated fallback if Hermes fails concrete vertical-slice gates. | Reproducibility and a credible replacement path are both required without broadening the current technology decision or coupling mission state to a harness. |
+| K-032 | Adopt the staged technology stack in [`KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md): Python control plane, SQLite now/PostgreSQL beta, Kora-owned coordination with Temporal Cloud at the durability trigger, native Swift macOS, Twilio phone continuity, and a small managed cloud surface. | Preserves Kora's model-agnostic, authority-first architecture while deferring rewrites and infrastructure whose cost is not yet justified. |
 
 ## Rejected initial directions
 
@@ -81,10 +82,10 @@ Statuses:
 | ID | Question | Evidence needed |
 |---|---|---|
 | O-001 | What is the smallest product-development task that produces the first magical moment? | Dogfood missions and two developer design partners. |
-| O-002 | Which desktop technology should implement onboarding and observability? | Prototype speed, permissions, security, and visual quality. |
-| O-003 | What is the reliable iMessage bridge for an alpha? | Apple platform constraints, account risk, delivery reliability, and user setup. |
-| O-004 | Which call provider and voice stack should run daily meetings? | Latency, cost, identity, recording consent, and naturalness. |
-| O-005 | How should persistent cloud workspaces be provisioned and isolated? | Real read/write mission tests, cost measurements, and recovery exercises. |
+| O-002 | Which native macOS implementation details and distribution gates should the alpha use? | Prototype speed, permissions, security, visual quality, and notarized distribution. |
+| O-003 | What reliability, consent, and account-safety gates must an iMessage relay experiment pass? | Apple platform constraints, delivery reliability, founder setup, and an independent SMS fallback. |
+| O-004 | Which voice UX, consent, and daily-meeting details should sit on the initial Twilio path? | Latency, cost, identity, recording consent, and naturalness. |
+| O-005 | How should the selected beta cloud services provision, isolate, pause, and recover workspaces? | Real read/write mission tests, egress and secret-isolation trials, cost measurements, and recovery exercises. |
 | O-006 | What semantic permission schema feels simple enough for users? | Usability testing across deployment, outreach, provider setup, and spending. |
 | O-007 | Which models and routing policy achieve founder-level product quality within the allowance? | Task-level evaluations and actual cost traces. |
 | O-008 | How should Kora store and update the user's operating model? | Context conflict tests, correction propagation, privacy, and retrieval quality. |
@@ -101,3 +102,7 @@ Statuses:
   Hermes runtime memory, scheduling, approvals, and self-improvement state are
   never authoritative. Added the later tagged-release/digest hardening target
   and gated OpenHands fallback condition.
+- **2026-08-26:** Accepted the staged technology-stack decision in
+  [`docs/KORA_TECHNOLOGY_STACK.md`](../KORA_TECHNOLOGY_STACK.md), including
+  Python, SQLite/PostgreSQL, Temporal-at-trigger, native Swift, Twilio phone
+  continuity, beta cloud defaults, and explicit replacement gates.

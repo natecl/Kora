@@ -43,6 +43,11 @@ Phone / iMessage / Calls        macOS Desktop App
               Restricted Mac Bridge
 ```
 
+The accepted, staged implementation choices and migration gates are maintained
+in [KORA_TECHNOLOGY_STACK.md](./docs/KORA_TECHNOLOGY_STACK.md). This document
+remains authoritative for Kora's system invariants, ownership boundaries, and
+product-facing architecture.
+
 ## Replaceable open-source execution harness
 
 Kora is the product and control plane. Proven open-source projects may supply

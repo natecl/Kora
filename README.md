@@ -14,6 +14,8 @@ provide invisible model, tool, skill, and worker infrastructure underneath.
 The repository contains:
 
 - The v1 product requirements and technical architecture.
+- A canonical Kora context pack covering identity, founder context, behavior,
+  source influences, product decisions, and current implementation state.
 - Kora's open-source implementation strategy.
 - A capability-gated Hermes one-shot adapter.
 - A persistent Hermes ACP adapter with deny-by-default permissions.
@@ -30,5 +32,13 @@ uv run --no-sync kora-hermes-spike health
 uv run --no-sync kora-hermes-spike acp-smoke --workspace "$PWD"
 ```
 
-Start with [KORA_V1_PRD.md](./KORA_V1_PRD.md) and
+## Canonical context
+
+Start with the [Kora Context Pack](./docs/kora-context/README.md). It defines
+the source hierarchy and links Kora's identity, behavior contract, founder
+context, conversation synthesis, decision ledger, source context, and honest
+implementation snapshot.
+
+The normative product and system specifications remain
+[KORA_V1_PRD.md](./KORA_V1_PRD.md) and
 [KORA_TECHNICAL_ARCHITECTURE.md](./KORA_TECHNICAL_ARCHITECTURE.md).

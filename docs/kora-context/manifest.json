@@ -1,0 +1,61 @@
+{
+  "schema_version": "1.0",
+  "context_pack": "kora-core",
+  "version": "1.0",
+  "approved_on": "2026-08-26",
+  "authority_order": [
+    "latest_explicit_user_instruction",
+    "active_mission_and_authority",
+    "KORA_V1_PRD.md",
+    "KORA_TECHNICAL_ARCHITECTURE.md",
+    "docs/kora-context/BEHAVIOR_CONTRACT.md",
+    "docs/kora-context/KORA_IDENTITY.md",
+    "docs/kora-context/FOUNDER_CONTEXT.md",
+    "docs/kora-context/PRODUCT_DECISION_LEDGER.md",
+    "docs/kora-context/SOURCE_CONTEXT.md"
+  ],
+  "documents": [
+    {
+      "path": "docs/kora-context/KORA_IDENTITY.md",
+      "kind": "identity",
+      "authority": "canonical_behavior"
+    },
+    {
+      "path": "docs/kora-context/FOUNDER_CONTEXT.md",
+      "kind": "founder_context",
+      "authority": "personalization_only"
+    },
+    {
+      "path": "docs/kora-context/BEHAVIOR_CONTRACT.md",
+      "kind": "behavior_contract",
+      "authority": "canonical_behavior"
+    },
+    {
+      "path": "docs/kora-context/CONVERSATION_SYNTHESIS.md",
+      "kind": "conversation_synthesis",
+      "authority": "historical_context"
+    },
+    {
+      "path": "docs/kora-context/PRODUCT_DECISION_LEDGER.md",
+      "kind": "decision_ledger",
+      "authority": "historical_context"
+    },
+    {
+      "path": "docs/kora-context/SOURCE_CONTEXT.md",
+      "kind": "source_context",
+      "authority": "historical_context"
+    },
+    {
+      "path": "docs/kora-context/CURRENT_STATE.md",
+      "kind": "implementation_snapshot",
+      "authority": "descriptive_only"
+    }
+  ],
+  "safety": {
+    "historical_context_grants_authority": false,
+    "access_implies_authority": false,
+    "store_chain_of_thought": false,
+    "store_credentials": false,
+    "behavior_changes_require_approval": true
+  }
+}

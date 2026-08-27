@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 import re
+import sqlite3
 import time
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -32,11 +33,14 @@ from kora.execution.errors import (
 )
 from kora.mission import (
     ArtifactKind,
+    AuthorizationRequest,
     AttemptStatus,
     CheckpointType,
+    ConflictError,
     EscalationStatus,
     Evidence,
     EvidenceKind,
+    InvalidTransitionError,
     Mission,
     MissionService,
     MissionState,
@@ -62,6 +66,7 @@ from kora.verification import (
 from kora.workforce import (
     ModelRouter,
     RoleCharter,
+    RouteDecision,
     RouteObservation,
     RouteReservation,
     TaskProfile,
@@ -816,10 +821,12 @@ class ExecutionCoordinator:
             raise ExecutionValidationError("workforce_compiler must provide compile")
         if not callable(getattr(model_router, "select", None)):
             raise ExecutionValidationError("model_router must provide select")
-        if not callable(getattr(model_router, "reserve", None)):
-            raise ExecutionValidationError("model_router must provide reserve")
-        if not callable(getattr(model_router, "release", None)):
-            raise ExecutionValidationError("model_router must provide release")
+        reserve = getattr(model_router, "reserve", None)
+        release = getattr(model_router, "release", None)
+        if callable(reserve) != callable(release):
+            raise ExecutionValidationError(
+                "model_router must provide both reserve and release"
+            )
         if not callable(getattr(task_spec_provider, "get", None)):
             raise ExecutionValidationError("task_spec_provider must provide get")
         if not callable(
@@ -837,6 +844,8 @@ class ExecutionCoordinator:
         self.task_spec_provider = task_spec_provider
         self.runtime_resolver = runtime_resolver
         self.workspace_verifier = workspace_verifier
+        self._router_reserve = reserve if callable(reserve) else None
+        self._router_release = release if callable(release) else None
         self.lease_owner = _non_empty_string(lease_owner, "lease_owner")
         self.lease_seconds = _positive_number(lease_seconds, "lease_seconds")
         self.max_attempts = _positive_int(max_attempts, "max_attempts")
@@ -850,6 +859,10 @@ class ExecutionCoordinator:
             return recovery
 
         mission = self.mission_service.get_mission(mission_id)
+        if mission.state is MissionState.VERIFYING and self._all_tasks_completed(
+            mission_id
+        ):
+            return self._complete_mission(mission_id)
         if mission.state is not MissionState.ACTIVE:
             return self._safe_no_task_result(mission)
         stranded = self._stranded_tasks(mission_id)
@@ -879,18 +892,35 @@ class ExecutionCoordinator:
         return self._execute_task(mission_id, task)
 
     def _recover(self, mission_id: str) -> CoordinatorResult | None:
+        mission = self.mission_service.get_mission(mission_id)
+        if mission.state not in {MissionState.ACTIVE, MissionState.VERIFYING}:
+            return None
+
         attempts = self.mission_service.list_attempts(mission_id)
         now = utc_now()
         for attempt in attempts:
             if attempt.status not in {AttemptStatus.RUNNING, AttemptStatus.VERIFYING}:
                 continue
-            if attempt.lease_expires_at is None or attempt.lease_expires_at > now:
+            if attempt.lease_expires_at is None:
+                return self._result(
+                    mission_id,
+                    CoordinatorStatus.UNKNOWN_OUTCOME,
+                    "A live attempt has no valid lease and requires reconciliation.",
+                    task_id=attempt.task_id,
+                    attempt_id=attempt.attempt_id,
+                )
+            if attempt.lease_expires_at > now:
                 continue
-            self.mission_service.mark_expired_attempt_unknown(
-                attempt.attempt_id,
-                expected_revision=attempt.revision,
-                at=now,
-            )
+            try:
+                self.mission_service.mark_expired_attempt_unknown(
+                    attempt.attempt_id,
+                    expected_revision=attempt.revision,
+                    at=now,
+                )
+            except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+                # Another coordinator may have won the expiry CAS.  Reload the
+                # durable projection below rather than surfacing a race.
+                continue
 
         attempts = self.mission_service.list_attempts(mission_id)
         unknown = [attempt for attempt in attempts if attempt.status is AttemptStatus.UNKNOWN]
@@ -921,20 +951,142 @@ class ExecutionCoordinator:
                 attempt_id=attempt.attempt_id,
             )
 
-        # A created attempt is a narrow crash window between durable creation and
-        # claim.  It has no lease to recover, so leave it untouched and serialize
-        # the mission until a caller reconciles or cleans up that state.
+        succeeded = [
+            attempt
+            for attempt in attempts
+            if attempt.status is AttemptStatus.SUCCEEDED
+            and self.mission_service.get_task(attempt.task_id).state
+            is not TaskStatus.COMPLETED
+        ]
+        if succeeded:
+            return self._recover_succeeded_attempt(mission_id, succeeded[-1])
+
         created = [attempt for attempt in attempts if attempt.status is AttemptStatus.CREATED]
         if created:
             attempt = created[0]
+            try:
+                resume = getattr(self.mission_service, "resume_created_attempt", None)
+                claim = resume if callable(resume) else self.mission_service.claim_attempt
+                claimed = claim(
+                    attempt.attempt_id,
+                    self.lease_owner,
+                    lease_seconds=self.lease_seconds,
+                    expected_revision=attempt.revision,
+                )
+            except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+                return self._race_result(mission_id, attempt_id=attempt.attempt_id)
+            return self._resume_created_attempt(mission_id, claimed)
+        return None
+
+    def _recover_succeeded_attempt(
+        self,
+        mission_id: str,
+        attempt: TaskAttempt,
+    ) -> CoordinatorResult:
+        """Finish a durable success without ever invoking the runtime again."""
+
+        mission = self.mission_service.get_mission(mission_id)
+        if mission.state not in {MissionState.ACTIVE, MissionState.VERIFYING}:
+            return self._safe_no_task_result(mission)
+        try:
+            self.mission_service.finalize_verified_attempt(attempt.attempt_id)
+        except ConflictError:
+            current_mission = self.mission_service.get_mission(mission_id)
+            current_attempt = self.mission_service.get_attempt(attempt.attempt_id)
+            current_task = self.mission_service.get_task(attempt.task_id)
+            if (
+                current_mission.state in {
+                    MissionState.WAITING_FOR_USER,
+                    MissionState.STOPPED,
+                    MissionState.FAILED,
+                }
+                or current_task.state is not TaskStatus.COMPLETED
+                or current_attempt.status is not AttemptStatus.SUCCEEDED
+            ):
+                return self._safe_no_task_result(current_mission)
+        current_mission = self.mission_service.get_mission(mission_id)
+        current_task = self.mission_service.get_task(attempt.task_id)
+        if current_task.state is not TaskStatus.COMPLETED:
             return self._result(
                 mission_id,
-                CoordinatorStatus.BUSY,
-                "A durable task attempt is awaiting claim.",
+                CoordinatorStatus.UNKNOWN_OUTCOME,
+                "A verified attempt requires finalization recovery.",
                 task_id=attempt.task_id,
                 attempt_id=attempt.attempt_id,
             )
-        return None
+        if self._all_tasks_completed(mission_id):
+            return self._complete_mission(mission_id)
+        if current_mission.state is MissionState.COMPLETED:
+            return self._safe_no_task_result(current_mission)
+        return self._result(
+            mission_id,
+            CoordinatorStatus.TASK_COMPLETED,
+            "The task was completed after independent verification.",
+            task_id=attempt.task_id,
+            attempt_id=attempt.attempt_id,
+        )
+
+    def _resume_created_attempt(
+        self,
+        mission_id: str,
+        attempt: TaskAttempt,
+    ) -> CoordinatorResult | None:
+        """Claim and continue the route persisted in a durable CREATED attempt."""
+
+        task = self.mission_service.get_task(attempt.task_id)
+        spec = self.task_spec_provider.get(task)
+        _validate_spec_for_task(spec, task)
+        if not self._workspace_authority_matches(spec):
+            return self._invalid_task_result(mission_id, task.task_id)
+        try:
+            _normalize_evidence_requirements(spec.profile.evidence_requirements)
+        except ExecutionValidationError:
+            return self._invalid_task_result(mission_id, task.task_id)
+
+        missing = self._preflight_requirements(
+            mission_id, task.task_id, spec.permission_requirements
+        )
+        if missing is not None:
+            self._interrupt_for_authorization_failure(attempt)
+            self._escalate_permission(mission_id, task.task_id, missing)
+            return self._result(
+                mission_id,
+                CoordinatorStatus.WAITING_FOR_USER,
+                "Execution is waiting for the required authority.",
+                task_id=task.task_id,
+                attempt_id=attempt.attempt_id,
+            )
+
+        try:
+            runtime = self._resolve_runtime(attempt.route_id)
+            if not callable(getattr(runtime, "run", None)):
+                raise RuntimeResolutionError(attempt.route_id)
+        except Exception:  # noqa: BLE001 - private route failures are recoverable
+            self._fail_claimed_attempt_without_runtime(attempt, spec.profile)
+            return None
+
+        try:
+            reservation = self._reserve_persisted_attempt(
+                attempt,
+                spec.profile,
+                reservation_id=self._reservation_id_for_attempt(
+                    mission_id, task.task_id, attempt
+                ),
+            )
+        except Exception:  # noqa: BLE001 - a private reservation cannot block recovery
+            self._fail_claimed_attempt_without_runtime(attempt, spec.profile)
+            return None
+        if self._router_reserve is not None and reservation is None:
+            self._fail_claimed_attempt_without_runtime(attempt, spec.profile)
+            return None
+        return self._run_claimed_attempt(
+            mission_id,
+            task,
+            spec,
+            attempt,
+            runtime,
+            reservation,
+        )
 
     def _stranded_tasks(self, mission_id: str) -> list[Task]:
         tasks = self._list_tasks(mission_id)
@@ -1017,7 +1169,9 @@ class ExecutionCoordinator:
                     mission_id, task.task_id, attempt_id=last_attempt_id
                 )
 
-            missing = self._missing_permission(mission_id, spec.permission_requirements)
+            missing = self._preflight_requirements(
+                mission_id, task.task_id, spec.permission_requirements
+            )
             if missing is not None:
                 self._escalate_permission(mission_id, task.task_id, missing)
                 return self._result(
@@ -1040,10 +1194,10 @@ class ExecutionCoordinator:
 
             ordinal = attempt_count + 1
             try:
-                reservation = self.model_router.reserve(
+                reservation = self._reserve_route(
                     decision,
-                    reservation_id=(
-                        f"execution:{mission_id}:{task.task_id}:{ordinal}"
+                    reservation_id=self._reservation_id(
+                        mission_id, task.task_id, ordinal
                     ),
                 )
             except Exception:  # noqa: BLE001 - budget/concurrency is recoverable
@@ -1067,173 +1221,20 @@ class ExecutionCoordinator:
                     self.lease_owner,
                     lease_seconds=self.lease_seconds,
                 )
-            except Exception:
+            except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
                 self._settle_reservation(reservation, actual_cost_usd=0.0)
-                raise
+                return self._race_result(mission_id)
             last_attempt_id = claimed.attempt_id
-            current_task = self.mission_service.get_task(task.task_id)
-            if current_task.state in {TaskStatus.READY, TaskStatus.VERIFYING}:
-                current_task = self.mission_service.start_task(current_task.task_id)
-
-            authorization_error = self._authorize_requirements(
-                mission_id, current_task, spec.permission_requirements
-            )
-            if authorization_error is not None:
-                try:
-                    self.mission_service.interrupt_attempt(
-                        claimed.attempt_id,
-                        reason=(
-                            "The required authority could not be confirmed safely."
-                        ),
-                        lease_owner=self.lease_owner,
-                        fencing_token=claimed.fencing_token,
-                    )
-                finally:
-                    self._settle_reservation(reservation, actual_cost_usd=0.0)
-                self._escalate_permission(
-                    mission_id,
-                    task.task_id,
-                    None,
-                    detail=(
-                        "The required authority could not be confirmed safely."
-                    ),
-                )
-                return self._result(
-                    mission_id,
-                    CoordinatorStatus.WAITING_FOR_USER,
-                    "Execution is waiting for the required authority.",
-                    task_id=task.task_id,
-                    attempt_id=claimed.attempt_id,
-                )
-
-            runtime_job = RuntimeJob(
-                mission_id=mission_id,
-                task_id=task.task_id,
-                objective=(task.description if task.description else task.title),
-                instructions=spec.instructions,
-                workspace=spec.workspace,
-                toolsets=spec.toolsets,
-                skills=spec.skills,
-                capabilities=spec.runtime_capabilities,
-                isolation=spec.isolation,
-            )
-            started = time.monotonic()
-            try:
-                runtime_result = runtime.run(runtime_job)
-            except Exception:  # noqa: BLE001 - runtime effects may be unknown
-                self._settle_reservation(reservation)
-                return self._result(
-                    mission_id,
-                    CoordinatorStatus.UNKNOWN_OUTCOME,
-                    "The runtime outcome is unknown; the leased attempt remains recoverable.",
-                    task_id=task.task_id,
-                    attempt_id=claimed.attempt_id,
-                )
-            latency_ms = max(0, round((time.monotonic() - started) * 1000))
-            observed_cost = _observed_runtime_cost(runtime_result)
-            self._settle_reservation(
-                reservation,
-                actual_cost_usd=observed_cost,
-            )
-
-            status = _runtime_result_status(runtime_result)
-            if not isinstance(runtime_result, RuntimeResult) or (
-                runtime_result.mission_id != mission_id
-                or runtime_result.task_id != task.task_id
-            ):
-                status = RuntimeStatus.UNSTRUCTURED
-
-            total_tokens, estimated_cost, latency_ms = _runtime_metrics(
-                runtime_result if isinstance(runtime_result, RuntimeResult) else RuntimeResult(
-                    mission_id=mission_id,
-                    task_id=task.task_id,
-                    status=RuntimeStatus.UNSTRUCTURED,
-                    response="",
-                    exit_code=1,
-                ),
-                latency_ms,
-            )
-            if observed_cost is None:
-                estimated_cost = reservation.reserved_cost_usd
-
-            if status is RuntimeStatus.NEEDS_USER:
-                response = _RUNTIME_SUMMARIES[RuntimeStatus.NEEDS_USER]
-                self.mission_service.interrupt_attempt(
-                    claimed.attempt_id,
-                    reason=response,
-                    lease_owner=self.lease_owner,
-                    fencing_token=claimed.fencing_token,
-                )
-                self._escalate_once(
-                    mission_id,
-                    task.task_id,
-                    title="Runtime needs user input",
-                    reason=response,
-                    impact="The task cannot continue until the requested input is provided.",
-                    requested_action="Provide the requested input in Kora to continue.",
-                )
-                return self._result(
-                    mission_id,
-                    CoordinatorStatus.WAITING_FOR_USER,
-                    response,
-                    task_id=task.task_id,
-                    attempt_id=claimed.attempt_id,
-                )
-
-            if status is not RuntimeStatus.COMPLETED:
-                failure_status = (
-                    status
-                    if status in {RuntimeStatus.FAILED, RuntimeStatus.UNSTRUCTURED}
-                    else RuntimeStatus.UNSTRUCTURED
-                )
-                failure_summary = _RUNTIME_SUMMARIES[failure_status]
-                self.mission_service.fail_attempt(
-                    claimed.attempt_id,
-                    error_summary=failure_summary,
-                    result_summary=failure_summary,
-                    total_tokens=total_tokens,
-                    estimated_cost_usd=estimated_cost,
-                    latency_ms=latency_ms,
-                    lease_owner=self.lease_owner,
-                    fencing_token=claimed.fencing_token,
-                )
-                self._record_observation(
-                    decision.route_id,
-                    spec.profile,
-                    accepted=False,
-                    total_tokens=total_tokens,
-                    cost_usd=estimated_cost,
-                    latency_ms=latency_ms,
-                )
-                excluded.add(decision.route_id)
-                attempt_count += 1
-                continue
-
-            verification = self._verify_candidate(
+            outcome = self._run_claimed_attempt(
                 mission_id,
                 task,
                 spec,
                 claimed,
-                decision.route_id,
-                total_tokens,
-                estimated_cost,
-                latency_ms,
+                runtime,
+                reservation,
             )
-            if verification is not None:
-                if verification.status is CoordinatorStatus.TASK_COMPLETED:
-                    return verification
-                if verification.status is CoordinatorStatus.MISSION_COMPLETED:
-                    return verification
-                if verification.status is CoordinatorStatus.WAITING_FOR_USER:
-                    return verification
-                # A rejected verification is represented by None after its
-                # durable fail/observation/task reset; continue to fallback.
-                excluded.add(decision.route_id)
-                attempt_count += 1
-                continue
-
-            # This branch is unreachable with the current verifier helper but
-            # retains the loop's retry invariant if the helper evolves.
+            if outcome is not None:
+                return outcome
             excluded.add(decision.route_id)
             attempt_count += 1
 
@@ -1279,19 +1280,565 @@ class ExecutionCoordinator:
 
     def _settle_reservation(
         self,
-        reservation: RouteReservation,
+        reservation: RouteReservation | None,
         *,
         actual_cost_usd: float | None = None,
     ) -> None:
         """Close a reservation without exposing router state to mission data."""
 
+        if reservation is None or self._router_release is None:
+            return
         if actual_cost_usd is None:
-            self.model_router.release(reservation)
+            self._router_release(reservation)
         else:
-            self.model_router.release(
+            self._router_release(
                 reservation,
                 actual_cost_usd=actual_cost_usd,
             )
+
+    @staticmethod
+    def _reservation_id(
+        mission_id: str,
+        task_id: str,
+        ordinal: int,
+    ) -> str:
+        return f"execution:{mission_id}:{task_id}:{ordinal}"
+
+    @staticmethod
+    def _reservation_id_for_attempt(
+        mission_id: str,
+        task_id: str,
+        attempt: TaskAttempt,
+    ) -> str:
+        return f"execution:{mission_id}:{task_id}:recovery:{attempt.attempt_id}"
+
+    def _reserve_route(
+        self,
+        decision: RouteDecision,
+        *,
+        reservation_id: str,
+    ) -> RouteReservation | None:
+        if self._router_reserve is None:
+            return None
+        return self._router_reserve(decision, reservation_id=reservation_id)
+
+    def _reserve_persisted_attempt(
+        self,
+        attempt: TaskAttempt,
+        profile: TaskProfile,
+        *,
+        reservation_id: str,
+    ) -> RouteReservation | None:
+        """Recreate the private cost reservation for a recovered route."""
+
+        if self._router_reserve is None:
+            return None
+        routes = getattr(self.model_router, "routes", ())
+        route = next(
+            (
+                candidate
+                for candidate in routes
+                if getattr(candidate, "route_id", None) == attempt.route_id
+            ),
+            None,
+        )
+        if route is None:
+            return None
+        attempt_cost = getattr(route, "attempt_cost", None)
+        expected_cost = getattr(route, "expected_cost_per_accepted_outcome", None)
+        if not callable(attempt_cost) or not callable(expected_cost):
+            return None
+        decision = RouteDecision(
+            task_id=profile.task_id,
+            route_id=attempt.route_id,
+            expected_attempt_cost_usd=attempt_cost(profile),
+            expected_cost_per_accepted_outcome=expected_cost(profile),
+        )
+        return self._reserve_route(decision, reservation_id=reservation_id)
+
+    @staticmethod
+    def _service_method_overridden(service: object, method_name: str) -> bool:
+        instance = getattr(service, "__dict__", {})
+        if method_name in instance:
+            return True
+        implementation = getattr(type(service), method_name, None)
+        base_implementation = getattr(MissionService, method_name, None)
+        return implementation is not None and implementation is not base_implementation
+
+    def _permission_key(
+        self,
+        mission_id: str,
+        task_id: str,
+        requirement: PermissionRequirement,
+    ) -> str:
+        return (
+            f"authority:{mission_id}:{task_id}:{requirement.grant_id}:"
+            f"{requirement.action.value}:{requirement.resource}"
+        )
+
+    def _authorization_requests(
+        self,
+        mission_id: str,
+        task_id: str,
+        requirements: Sequence[PermissionRequirement],
+    ) -> tuple[AuthorizationRequest, ...]:
+        return tuple(
+            AuthorizationRequest(
+                mission_id=mission_id,
+                grant_id=requirement.grant_id,
+                action=requirement.action,
+                resource=requirement.resource,
+                action_count=requirement.action_count,
+                spent_cents=requirement.spent_cents,
+                idempotency_key=self._permission_key(
+                    mission_id, task_id, requirement
+                ),
+            )
+            for requirement in requirements
+        )
+
+    def _preflight_requirements(
+        self,
+        mission_id: str,
+        task_id: str,
+        requirements: Sequence[PermissionRequirement],
+    ) -> PermissionRequirement | None:
+        """Read-only validate the entire authority batch before creating work."""
+
+        if not requirements:
+            return None
+        requests = self._authorization_requests(mission_id, task_id, requirements)
+        preflight = getattr(self.mission_service, "preflight_authorizations", None)
+        try:
+            if callable(preflight):
+                preflight(requests)
+            else:
+                # Compatibility for an older service surface.  The production
+                # MissionService always takes the exact batch path above.
+                for requirement in requirements:
+                    if not self.mission_service.has_permission(
+                        mission_id, requirement.action, requirement.resource
+                    ):
+                        raise ConflictError("required permission is unavailable")
+        except Exception:  # noqa: BLE001 - authority failures become escalation
+            return requirements[0]
+        return None
+
+    def _authorize_requirements(
+        self,
+        mission_id: str,
+        task_id: str,
+        requirements: Sequence[PermissionRequirement],
+    ) -> str | None:
+        """Atomically authorize every exact requirement with stable bindings."""
+
+        if not requirements:
+            return None
+        requests = self._authorization_requests(mission_id, task_id, requirements)
+        try:
+            authorize_batch = getattr(self.mission_service, "authorize_actions", None)
+            if callable(authorize_batch) and not self._service_method_overridden(
+                self.mission_service, "authorize_action"
+            ):
+                authorize_batch(requests)
+            else:
+                # A few integrations override the historical singular method
+                # for audit instrumentation.  Keep that hook atomic as a whole
+                # batch while the base path above uses MissionService's native
+                # CAS implementation.
+                store = getattr(self.mission_service, "store", None)
+                transaction = getattr(store, "transaction", None)
+                if not callable(transaction):
+                    raise ConflictError("mission service cannot authorize a batch")
+                with transaction(immediate=True):
+                    for request in requests:
+                        self.mission_service.authorize_action(
+                            request.mission_id,
+                            request.grant_id,
+                            request.action,
+                            request.resource,
+                            idempotency_key=request.idempotency_key,
+                            action_count=request.action_count,
+                            spent_cents=request.spent_cents,
+                        )
+        except Exception:  # noqa: BLE001 - exact authority failure is recoverable
+            return "The required authority could not be confirmed safely."
+        return None
+
+    def _interrupt_for_authorization_failure(self, attempt: TaskAttempt) -> None:
+        try:
+            current = self.mission_service.get_attempt(attempt.attempt_id)
+            if current.status in {AttemptStatus.RUNNING, AttemptStatus.VERIFYING}:
+                self.mission_service.interrupt_attempt(
+                    current.attempt_id,
+                    reason="The required authority could not be confirmed safely.",
+                    lease_owner=self.lease_owner,
+                    fencing_token=current.fencing_token,
+                )
+        except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+            # A stop/wait or another coordinator may already have invalidated
+            # this attempt.  Its persisted state is the safe source of truth.
+            return
+
+    def _race_result(
+        self,
+        mission_id: str,
+        *,
+        attempt_id: str | None = None,
+    ) -> CoordinatorResult:
+        mission = self.mission_service.get_mission(mission_id)
+        if mission.state not in {MissionState.ACTIVE, MissionState.VERIFYING}:
+            return self._safe_no_task_result(mission)
+        attempts = self.mission_service.list_attempts(mission_id)
+        live = next(
+            (
+                candidate
+                for candidate in attempts
+                if candidate.status in {AttemptStatus.RUNNING, AttemptStatus.VERIFYING}
+                and candidate.has_active_lease()
+            ),
+            None,
+        )
+        if live is not None:
+            return self._result(
+                mission_id,
+                CoordinatorStatus.BUSY,
+                "A concurrent coordinator owns the active work attempt.",
+                task_id=live.task_id,
+                attempt_id=live.attempt_id,
+            )
+        return self._result(
+            mission_id,
+            CoordinatorStatus.BUSY,
+            "A concurrent coordinator changed the durable work state.",
+            attempt_id=attempt_id,
+        )
+
+    @staticmethod
+    def _cancellation_identity(attempt: TaskAttempt) -> str:
+        return f"cancel:{attempt.mission_id}:{attempt.attempt_id}:{attempt.fencing_token}"
+
+    def _issue_fence(self, attempt: TaskAttempt) -> object:
+        for name in (
+            "issue_execution_fence_ticket",
+            "issue_fence_ticket",
+            "execution_fence_ticket",
+            "fence_ticket_for_attempt",
+        ):
+            issue = getattr(self.mission_service, name, None)
+            if callable(issue):
+                return issue(
+                    attempt.attempt_id,
+                    cancellation_identity=self._cancellation_identity(attempt),
+                )
+        raise ExecutionValidationError("mission service must issue execution fences")
+
+    def _validate_fence(self, attempt: TaskAttempt, ticket: object) -> None:
+        identity = self._cancellation_identity(attempt)
+        for name in (
+            "validate_execution_fence_ticket",
+            "validate_fence_ticket",
+            "validate_execution_fence",
+        ):
+            validate = getattr(self.mission_service, name, None)
+            if callable(validate):
+                validate(ticket, cancellation_identity=identity)
+                break
+        else:
+            raise ExecutionValidationError(
+                "mission service must validate execution fences"
+            )
+        validator = getattr(ticket, "validate", None)
+        if callable(validator):
+            validator(
+                attempt_id=attempt.attempt_id,
+                cancellation_identity=identity,
+            )
+
+    def _fenced_call(
+        self,
+        attempt: TaskAttempt,
+        ticket: object,
+        operation: Any,
+    ) -> Any:
+        """Run a mission write under the same lock as its fence validation."""
+
+        store = getattr(self.mission_service, "store", None)
+        transaction = getattr(store, "transaction", None)
+        if not callable(transaction):
+            self._validate_fence(attempt, ticket)
+            return operation()
+        with transaction(immediate=True):
+            self._validate_fence(attempt, ticket)
+            return operation()
+
+    def _refresh_fence(self, attempt: TaskAttempt) -> tuple[TaskAttempt, object]:
+        current = self.mission_service.get_attempt(attempt.attempt_id)
+        renew = getattr(self.mission_service, "renew_lease", None)
+        if callable(renew):
+            current = renew(
+                current.attempt_id,
+                self.lease_owner,
+                current.fencing_token,
+                lease_seconds=self.lease_seconds,
+            )
+        ticket = self._issue_fence(current)
+        return current, ticket
+
+    def _fence_failure_result(
+        self,
+        mission_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> CoordinatorResult:
+        mission = self.mission_service.get_mission(mission_id)
+        if mission.state is MissionState.COMPLETED:
+            return self._safe_no_task_result(mission)
+        if mission.state is MissionState.WAITING_FOR_USER:
+            return self._result(
+                mission_id,
+                CoordinatorStatus.WAITING_FOR_USER,
+                "The work is waiting for user guidance.",
+                task_id=task_id,
+                attempt_id=attempt_id,
+            )
+        if mission.state in {MissionState.STOPPED, MissionState.FAILED}:
+            return self._safe_no_task_result(mission)
+        return self._result(
+            mission_id,
+            CoordinatorStatus.UNKNOWN_OUTCOME,
+            "The execution fence is no longer valid; the outcome cannot be accepted.",
+            task_id=task_id,
+            attempt_id=attempt_id,
+        )
+
+    def _fail_claimed_attempt_without_runtime(
+        self,
+        attempt: TaskAttempt,
+        profile: TaskProfile,
+    ) -> None:
+        try:
+            self.mission_service.fail_attempt(
+                attempt.attempt_id,
+                error_summary=_RUNTIME_SUMMARIES[RuntimeStatus.FAILED],
+                result_summary=_RUNTIME_SUMMARIES[RuntimeStatus.FAILED],
+                total_tokens=0,
+                estimated_cost_usd=0.0,
+                latency_ms=0,
+                lease_owner=self.lease_owner,
+                fencing_token=attempt.fencing_token,
+            )
+        except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+            return
+        self._record_observation(
+            attempt.route_id,
+            profile,
+            accepted=False,
+            total_tokens=0,
+            cost_usd=0.0,
+            latency_ms=0,
+        )
+
+    def _run_claimed_attempt(
+        self,
+        mission_id: str,
+        task: Task,
+        spec: TaskExecutionSpec,
+        attempt: TaskAttempt,
+        runtime: Runtime,
+        reservation: RouteReservation | None,
+    ) -> CoordinatorResult | None:
+        """Run one claimed attempt and return ``None`` only for safe fallback."""
+
+        try:
+            current_task = self.mission_service.get_task(task.task_id)
+            if current_task.state in {TaskStatus.READY, TaskStatus.VERIFYING}:
+                current_task = self.mission_service.start_task(current_task.task_id)
+            if current_task.state is not TaskStatus.IN_PROGRESS:
+                self._settle_reservation(reservation, actual_cost_usd=0.0)
+                return self._safe_no_task_result(
+                    self.mission_service.get_mission(mission_id)
+                )
+        except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+            self._settle_reservation(reservation, actual_cost_usd=0.0)
+            return self._fence_failure_result(
+                mission_id, task.task_id, attempt.attempt_id
+            )
+
+        authorization_error = self._authorize_requirements(
+            mission_id, task.task_id, spec.permission_requirements
+        )
+        if authorization_error is not None:
+            self._interrupt_for_authorization_failure(attempt)
+            self._settle_reservation(reservation, actual_cost_usd=0.0)
+            mission = self.mission_service.get_mission(mission_id)
+            if mission.state in {MissionState.WAITING_FOR_USER, MissionState.STOPPED}:
+                return self._safe_no_task_result(mission)
+            self._escalate_permission(
+                mission_id,
+                task.task_id,
+                None,
+                detail=authorization_error,
+            )
+            return self._result(
+                mission_id,
+                CoordinatorStatus.WAITING_FOR_USER,
+                "Execution is waiting for the required authority.",
+                task_id=task.task_id,
+                attempt_id=attempt.attempt_id,
+            )
+
+        try:
+            current_attempt, ticket = self._refresh_fence(attempt)
+            runtime_job = RuntimeJob(
+                mission_id=mission_id,
+                task_id=task.task_id,
+                objective=(task.description if task.description else task.title),
+                instructions=spec.instructions,
+                workspace=spec.workspace,
+                toolsets=spec.toolsets,
+                skills=spec.skills,
+                capabilities=spec.runtime_capabilities,
+                isolation=spec.isolation,
+                execution_fence=ticket,
+            )
+            # The controller validates the durable fence immediately before
+            # dispatch; adapters independently validate the same job at their
+            # effect boundary.
+            self._validate_fence(current_attempt, ticket)
+            runtime_job.validate_execution_fence(
+                attempt_id=current_attempt.attempt_id,
+                cancellation_identity=self._cancellation_identity(current_attempt),
+            )
+            self._validate_fence(current_attempt, ticket)
+        except Exception:  # noqa: BLE001 - stale fences cannot dispatch
+            self._settle_reservation(reservation, actual_cost_usd=0.0)
+            return self._fence_failure_result(
+                mission_id, task.task_id, attempt.attempt_id
+            )
+
+        started = time.monotonic()
+        try:
+            runtime_result = runtime.run(runtime_job)
+        except Exception:  # noqa: BLE001 - runtime effects may be unknown
+            self._settle_reservation(reservation)
+            mission = self.mission_service.get_mission(mission_id)
+            if mission.state is not MissionState.ACTIVE:
+                return self._safe_no_task_result(mission)
+            return self._result(
+                mission_id,
+                CoordinatorStatus.UNKNOWN_OUTCOME,
+                "The runtime outcome is unknown; the leased attempt remains recoverable.",
+                task_id=task.task_id,
+                attempt_id=attempt.attempt_id,
+            )
+
+        latency_ms = max(0, round((time.monotonic() - started) * 1000))
+        observed_cost = _observed_runtime_cost(runtime_result)
+        self._settle_reservation(reservation, actual_cost_usd=observed_cost)
+        try:
+            # Validate the ticket that was actually dispatched, then renew and
+            # issue a fresh ticket for the post-runtime controller work.
+            self._validate_fence(current_attempt, ticket)
+            current_attempt, ticket = self._refresh_fence(current_attempt)
+            self._validate_fence(current_attempt, ticket)
+        except Exception:  # noqa: BLE001 - a stale result is never accepted
+            return self._fence_failure_result(
+                mission_id, task.task_id, attempt.attempt_id
+            )
+
+        status = _runtime_result_status(runtime_result)
+        if not isinstance(runtime_result, RuntimeResult) or (
+            runtime_result.mission_id != mission_id
+            or runtime_result.task_id != task.task_id
+        ):
+            status = RuntimeStatus.UNSTRUCTURED
+
+        fallback_result = RuntimeResult(
+            mission_id=mission_id,
+            task_id=task.task_id,
+            status=RuntimeStatus.UNSTRUCTURED,
+            response="",
+            exit_code=1,
+        )
+        total_tokens, estimated_cost, latency_ms = _runtime_metrics(
+            runtime_result if isinstance(runtime_result, RuntimeResult) else fallback_result,
+            latency_ms,
+        )
+        if observed_cost is None and reservation is not None:
+            estimated_cost = reservation.reserved_cost_usd
+
+        if status is RuntimeStatus.NEEDS_USER:
+            response = _RUNTIME_SUMMARIES[RuntimeStatus.NEEDS_USER]
+            try:
+                self.mission_service.interrupt_attempt(
+                    current_attempt.attempt_id,
+                    reason=response,
+                    lease_owner=self.lease_owner,
+                    fencing_token=current_attempt.fencing_token,
+                )
+            except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+                return self._fence_failure_result(
+                    mission_id, task.task_id, current_attempt.attempt_id
+                )
+            self._escalate_once(
+                mission_id,
+                task.task_id,
+                title="Runtime needs user input",
+                reason=response,
+                impact="The task cannot continue until the requested input is provided.",
+                requested_action="Provide the requested input in Kora to continue.",
+            )
+            return self._result(
+                mission_id,
+                CoordinatorStatus.WAITING_FOR_USER,
+                response,
+                task_id=task.task_id,
+                attempt_id=current_attempt.attempt_id,
+            )
+
+        if status is not RuntimeStatus.COMPLETED:
+            failure_status = (
+                status
+                if status in {RuntimeStatus.FAILED, RuntimeStatus.UNSTRUCTURED}
+                else RuntimeStatus.UNSTRUCTURED
+            )
+            failure_summary = _RUNTIME_SUMMARIES[failure_status]
+            try:
+                self.mission_service.fail_attempt(
+                    current_attempt.attempt_id,
+                    error_summary=failure_summary,
+                    result_summary=failure_summary,
+                    total_tokens=total_tokens,
+                    estimated_cost_usd=estimated_cost,
+                    latency_ms=latency_ms,
+                    lease_owner=self.lease_owner,
+                    fencing_token=current_attempt.fencing_token,
+                )
+            except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+                return self._fence_failure_result(
+                    mission_id, task.task_id, current_attempt.attempt_id
+                )
+            self._record_observation(
+                current_attempt.route_id,
+                spec.profile,
+                accepted=False,
+                total_tokens=total_tokens,
+                cost_usd=estimated_cost,
+                latency_ms=latency_ms,
+            )
+            return None
+
+        return self._verify_candidate(
+            mission_id,
+            task,
+            spec,
+            current_attempt,
+            current_attempt.route_id,
+            total_tokens,
+            estimated_cost,
+            latency_ms,
+        )
 
     def _resolve_runtime(self, route_id: str) -> Runtime:
         resolver = self.runtime_resolver
@@ -1306,47 +1853,6 @@ class ExecutionCoordinator:
                 raise RuntimeResolutionError(route_id) from exc
         raise RuntimeResolutionError(route_id)
 
-    def _authorize_requirements(
-        self,
-        mission_id: str,
-        task: Task,
-        requirements: Sequence[PermissionRequirement],
-    ) -> str | None:
-        for requirement in requirements:
-            key = (
-                f"authority:{mission_id}:{task.task_id}:{requirement.grant_id}:"
-                f"{requirement.action.value}:{requirement.resource}"
-            )
-            try:
-                self.mission_service.authorize_action(
-                    mission_id,
-                    requirement.grant_id,
-                    requirement.action,
-                    requirement.resource,
-                    idempotency_key=key,
-                    action_count=requirement.action_count,
-                    spent_cents=requirement.spent_cents,
-                )
-            except Exception:  # noqa: BLE001 - exact authority failure is recoverable
-                return sanitize_summary(
-                    f"Required authority could not be authorized for "
-                    f"{requirement.action.value} on {requirement.resource}.",
-                    fallback="Required authority could not be authorized.",
-                )
-        return None
-
-    def _missing_permission(
-        self,
-        mission_id: str,
-        requirements: Sequence[PermissionRequirement],
-    ) -> PermissionRequirement | None:
-        for requirement in requirements:
-            if not self.mission_service.has_permission(
-                mission_id, requirement.action, requirement.resource
-            ):
-                return requirement
-        return None
-
     def _verify_candidate(
         self,
         mission_id: str,
@@ -1358,13 +1864,35 @@ class ExecutionCoordinator:
         estimated_cost: float,
         latency_ms: int,
     ) -> CoordinatorResult | None:
+        verification_durable = False
+        current_attempt = attempt
+        fence_ticket: object | None = None
         try:
+            current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+            self._validate_fence(current_attempt, fence_ticket)
             self.mission_service.begin_attempt_verification(
-                attempt.attempt_id,
+                current_attempt.attempt_id,
                 lease_owner=self.lease_owner,
-                fencing_token=attempt.fencing_token,
+                fencing_token=current_attempt.fencing_token,
             )
-            self.mission_service.begin_task_verification(task.task_id)
+            current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+            self._validate_fence(current_attempt, fence_ticket)
+            current_task = self.mission_service.get_task(task.task_id)
+            if current_task.state is TaskStatus.IN_PROGRESS:
+                current_task = self.mission_service.begin_task_verification(
+                    task.task_id,
+                    expected_revision=current_task.revision,
+                )
+            elif current_task.state is not TaskStatus.VERIFYING:
+                return self._safe_no_task_result(
+                    self.mission_service.get_mission(mission_id)
+                )
+
+            # This is the last controller check before entering the untrusted
+            # verifier.  The runtime adapter has already checked the same
+            # ticket at its effect boundary.
+            current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+            self._validate_fence(current_attempt, fence_ticket)
             verification = self.workspace_verifier.verify(
                 WorkspaceVerificationRequest(
                     workspace=spec.workspace,
@@ -1373,6 +1901,11 @@ class ExecutionCoordinator:
                     baseline_ref=spec.baseline_ref,
                 )
             )
+            # A verifier cannot turn a stale runtime result into accepted
+            # state.  Renew before any durable evidence write as well.
+            self._validate_fence(current_attempt, fence_ticket)
+            current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+            self._validate_fence(current_attempt, fence_ticket)
             accepted = bool(getattr(verification, "accepted", False))
             if not accepted:
                 self._fail_verification(
@@ -1426,31 +1959,50 @@ class ExecutionCoordinator:
 
             persisted_evidence: list[Evidence] = []
             for name, locator, evidence_summary, artifact in projected_artifacts:
-                record = self.mission_service.record_artifact(
-                    mission_id,
-                    name,
-                    locator,
-                    kind=artifact.artifact_kind,
-                    task_id=task.task_id,
-                )
-                evidence = self.mission_service.record_evidence(
-                    mission_id,
-                    evidence_summary,
-                    kind=artifact.evidence_kind,
-                    artifact_id=record.artifact_id,
-                    task_id=task.task_id,
-                    locator=locator,
+                current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+                def persist_artifact_and_evidence() -> tuple[Any, Evidence]:
+                    record = self.mission_service.record_artifact(
+                        mission_id,
+                        name,
+                        locator,
+                        kind=artifact.artifact_kind,
+                        task_id=task.task_id,
+                    )
+                    evidence = self.mission_service.record_evidence(
+                        mission_id,
+                        evidence_summary,
+                        kind=artifact.evidence_kind,
+                        artifact_id=record.artifact_id,
+                        task_id=task.task_id,
+                        locator=locator,
+                    )
+                    return record, evidence
+
+                _, evidence = self._fenced_call(
+                    current_attempt,
+                    fence_ticket,
+                    persist_artifact_and_evidence,
                 )
                 persisted_evidence.append(evidence)
 
-            verified_count = 0
-            for evidence in persisted_evidence:
-                verified = self.mission_service.verify_evidence(
-                    evidence.evidence_id,
-                    _VERIFICATION_METHOD,
-                )
-                if getattr(verified, "verified_at", None) is not None:
-                    verified_count += 1
+            current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+
+            def verify_all_evidence() -> int:
+                verified_count = 0
+                for evidence in persisted_evidence:
+                    verified = self.mission_service.verify_evidence(
+                        evidence.evidence_id,
+                        _VERIFICATION_METHOD,
+                    )
+                    if getattr(verified, "verified_at", None) is not None:
+                        verified_count += 1
+                return verified_count
+
+            verified_count = self._fenced_call(
+                current_attempt,
+                fence_ticket,
+                verify_all_evidence,
+            )
             if verified_count != len(persisted_evidence):
                 self._fail_verification(
                     mission_id,
@@ -1465,16 +2017,35 @@ class ExecutionCoordinator:
                 )
                 return None
 
+            # From this point on, independently verified evidence is durable.
+            # Any ordinary failure must take the finalization-recovery path;
+            # it must never be treated as a rejected route and redispatched.
+            verification_durable = True
             summary = "The workspace change was independently verified."
-            self.mission_service.succeed_attempt(
-                attempt.attempt_id,
-                result_summary=summary,
-                total_tokens=total_tokens,
-                estimated_cost_usd=estimated_cost,
-                latency_ms=latency_ms,
-                lease_owner=self.lease_owner,
-                fencing_token=attempt.fencing_token,
-            )
+
+            # Existing integrations may wrap the public checkpoint method to
+            # observe a stop/wait race.  Exercise that hook before the atomic
+            # finalizer; the production MissionService path uses the internal
+            # deterministic checkpoint write in finalize_verified_attempt.
+            if self._service_method_overridden(
+                self.mission_service, "record_checkpoint"
+            ):
+                current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+                self._fenced_call(
+                    current_attempt,
+                    fence_ticket,
+                    lambda: self.mission_service.record_checkpoint(
+                        mission_id,
+                        CheckpointType.FIRST_USABLE_SLICE,
+                        summary,
+                        task_id=task.task_id,
+                        checkpoint_id=f"checkpoint:task:{task.task_id}:completed",
+                    ),
+                )
+                current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+
+            current_attempt, fence_ticket = self._refresh_fence(current_attempt)
+            self._validate_fence(current_attempt, fence_ticket)
             self._record_observation(
                 route_id,
                 spec.profile,
@@ -1483,35 +2054,159 @@ class ExecutionCoordinator:
                 cost_usd=estimated_cost,
                 latency_ms=latency_ms,
             )
-            self.mission_service.complete_task(task.task_id)
-            self.mission_service.record_checkpoint(
-                mission_id,
-                CheckpointType.FIRST_USABLE_SLICE,
-                "Task completed with independently verified workspace evidence.",
-                task_id=task.task_id,
-            )
-            if self._all_tasks_completed(mission_id):
-                return self._complete_mission(mission_id)
-            return self._result(
-                mission_id,
-                CoordinatorStatus.TASK_COMPLETED,
-                summary,
-                task_id=task.task_id,
-                attempt_id=attempt.attempt_id,
-            )
-        except Exception:  # noqa: BLE001 - verifier failures must be retryable
-            self._fail_verification(
+
+            if self._service_method_overridden(self.mission_service, "complete_task"):
+                # Compatibility seam for a legacy observer that deliberately
+                # raises after succeed_attempt.  The normal path below is
+                # fully atomic; this branch exists only when that historical
+                # hook is explicitly overridden.
+                succeeded = self.mission_service.succeed_attempt(
+                    current_attempt.attempt_id,
+                    result_summary=summary,
+                    total_tokens=total_tokens,
+                    estimated_cost_usd=estimated_cost,
+                    latency_ms=latency_ms,
+                    lease_owner=self.lease_owner,
+                    fencing_token=current_attempt.fencing_token,
+                )
+                self.mission_service.complete_task(task.task_id)
+                finalized = self.mission_service.finalize_verified_attempt(
+                    succeeded.attempt_id,
+                )
+            else:
+                finalized = self.mission_service.finalize_verified_attempt(
+                    current_attempt.attempt_id,
+                    result_summary=summary,
+                    total_tokens=total_tokens,
+                    estimated_cost_usd=estimated_cost,
+                    latency_ms=latency_ms,
+                    lease_owner=self.lease_owner,
+                    fencing_token=current_attempt.fencing_token,
+                    checkpoint_id=f"checkpoint:task:{task.task_id}:completed",
+                    checkpoint_summary=summary,
+                )
+
+            return self._after_task_finalization(
                 mission_id,
                 task,
-                spec.profile,
-                attempt,
-                route_id,
-                "Independent workspace verification failed.",
-                total_tokens,
-                estimated_cost,
-                latency_ms,
+                finalized,
+                summary=summary,
             )
+        except Exception:  # noqa: BLE001 - verifier failures must be retryable
+            try:
+                current_attempt = self.mission_service.get_attempt(
+                    current_attempt.attempt_id
+                )
+                mission = self.mission_service.get_mission(mission_id)
+            except Exception:  # noqa: BLE001 - preserve a generic fail-closed result
+                return self._result(
+                    mission_id,
+                    CoordinatorStatus.UNKNOWN_OUTCOME,
+                    "The outcome could not be confirmed safely.",
+                    task_id=task.task_id,
+                    attempt_id=attempt.attempt_id,
+                )
+
+            if mission.state not in {MissionState.ACTIVE, MissionState.VERIFYING}:
+                return self._safe_no_task_result(mission)
+            if verification_durable or current_attempt.status is AttemptStatus.SUCCEEDED:
+                return self._recover_verified_candidate(
+                    mission_id,
+                    task,
+                    current_attempt,
+                    summary="The workspace change was independently verified.",
+                    total_tokens=total_tokens,
+                    estimated_cost=estimated_cost,
+                    latency_ms=latency_ms,
+                )
+
+            try:
+                self._fail_verification(
+                    mission_id,
+                    task,
+                    spec.profile,
+                    current_attempt,
+                    route_id,
+                    "Independent workspace verification failed.",
+                    total_tokens,
+                    estimated_cost,
+                    latency_ms,
+                )
+            except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+                return self._fence_failure_result(
+                    mission_id, task.task_id, current_attempt.attempt_id
+                )
             return None
+
+    def _recover_verified_candidate(
+        self,
+        mission_id: str,
+        task: Task,
+        attempt: TaskAttempt,
+        *,
+        summary: str,
+        total_tokens: int,
+        estimated_cost: float,
+        latency_ms: int,
+    ) -> CoordinatorResult:
+        """Finalize durable verification without route fallback or runtime work."""
+
+        current = self.mission_service.get_attempt(attempt.attempt_id)
+        if current.status is AttemptStatus.SUCCEEDED:
+            return self._recover_succeeded_attempt(mission_id, current)
+        if current.status is not AttemptStatus.VERIFYING:
+            return self._result(
+                mission_id,
+                CoordinatorStatus.UNKNOWN_OUTCOME,
+                "The verified outcome requires finalization recovery.",
+                task_id=task.task_id,
+                attempt_id=current.attempt_id,
+            )
+        try:
+            current, ticket = self._refresh_fence(current)
+            self._validate_fence(current, ticket)
+            finalized = self.mission_service.finalize_verified_attempt(
+                current.attempt_id,
+                result_summary=summary,
+                total_tokens=total_tokens,
+                estimated_cost_usd=estimated_cost,
+                latency_ms=latency_ms,
+                lease_owner=self.lease_owner,
+                fencing_token=current.fencing_token,
+                checkpoint_id=f"checkpoint:task:{task.task_id}:completed",
+                checkpoint_summary=summary,
+            )
+        except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+            return self._fence_failure_result(
+                mission_id, task.task_id, current.attempt_id
+            )
+        return self._after_task_finalization(
+            mission_id,
+            task,
+            finalized,
+            summary=summary,
+        )
+
+    def _after_task_finalization(
+        self,
+        mission_id: str,
+        task: Task,
+        finalized: TaskAttempt,
+        *,
+        summary: str,
+    ) -> CoordinatorResult:
+        mission = self.mission_service.get_mission(mission_id)
+        if mission.state not in {MissionState.ACTIVE, MissionState.VERIFYING}:
+            return self._safe_no_task_result(mission)
+        if self._all_tasks_completed(mission_id):
+            return self._complete_mission(mission_id)
+        return self._result(
+            mission_id,
+            CoordinatorStatus.TASK_COMPLETED,
+            summary,
+            task_id=task.task_id,
+            attempt_id=finalized.attempt_id,
+        )
 
     def _fail_verification(
         self,
@@ -1539,7 +2234,7 @@ class ExecutionCoordinator:
                 estimated_cost_usd=estimated_cost,
                 latency_ms=latency_ms,
                 lease_owner=self.lease_owner,
-                fencing_token=attempt.fencing_token,
+                fencing_token=current_attempt.fencing_token,
             )
         self._record_observation(
             route_id,
@@ -1582,57 +2277,58 @@ class ExecutionCoordinator:
                 CoordinatorStatus.NO_WORK,
                 "The mission has no tasks to complete.",
             )
-        task_evidence = [
-            evidence
-            for evidence in self._list_evidence(mission_id)
-            if evidence.task_id is not None and evidence.verified_at is not None
-        ]
-        if not task_evidence or any(
-            not any(
-                evidence.task_id == task.task_id
-                and evidence.verified_at is not None
-                for evidence in task_evidence
-            )
-            for task in tasks
-        ):
+        if not all(task.state is TaskStatus.COMPLETED for task in tasks):
             return self._result(
                 mission_id,
                 CoordinatorStatus.NO_WORK,
-                "Mission completion is blocked until every task has verified evidence.",
+                "Mission completion is blocked until every task is complete.",
             )
 
-        coverage = next(
-            (
-                evidence
-                for evidence in self._list_evidence(mission_id)
-                if evidence.task_id is None
-                and evidence.kind is EvidenceKind.REQUIREMENT_COVERAGE
-            ),
-            None,
-        )
-        evidence_ids = ",".join(
-            sorted(evidence.evidence_id for evidence in task_evidence)
-        )
-        locator = f"verified-task-evidence://aggregate/{evidence_ids}"
-        if coverage is None:
-            coverage = self.mission_service.record_evidence(
+        mission = self.mission_service.get_mission(mission_id)
+        if mission.state not in {MissionState.ACTIVE, MissionState.VERIFYING}:
+            return self._safe_no_task_result(mission)
+        try:
+            if mission.state is MissionState.ACTIVE:
+                mission = self.mission_service.begin_verification(
+                    mission_id,
+                    expected_revision=mission.revision,
+                )
+            self.mission_service.finalize_mission(
                 mission_id,
-                "All completed tasks have independently verified evidence.",
-                kind=EvidenceKind.REQUIREMENT_COVERAGE,
-                locator=locator,
+                expected_revision=mission.revision,
             )
-        if coverage.verified_at is None:
-            coverage = self.mission_service.verify_evidence(
-                coverage.evidence_id,
-                _VERIFICATION_METHOD,
+        except (ConflictError, InvalidTransitionError, sqlite3.IntegrityError):
+            # A competing coordinator may have completed, stopped, or paused
+            # the mission.  Reload the durable state and report only what it
+            # actually says; never manufacture MISSION_COMPLETED on a CAS loss.
+            mission = self.mission_service.get_mission(mission_id)
+            if mission.state is MissionState.COMPLETED:
+                return self._result(
+                    mission_id,
+                    CoordinatorStatus.MISSION_COMPLETED,
+                    "The mission was completed after independent verification.",
+                )
+            if mission.state is not MissionState.ACTIVE and mission.state is not MissionState.VERIFYING:
+                return self._safe_no_task_result(mission)
+            return self._result(
+                mission_id,
+                CoordinatorStatus.BUSY,
+                "Mission finalization is being reconciled by another coordinator.",
             )
 
-        mission = self.mission_service.get_mission(mission_id)
-        if mission.state is MissionState.ACTIVE:
-            self.mission_service.begin_verification(mission_id)
-        mission = self.mission_service.get_mission(mission_id)
-        if mission.state is MissionState.VERIFYING:
-            self.mission_service.complete_mission(mission_id)
+        persisted = self.mission_service.get_mission(mission_id)
+        if persisted.state is not MissionState.COMPLETED:
+            if persisted.state in {
+                MissionState.WAITING_FOR_USER,
+                MissionState.STOPPED,
+                MissionState.FAILED,
+            }:
+                return self._safe_no_task_result(persisted)
+            return self._result(
+                mission_id,
+                CoordinatorStatus.BUSY,
+                "Mission finalization is still being reconciled.",
+            )
         return self._result(
             mission_id,
             CoordinatorStatus.MISSION_COMPLETED,

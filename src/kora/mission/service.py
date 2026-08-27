@@ -1730,21 +1730,81 @@ class MissionService:
                 raise PermissionUnavailableError(
                     f"permission grant is not available: {grant_id}"
                 )
-            event_type = (
-                EventType.PERMISSION_CONSUMED
-                if grant.mode is PermissionMode.APPROVE_ONCE
-                else EventType.PERMISSION_USED
+            self._record_permission_use_event(
+                grant,
+                action_count=action_count,
+                spent_cents=spent_cents,
+                used_at=timestamp,
             )
-            self._record_event(
-                mission_id=mission_id,
-                event_type=event_type,
-                entity_id=grant.grant_id,
-                payload={
-                    "mode": grant.mode.value,
-                    "action_count": action_count,
-                    "spent_cents": spent_cents,
-                },
-                created_at=timestamp,
+            return grant
+
+    def authorize_action(
+        self,
+        mission_id: str,
+        grant_id: str,
+        action: PermissionAction | str,
+        resource: str,
+        *,
+        idempotency_key: str,
+        action_count: int = 1,
+        spent_cents: int = 0,
+        used_at: datetime | None = None,
+    ) -> PermissionGrant:
+        """Authorize and record one action against an exact permission grant."""
+
+        action_value = _coerce_permission_action(action)
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValidationError("idempotency_key must be a non-empty string")
+        timestamp = normalize_timestamp(used_at or utc_now())
+        with self.store.transaction(immediate=True):
+            mission = self._require_owned_mission(mission_id)
+            if mission.state is not MissionState.ACTIVE:
+                raise PermissionUnavailableError(
+                    f"mission is not active: {mission_id}"
+                )
+            existing = self.store.get_permission_grant(grant_id)
+            if existing is None:
+                raise NotFoundError(f"permission grant not found: {grant_id}")
+            if existing.mission_id != mission_id:
+                raise ConflictError("permission grant belongs to another mission")
+            if existing.action != action_value:
+                raise ConflictError("permission grant action does not match request")
+            if existing.resource != resource:
+                raise ConflictError(
+                    "permission grant resource does not match request"
+                )
+            try:
+                grant = self.store.use_permission(
+                    grant_id,
+                    idempotency_key=idempotency_key,
+                    action_count=action_count,
+                    spent_cents=spent_cents,
+                    used_at=timestamp,
+                )
+            except ConflictError:
+                prior_use = self.store.connection.execute(
+                    """
+                    SELECT grant_id
+                    FROM permission_uses
+                    WHERE idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+                if prior_use is None or prior_use["grant_id"] != grant_id:
+                    raise
+                grant = self.store.get_permission_grant(grant_id)
+                if grant is None:
+                    raise NotFoundError(f"permission grant not found: {grant_id}")
+                return grant
+            if grant is None:
+                raise PermissionUnavailableError(
+                    f"permission grant is not available: {grant_id}"
+                )
+            self._record_permission_use_event(
+                grant,
+                action_count=action_count,
+                spent_cents=spent_cents,
+                used_at=timestamp,
             )
             return grant
 
@@ -1771,6 +1831,31 @@ class MissionService:
         return grant
 
     # Internal transaction helpers ----------------------------------------
+
+    def _record_permission_use_event(
+        self,
+        grant: PermissionGrant,
+        *,
+        action_count: int,
+        spent_cents: int,
+        used_at: datetime,
+    ) -> DomainEvent:
+        event_type = (
+            EventType.PERMISSION_CONSUMED
+            if grant.mode is PermissionMode.APPROVE_ONCE
+            else EventType.PERMISSION_USED
+        )
+        return self._record_event(
+            mission_id=grant.mission_id,
+            event_type=event_type,
+            entity_id=grant.grant_id,
+            payload={
+                "mode": grant.mode.value,
+                "action_count": action_count,
+                "spent_cents": spent_cents,
+            },
+            created_at=used_at,
+        )
 
     def _transition_attempt_in_transaction(
         self,

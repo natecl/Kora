@@ -1131,6 +1131,248 @@ class MissionControlTests(unittest.TestCase):
                 "mission-1", grant.grant_id, idempotency_key="use-3"
             )
 
+    def test_authorize_action_requires_exact_action_and_resource(self) -> None:
+        self._activate()
+        grant = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.DEPLOY,
+            "staging/project-a",
+            "Deploy the reviewed preview",
+            grant_id="authorize-exact",
+        )
+        before = self.store.get_permission_grant(grant.grant_id)
+
+        with self.assertRaises(ConflictError):
+            self.service.authorize_action(
+                "mission-1",
+                grant.grant_id,
+                PermissionAction.PUBLISH,
+                grant.resource,
+                idempotency_key="authorize-wrong-action",
+            )
+        with self.assertRaises(ConflictError):
+            self.service.authorize_action(
+                "mission-1",
+                grant.grant_id,
+                "deploy",
+                "staging/project-b",
+                idempotency_key="authorize-wrong-resource",
+            )
+        with self.assertRaises(ValidationError):
+            self.service.authorize_action(
+                "mission-1",
+                grant.grant_id,
+                "deploy",
+                grant.resource,
+                idempotency_key=" ",
+            )
+
+        self.assertEqual(self.store.get_permission_grant(grant.grant_id), before)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM permission_uses WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+        authorized = self.service.authorize_action(
+            "mission-1",
+            grant.grant_id,
+            "deploy",
+            grant.resource,
+            idempotency_key="authorize-exact",
+        )
+        self.assertEqual(authorized.actions_used, 1)
+        events = [
+            event
+            for event in self.store.list_events("mission-1")
+            if event.entity_id == grant.grant_id
+            and event.event_type is EventType.PERMISSION_CONSUMED
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            events[0].payload,
+            {"mode": PermissionMode.APPROVE_ONCE.value, "action_count": 1, "spent_cents": 0},
+        )
+
+    def test_authorize_action_requires_active_owned_mission_and_grant_scope(self) -> None:
+        self._activate()
+        other_service = MissionService(self.store, owner_ref="other-owner")
+        other_mission = other_service.create_mission(
+            "Other mission", "Other objective", "Other done", mission_id="mission-2"
+        )
+        other_service.align_mission(other_mission.mission_id)
+        foreign_grant = other_service.grant_permission(
+            other_mission.mission_id,
+            PermissionAction.DEPLOY,
+            "staging/project-a",
+            "Deploy the other preview",
+            grant_id="foreign-grant",
+        )
+
+        with self.assertRaises(ConflictError):
+            self.service.authorize_action(
+                "mission-1",
+                foreign_grant.grant_id,
+                PermissionAction.DEPLOY,
+                foreign_grant.resource,
+                idempotency_key="authorize-foreign",
+            )
+        self.assertEqual(
+            self.store.get_permission_grant(foreign_grant.grant_id), foreign_grant
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM permission_uses WHERE grant_id = ?",
+                (foreign_grant.grant_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_authorize_action_rejects_inactive_mission(self) -> None:
+        self.service.align_mission("mission-1")
+        grant = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.DEPLOY,
+            "staging/project-a",
+            "Deploy the reviewed preview",
+            grant_id="inactive-mission-grant",
+        )
+
+        with self.assertRaises(PermissionUnavailableError):
+            self.service.authorize_action(
+                "mission-1",
+                grant.grant_id,
+                PermissionAction.DEPLOY,
+                grant.resource,
+                idempotency_key="authorize-inactive",
+            )
+        self.assertEqual(self.store.get_permission_grant(grant.grant_id), grant)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM permission_uses WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_authorize_action_consumes_once_and_audit_is_idempotent(self) -> None:
+        self._activate()
+        grant = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.SEND_MESSAGE,
+            "user:design-partner",
+            "Send the approved test invitation",
+            grant_id="authorize-once",
+        )
+
+        first = self.service.authorize_action(
+            "mission-1",
+            grant.grant_id,
+            PermissionAction.SEND_MESSAGE,
+            grant.resource,
+            idempotency_key="authorize-once-key",
+        )
+        repeated = self.service.authorize_action(
+            "mission-1",
+            grant.grant_id,
+            "send_message",
+            grant.resource,
+            idempotency_key="authorize-once-key",
+        )
+        self.assertEqual(repeated, first)
+        with self.assertRaises(PermissionUnavailableError):
+            self.service.authorize_action(
+                "mission-1",
+                grant.grant_id,
+                PermissionAction.SEND_MESSAGE,
+                grant.resource,
+                idempotency_key="authorize-once-again",
+            )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM permission_uses WHERE grant_id = ?",
+                (grant.grant_id,),
+            ).fetchone()[0],
+            1,
+        )
+        events = [
+            event
+            for event in self.store.list_events("mission-1")
+            if event.entity_id == grant.grant_id
+            and event.event_type is EventType.PERMISSION_CONSUMED
+        ]
+        self.assertEqual(len(events), 1)
+
+    def test_authorize_action_enforces_bounded_use_budget_and_idempotency(self) -> None:
+        self._activate()
+        grant = self.service.grant_permission(
+            "mission-1",
+            PermissionAction.SPEND,
+            "budget:authorize",
+            "Use the approved bounded budget",
+            mode=PermissionMode.BOUNDED_INDEFINITE,
+            scope="authorize test budget only",
+            max_actions=3,
+            budget_limit_cents=100,
+            grant_id="authorize-bounded",
+        )
+
+        first = self.service.authorize_action(
+            "mission-1",
+            grant.grant_id,
+            PermissionAction.SPEND,
+            grant.resource,
+            idempotency_key="authorize-budget-1",
+            action_count=2,
+            spent_cents=60,
+        )
+        repeated = self.service.authorize_action(
+            "mission-1",
+            grant.grant_id,
+            PermissionAction.SPEND,
+            grant.resource,
+            idempotency_key="authorize-budget-1",
+            action_count=1,
+            spent_cents=1,
+        )
+        self.assertEqual(repeated, first)
+        second = self.service.authorize_action(
+            "mission-1",
+            grant.grant_id,
+            "spend",
+            grant.resource,
+            idempotency_key="authorize-budget-2",
+            action_count=1,
+            spent_cents=40,
+        )
+        self.assertEqual((second.actions_used, second.spent_cents), (3, 100))
+        with self.assertRaises(PermissionUnavailableError):
+            self.service.authorize_action(
+                "mission-1",
+                grant.grant_id,
+                PermissionAction.SPEND,
+                grant.resource,
+                idempotency_key="authorize-budget-3",
+            )
+        self.assertFalse(
+            self.service.has_permission(
+                "mission-1", PermissionAction.SPEND, grant.resource
+            )
+        )
+        events = [
+            event
+            for event in self.store.list_events("mission-1")
+            if event.entity_id == grant.grant_id
+            and event.event_type is EventType.PERMISSION_USED
+        ]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(
+            {key for event in events for key in event.payload},
+            {"mode", "action_count", "spent_cents"},
+        )
+
     def test_permission_grants_require_bounded_scope_and_owner_approval(self) -> None:
         with self.assertRaises(InvalidTransitionError):
             self.service.grant_permission(

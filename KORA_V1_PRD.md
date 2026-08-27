@@ -88,9 +88,17 @@ Internal checkpoints, state machines, routing, evaluation, and retries stay hidd
 
 Kora should reuse, wrap, and contribute to proven open-source infrastructure wherever that infrastructure is not the product's differentiation. The team should not rebuild model adapters, agent loops, tool systems, skills formats, memory search, messaging gateways, schedulers, sandbox backends, or generic connector plumbing when mature implementations can be safely adopted.
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) is the preferred starting harness because its MIT-licensed implementation already provides model-agnostic execution, self-improving skills, persistent memory, messaging, scheduled automation, subagents, tools, MCP integration, and cloud execution backends.
+Such projects may provide implementation primitives only; their runtime state
+cannot become Kora's source of truth. Kora's own contracts and stores govern
+memory/context, scheduling, messaging, permissions, evidence, and mission
+control even when an open-source component supplies a transport or execution
+primitive.
+
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) is Kora's replaceable initial execution harness behind `RuntimeAdapter`, not Kora's product foundation or source of truth. Hermes supplies commodity provider/model, tool, skill, subagent, MCP, session, and sandbox execution only. Kora exclusively owns durable identity and relationship state, mission state and stop conditions, context reconciliation and provenance, semantic permissions and decision authority, evidence and evaluation, and cloud-workspace policy. Hermes memory, scheduler, approvals, and self-improvement state are never authoritative; any useful runtime output must be validated and persisted by Kora.
 
 Kora's proprietary work should concentrate on the persistent coworker experience: intent fidelity, context reconciliation, the user operating model, mission control, reciprocal delegation, authority, evidence, cloud continuity, the Kora profile and skill tree, and phone-first interaction.
+
+The planned runtime-pinning target is a tagged Hermes release plus an immutable container image digest. The current exact-commit/container lock supports the bootstrap spike and is not a reason to couple Kora's control plane to Hermes. OpenHands is not a co-equal runtime choice or current dependency; it may be evaluated only as a gated fallback if Hermes fails the concrete vertical-slice gates for mission-scoped execution, Kora authority/stop enforcement, structured results, and safe workspace execution through the same adapter contract.
 
 Open-source-first does not mean bypassing safety, blindly inheriting upstream behavior, or exposing implementation complexity. Every dependency remains pinned, reviewed, isolated behind an adapter, attributed according to its license, and subject to Kora's own permission and safety boundaries.
 

@@ -28,9 +28,9 @@ validation.
 ### 1.1 Replaceable harness boundary
 
 Hermes is Kora's replaceable initial execution harness, not Kora's product
-foundation. It provides commodity model/tool execution only behind
-`RuntimeAdapter`. Kora must own the durable state and policy that define the
-product:
+foundation. It provides commodity provider/model, tool, skill, subagent, MCP,
+session, and sandbox execution only behind `RuntimeAdapter`. Kora must own the
+durable state and policy that define the product:
 
 - identity and relationship state;
 - mission state, task state, and stop conditions;
@@ -55,7 +55,9 @@ is allowed, and whether a result is evidence-bearing.
 Selecting and validating a tagged Hermes release plus an immutable container
 digest is a later runtime-hardening task. It is intentionally separate from
 the Portion 1 mission-store implementation; the store and application service
-must remain harness-independent.
+must remain harness-independent. OpenHands is only a gated fallback if Hermes
+fails concrete vertical-slice gates, and must satisfy the same adapter and
+authority contract.
 
 Portion 1 includes:
 

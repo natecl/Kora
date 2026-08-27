@@ -43,24 +43,40 @@ Phone / iMessage / Calls        macOS Desktop App
               Restricted Mac Bridge
 ```
 
-## Open-source substrate
+## Replaceable open-source execution harness
 
-Kora should be implemented as a differentiated control plane over proven open-source infrastructure. The detailed adoption plan is in [KORA_OPEN_SOURCE_STRATEGY.md](./KORA_OPEN_SOURCE_STRATEGY.md).
+Kora is the product and control plane. Proven open-source projects may supply
+commodity execution, but none is Kora's product foundation or source of truth.
+The detailed adoption policy is in
+[KORA_OPEN_SOURCE_STRATEGY.md](./KORA_OPEN_SOURCE_STRATEGY.md).
 
-The preferred initial substrate is [Hermes Agent](https://github.com/NousResearch/hermes-agent), currently published under the MIT License. Kora should reuse or adapt Hermes for model/provider dispatch, agent and tool execution, skills, memory foundations, session search, messaging gateways, scheduling, subagent delegation, MCP/tool integration, and cloud/sandbox backends.
+[Hermes Agent](https://github.com/NousResearch/hermes-agent), currently
+published under the MIT License, is Kora's replaceable initial execution
+harness behind `RuntimeAdapter`. Hermes supplies commodity provider/model,
+tool, skill, subagent, MCP, session, and sandbox execution only. Kora
+exclusively owns:
 
-Kora must own the layers that create the product's differentiated behavior:
+- durable identity and relationship state;
+- mission state and stop conditions;
+- context reconciliation, provenance, source authority, and conflicts;
+- semantic permissions and decision authority;
+- evidence, evaluation, and completion criteria;
+- cloud-workspace policy, isolation, and recovery rules;
+- the Kora profile, skill tree, semantic Kanban, calls, and mobile approvals.
 
-- Context reconciliation and source authority.
-- Intent fidelity and the learned user operating model.
-- Single-mission control and stop conditions.
-- Technical permission versus decision-authority enforcement.
-- Reciprocal delegation and natural escalations.
-- Evidence-based completion and harsh evaluation.
-- Persistent cloud continuity and restricted Mac bridge.
-- Kora profile, skill tree, semantic Kanban, calls, and mobile approvals.
+Hermes memory, scheduler, approvals, and self-improvement state are never
+authoritative. The Kora control plane communicates with Hermes only through a
+versioned runtime adapter, validates runtime output, and persists authoritative
+state in Kora-owned stores. Upstream model settings, agents, prompts, and tools
+remain invisible to Kora users.
 
-The Kora control plane communicates with Hermes through a versioned runtime adapter. This keeps upstream code replaceable, prevents a permanent deep fork, and allows generic improvements to be contributed upstream. Upstream model settings, agents, prompts, and tools remain invisible to Kora users.
+The planned runtime-pinning target is a tagged Hermes release plus an
+immutable container image digest. The current exact-commit/container lock
+supports the bootstrap spike; it does not couple the control plane to Hermes.
+OpenHands is only a gated fallback: it may be evaluated through the same
+adapter and ownership contract if Hermes fails concrete vertical-slice gates
+for mission-scoped execution, Kora authority/stop enforcement, structured
+results, and safe workspace execution.
 
 ## Major components
 
@@ -220,7 +236,13 @@ Outputs:
 
 Kora does not operate the user's existing workforce directly in v1. She learns from it and creates a personalized internal workforce that she can change without exposing implementation details.
 
-The first implementation should compile Kora's private workers into Hermes-compatible skills, context, tools, subagents, and scheduled jobs wherever those primitives fit. Kora-specific mission and authority state must remain outside Hermes so an upstream runtime cannot silently broaden goals or permissions.
+The first implementation should compile Kora's private workforce into
+adapter-compatible skill, tool, subagent, and session requests wherever those
+primitives fit. Kora owns scheduling, memory, mission state, and authority
+state; those records must remain outside Hermes so an upstream runtime cannot
+silently broaden goals or permissions. Hermes memory, scheduler, approvals, and
+self-improvement state may be observed as runtime inputs, but are never
+authoritative.
 
 The compiler separates two representations:
 
@@ -261,6 +283,11 @@ The tree describes Kora's competence, not her workforce implementation. A user m
 ### 8. invisible model router
 
 The router selects models based on capability, reliability, latency, context size, and cost. Users never choose or see models.
+
+Routing policy and provider substitution are Kora-owned. Hermes supplies only
+the replaceable provider/model execution layer behind the adapter; a Hermes
+route, fallback, or session state cannot change Kora's mission, authority, or
+identity.
 
 Logical workloads may include:
 

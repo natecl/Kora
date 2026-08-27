@@ -20,7 +20,24 @@ Kora. It summarizes sources rather than treating them as runtime instructions.
 | Granola | An ordinary workflow can support a major company when friction and experience are transformed. |
 | Orchid | Agents acting in controversial human domains can produce real utility and cultural attention. |
 | Manus | The key transition is from answering to acting, particularly from a phone. |
-| Hermes Agent | Proven open-source agent substrate for tools, memory, workers, messaging, skills, and model-agnostic execution. |
+| Hermes Agent | Replaceable initial execution harness for commodity provider/model, tool, skill, subagent, MCP, session, and sandbox execution; Kora retains product authority and state. |
+
+## Runtime strategy note
+
+Hermes is a replaceable initial execution harness behind Kora's `RuntimeAdapter`,
+not Kora's product foundation or source of truth. Hermes supplies commodity
+provider/model, tool, skill, subagent, MCP, session, and sandbox execution only.
+Kora exclusively owns durable identity and relationship state, mission state and
+stop conditions, context reconciliation and provenance, semantic permissions
+and decision authority, evidence and evaluation, and cloud-workspace policy.
+Hermes memory, scheduler, approvals, and self-improvement state are never
+authoritative.
+
+The current exact Hermes commit and container lock support the bootstrap spike.
+The planned runtime-hardening target is a tagged Hermes release plus an
+immutable container image digest. OpenHands is only a gated fallback if Hermes
+fails concrete vertical-slice gates; this source synthesis does not select a
+broader technology stack.
 
 ## YC idea-selection principles retained
 

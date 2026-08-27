@@ -54,6 +54,7 @@
   "safety": {
     "historical_context_grants_authority": false,
     "access_implies_authority": false,
+    "runtime_harness_state_authoritative": false,
     "store_chain_of_thought": false,
     "store_credentials": false,
     "behavior_changes_require_approval": true

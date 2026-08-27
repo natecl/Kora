@@ -1,9 +1,14 @@
-# Pinned Hermes runtime image
+# Bootstrap Hermes runtime image
 
 This image builds the exact Hermes revision, Python base-image digest, and uv
 version recorded in [`KORA_RUNTIME_LOCK.json`](../../KORA_RUNTIME_LOCK.json).
 It exists beneath Kora's control plane and must never become a user-facing
 model or tool surface.
+
+This is the exact-commit/container lock for the bootstrap spike, not the final
+runtime-hardening pin. The planned target is a tagged Hermes release plus an
+immutable container image digest, validated through the Kora vertical-slice
+gates. OpenHands remains only a gated fallback if Hermes fails those gates.
 
 Build and verify:
 

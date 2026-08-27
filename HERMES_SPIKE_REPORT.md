@@ -2,7 +2,9 @@
 
 ## Outcome
 
-Hermes is viable as Kora's initial execution harness, but it must remain beneath a Kora-owned mission and authority boundary.
+Hermes is viable as Kora's replaceable initial execution harness, but it must
+remain beneath a Kora-owned mission and authority boundary. It is commodity
+execution infrastructure, not Kora's product foundation or source of truth.
 
 The spike verified:
 
@@ -59,6 +61,24 @@ The already installed local Hermes used for the initial live smoke was version
 has now been installed and tested in Kora's isolated runtime image. Kora does
 not depend on the developer's global Hermes installation.
 
+This exact-commit/container lock is the bootstrap-spike pin. The planned
+runtime-hardening target is a tagged Hermes release plus an immutable container
+image digest; that work is separate from the Kora mission-store
+implementation.
+
+## Authority boundary
+
+Hermes supplies commodity provider/model, tool, skill, subagent, MCP, session,
+and sandbox execution only behind `RuntimeAdapter`. Kora exclusively owns
+durable identity and relationship state, mission state and stop conditions,
+context reconciliation and provenance, semantic permissions and decision
+authority, evidence and evaluation, and cloud-workspace policy.
+
+Hermes memory, scheduler, approvals, and self-improvement state are never
+authoritative. The adapter may expose a runtime result or permission request,
+but Kora validates it and persists any authoritative state in Kora-owned
+records.
+
 ## Critical finding
 
 Hermes one-shot mode explicitly auto-bypasses its own shell and tool approvals and resolves clarification by asking the model to make a reasonable assumption. That behavior conflicts with Kora's intent-fidelity contract if it is treated as the authority layer.
@@ -72,6 +92,12 @@ The safe integration is:
 5. External actions remain behind Kora's separate permission broker.
 
 One-shot is sufficient for the bootstrap spike. Hermes ACP over stdio is the preferred persistent interface because it supports sessions, events, steering, and permission callbacks without coupling Kora to private Python APIs.
+
+OpenHands is not a current dependency or co-equal runtime choice. It may be
+evaluated only as a gated fallback if Hermes fails the concrete vertical-slice
+gates for mission-scoped execution, Kora authority/stop enforcement,
+structured results/evidence, and safe workspace execution through the same
+adapter contract.
 
 ## Implemented boundary
 
@@ -89,10 +115,15 @@ One-shot is sufficient for the bootstrap spike. Hermes ACP over stdio is the pre
 
 ## Next engineering slice
 
-1. Replace the static toolset table with capability manifests discovered from the pinned runtime and reviewed into a Kora allowlist.
-2. Add a Kora mission-state store and permission broker outside Hermes.
-3. Execute a real read/write task against a disposable sample repository.
-4. Attach diff, tests, and artifacts as completion evidence.
+1. Exercise the Kora-owned mission store and semantic permission records with a
+   real read/write task against a disposable sample repository.
+2. Connect the persistent task lifecycle to `RuntimeAdapter` without allowing
+   Hermes state to become mission or authority state.
+3. Attach diff, tests, and artifacts as completion evidence and run an
+   independent review.
+4. After the vertical slice is credible, validate the tagged Hermes release and
+   immutable image digest; evaluate OpenHands only if Hermes fails the gates
+   above.
 
 ## Reproduce the spike
 

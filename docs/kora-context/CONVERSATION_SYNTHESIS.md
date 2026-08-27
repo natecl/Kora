@@ -273,15 +273,24 @@ or infrastructure.
 ## 14. Open source became a speed strategy
 
 The founder explicitly wanted to use as much proven open-source work as
-possible to accelerate development. Hermes Agent was selected as the preferred
-initial harness because it already offers model-agnostic execution, tools,
-skills, memory, messaging, workers, and self-learning mechanisms.
+possible to accelerate development. Hermes Agent is the replaceable initial
+execution harness behind Kora's `RuntimeAdapter`, not Kora's product foundation
+or source of truth. It supplies commodity provider/model, tool, skill,
+subagent, MCP, session, and sandbox execution only.
 
-Kora's proprietary layer should be the persistent coworker relationship:
-intent fidelity, context reconciliation, authority, mission control,
-reciprocal delegation, evidence, personalization, cloud continuity, and the
-phone-first experience. Hermes remains hidden and replaceable beneath a Kora
-adapter.
+Kora's product and control-plane layer owns durable identity and relationship
+state, mission state and stop conditions, context reconciliation and provenance,
+semantic permissions and decision authority, evidence and evaluation,
+cloud-workspace policy, reciprocal delegation, personalization, and the
+phone-first experience. Hermes memory, scheduler, approvals, and
+self-improvement state are never authoritative, even if the harness exposes
+those capabilities.
+
+The current exact Hermes commit and container lock support the bootstrap spike.
+The planned runtime-hardening target is a tagged Hermes release plus an
+immutable container image digest. OpenHands is only a gated fallback if Hermes
+fails concrete vertical-slice gates, and would have to satisfy the same
+adapter-owned boundary. This does not decide the broader technology stack.
 
 ## 15. The commercial hypothesis stayed premium and unified
 
@@ -309,5 +318,6 @@ Kora is now defined as:
 - conservative at external, destructive, costly, or ambiguous boundaries;
 - designed to reproduce more of the user's working judgment over time.
 
-The current repository implements only the initial runtime boundary and
-documents the product. The full Kora experience remains to be built.
+The current repository implements the initial runtime boundary and a persistent
+Kora-owned mission control-plane slice, and documents the product. The
+headless autonomous loop and full Kora experience remain to be built.

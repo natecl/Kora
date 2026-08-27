@@ -10,39 +10,38 @@ The rule is:
 
 Open-source reuse is an implementation strategy, not a user-facing feature. Users experience one Kora and never configure or inspect the projects, models, agents, or runtimes underneath her.
 
-## Hermes Agent as the initial harness
+## Hermes Agent as the replaceable initial execution harness
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) is the preferred initial foundation. Its current official repository describes:
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) is Kora's
+replaceable initial execution harness behind `RuntimeAdapter`, not Kora's
+product foundation or source of truth. Hermes supplies commodity provider/model,
+tool, skill, subagent, MCP, session, and sandbox execution only.
 
-- A model-agnostic provider layer.
-- A closed learning loop that creates and improves skills.
-- Persistent memory, user modeling, and session search.
-- Context files and compatible agent skills.
-- Messaging gateways and cross-platform conversation continuity.
-- Scheduled unattended automation.
-- Parallel subagent delegation.
-- Tools and MCP integration.
-- Local, container, SSH, Modal, Daytona, and Vercel Sandbox execution backends.
-- Command approval and container-isolation foundations.
+Kora exclusively owns durable identity and relationship state, mission state and
+stop conditions, context reconciliation and provenance, semantic permissions
+and decision authority, evidence and evaluation, and cloud-workspace policy.
+Hermes memory, scheduler, approvals, and self-improvement state are never
+authoritative. Any useful runtime output must be validated and persisted by
+Kora's control plane.
 
-Hermes is currently released under the [MIT License](https://github.com/NousResearch/hermes-agent/blob/main/LICENSE), which permits commercial use, modification, distribution, and sublicensing as long as the copyright and license notice are preserved. The license and dependency tree must be rechecked against the exact pinned commit before each release.
+Hermes is currently released under the [MIT License](https://github.com/NousResearch/hermes-agent/blob/main/LICENSE), which permits commercial use, modification, distribution, and sublicensing as long as the copyright and license notice are preserved. The license and dependency tree must be rechecked against the exact release selected for Kora.
 
 ## What to reuse from Hermes
 
 | Hermes capability | Kora use | Integration policy |
 |---|---|---|
-| Agent loop and tool execution | Execute Kora's private work plans. | Reuse behind `HermesRuntimeAdapter`; do not expose its loop to users. |
-| Provider and model abstraction | Route different workloads invisibly. | Reuse adapters; Kora owns routing policy and hides provider selection. |
-| Skills system | Materialize Kora's compiled personalized skills. | Adopt compatible skill files where useful; Kora owns provenance, approval, hierarchy, and the public skill tree. |
-| Persistent memory and session search | Bootstrap recall and cross-session retrieval. | Reuse storage/search primitives; Kora owns typed source authority, conflicts, mission snapshots, and correction history. |
-| User modeling foundations | Seed Kora's learned operating model. | Reuse selectively; Kora owns the decision-learning and authority semantics. |
-| Messaging gateway | Bootstrap text continuity and delivery. | Reuse transport adapters; Kora owns iMessage/contact identity, message style, mobile approvals, and conversation state. |
-| Cron and scheduled automation | Daily calls, monitoring, and proactive mission work. | Reuse scheduler; Kora's mission controller determines whether scheduled work is authorized. |
-| Subagents and parallel work | Power Kora's private workforce. | Reuse internally; workers and models are never user-visible. |
-| Tools and MCP support | Bootstrap integrations and tool execution. | Reuse protocol/tooling; wrap with connector health, scoped permissions, and action audit. |
-| Terminal and sandbox backends | Run work away from the user's Mac. | Reuse cloud/container backends; Kora presents one persistent logical workspace. |
-| Approval and isolation foundations | Accelerate execution safety. | Reuse primitives only; Kora's external authority engine remains the final policy boundary. |
-| Self-improving skill loop | Learn procedural improvements from experience. | Reuse mechanisms; Kora requires provenance, versioning, and confirmation for material behavior changes. |
+| Provider and model execution | Run invisible model workloads. | Reuse behind `RuntimeAdapter`; Kora owns routing policy and hides provider selection. |
+| Tool and agent-loop execution | Execute Kora's private work plans. | Reuse only behind the adapter; Kora supplies mission-scoped instructions and capabilities. |
+| Skills execution and compatible format | Materialize private task skills. | Adopt compatible skill files where useful; Kora owns provenance, approval, hierarchy, and the public skill tree. |
+| Subagents and parallel execution | Power Kora's hidden workforce. | Reuse internally; workers and models are never user-visible or authoritative. |
+| Tools and MCP support | Bootstrap bounded tool execution. | Reuse protocol/tooling behind Kora's capability and authority checks. |
+| Session protocol and transport | Maintain a runtime session for a Kora task. | Kora owns relationship, mission, memory, and recovery state; Hermes session state is disposable execution state. |
+| Container and sandbox execution | Run work away from the user's Mac. | Reuse cloud/container primitives; Kora owns cloud-workspace policy and isolation requirements. |
+
+Hermes may expose memory, scheduling, approval, or self-improvement features,
+but Kora does not use those runtime records as product authority. Messaging,
+identity, scheduling, permissions, and context continuity are Kora-owned or
+remain behind a future Kora-owned adapter.
 
 ## What Kora must build
 
@@ -94,6 +93,19 @@ These layers should not be delegated to the harness because they constitute Kora
 - Harsh self-scoring and uncertainty disclosure.
 - Proof attached to semantic work items.
 
+### Runtime selection gate
+
+The planned pinning target is a tagged Hermes release plus an immutable
+container image digest. The current exact-commit/container lock supports the
+bootstrap spike; it is not a reason to couple Kora's control plane to Hermes.
+
+OpenHands is only a gated fallback, not a co-equal current runtime choice. It
+may be evaluated only if Hermes fails the concrete vertical-slice gates for
+mission-scoped execution, Kora authority and stop enforcement, structured
+results/evidence, and safe workspace execution through the same
+`RuntimeAdapter` contract. A fallback must preserve Kora's identity, mission,
+context, authority, evidence, and cloud-workspace ownership.
+
 ## Integration architecture
 
 ```text
@@ -103,9 +115,9 @@ Kora identity, context, mission, authority, and evidence control plane
         |
 HermesRuntimeAdapter
         |
-Pinned Hermes runtime
+Hermes execution harness
         |
-Providers, tools, skills, subagents, gateways, schedulers, and sandboxes
+Provider/model, tools, skills, subagents, MCP, sessions, and sandbox execution
 ```
 
 The adapter is responsible for:
@@ -121,12 +133,14 @@ The adapter is responsible for:
 
 ### Prototype phase
 
-Use a pinned internal Hermes fork if that is the fastest path to the first end-to-end demonstration. Keep Kora-specific logic outside the fork whenever possible.
+Use the current Hermes spike lock only to prove the vertical slice. Keep
+Kora-specific logic outside the harness whenever possible.
 
 ### Product phase
 
 - Isolate all runtime integration behind `HermesRuntimeAdapter`.
-- Track the exact upstream commit and maintain a reproducible lockfile.
+- Target a tagged Hermes release plus an immutable container image digest, with
+  a reproducible lockfile and preserved license notices.
 - Rebase or merge upstream deliberately rather than automatically.
 - Contribute generic bug fixes, connector improvements, reliability work, and broadly useful skills upstream.
 - Keep Kora's proprietary mission, intent, authority, relationship, and user-interface layers in the Kora repository.
@@ -152,7 +166,8 @@ Candidate categories include connector frameworks, browser automation, sandbox r
 
 Open source accelerates Kora but also expands the attack surface. Required controls:
 
-- Pin source commits and dependency versions.
+- Pin source releases/commits, dependency versions, and container image
+  digests.
 - Verify release provenance and checksums where available.
 - Generate a software bill of materials.
 - Maintain `THIRD_PARTY_NOTICES` with required copyright and license text.
@@ -162,16 +177,20 @@ Open source accelerates Kora but also expands the attack surface. Required contr
 - Route connector secrets through Kora's scoped credential broker.
 - Keep the restricted Mac bridge outside the general agent runtime.
 - Require Kora's authority engine for every consequential action, regardless of upstream approval behavior.
-- Run contract, regression, and adversarial tests before upgrading upstream commits.
+- Run contract, regression, and adversarial tests before upgrading the harness.
 
-Reusing Hermes's autonomy or self-learning mechanisms does not mean removing Kora's safety boundaries. Kora may be direct and non-paternalistic while still enforcing consent, authority, recovery, and local-device protection at the system level.
+Reusing Hermes's execution primitives does not mean delegating Kora's product
+state or safety boundaries. Kora may be direct and non-paternalistic while
+still enforcing consent, authority, recovery, and local-device protection at
+the system level.
 
 ## Build sequence
 
 ### 1. Harness spike
 
-- Pin a Hermes commit.
-- Run one product-development task using its provider, tools, skills, memory, and subagent primitives.
+- Run one product-development task through `RuntimeAdapter` using Hermes's
+  provider/model, tool, skill, subagent, MCP, session, and sandbox execution
+  primitives.
 - Record which Kora requirements can be satisfied without modifying Hermes.
 - Create the first `HermesRuntimeAdapter` contract.
 
@@ -181,25 +200,33 @@ Reusing Hermes's autonomy or self-learning mechanisms does not mean removing Kor
 - Prove the runtime cannot change these records directly.
 - Translate one mission task into a Hermes job and collect structured evidence.
 
-### 3. Personalized skills
+### 3. Runtime hardening and fallback gate
+
+- Select and validate a tagged Hermes release plus an immutable container image
+  digest.
+- Re-run the concrete vertical-slice gates after the pin is selected.
+- If Hermes fails those gates, evaluate OpenHands only as a gated fallback
+  behind the same adapter and Kora-owned state/authority contracts.
+
+### 4. Personalized skills
 
 - Ingest the user's existing Markdown instructions and workflows.
-- Compile them into Hermes-compatible private execution skills.
+- Compile them into adapter-compatible private execution skills.
 - Generate separate user-readable Kora skill documents with provenance and version history.
 - Verify that a user correction changes later work without exposing runtime prompts.
 
-### 4. Cloud continuity
+### 5. Cloud continuity
 
 - Place the pinned runtime inside Kora's persistent logical cloud workspace.
 - Keep the restricted Mac bridge separate.
 - Verify productive work continues while the user's Mac is offline.
 
-### 5. Product surfaces
+### 6. Product surfaces
 
 - Implement onboarding, Kora profile, skill tree, semantic Kanban, messages, calls, previews, and approvals over the control-plane APIs.
 - Remove all runtime-specific language and configuration from the user experience.
 
-### 6. Upstream discipline
+### 7. Upstream discipline
 
 - Identify generic changes worth contributing to Hermes.
 - Maintain attribution and third-party notices.
@@ -210,9 +237,10 @@ Reusing Hermes's autonomy or self-learning mechanisms does not mean removing Kor
 The open-source strategy succeeds when:
 
 1. Kora can complete the first mission without building a new generic agent harness.
-2. A Hermes runtime upgrade cannot alter Kora's mission or permission state.
+2. Hermes is replaceable behind `RuntimeAdapter`; a runtime upgrade cannot alter Kora's identity, relationship, mission, authority, context, evidence, or cloud-workspace policy.
 3. Users never encounter Hermes, model, provider, prompt, worker, or token configuration.
-4. Kora can replace the underlying runtime without losing identity, memory, mission, permissions, or skill provenance.
+4. Hermes memory, scheduler, approvals, and self-improvement state are never authoritative.
 5. User workflow documents become personalized Kora skills rather than being ignored.
 6. Generic improvements can be contributed upstream without publishing Kora's proprietary control plane.
 7. Every shipped dependency has a recorded source, version, license, and security review.
+8. A tagged Hermes release and immutable container digest pass the concrete vertical-slice gates, or OpenHands passes them only after Hermes fails and only behind the same adapter contract.

@@ -10,7 +10,6 @@ with the code that currently exists.
 ## Implemented
 
 - Kora runtime job and result contracts.
-- Mission and task identifiers.
 - Explicit capability declarations.
 - Read-only and cloud-sandbox isolation modes.
 - Workspace boundary enforcement.
@@ -21,12 +20,28 @@ with the code that currently exists.
 - Deny-by-default ACP permission handling.
 - Sanitized product-facing results that omit model and provider identity.
 - Structured completion, escalation, failure, and unstructured-result states.
-- Eight tests covering core runtime and permission boundaries.
+- A Kora-owned SQLite mission store and service with typed mission, task,
+  dependency, decision, assumption, checkpoint, escalation, artifact,
+  evidence, permission-grant, and append-only audit-event records.
+- Explicit mission and task transition matrices, one active overarching mission
+  guard, dependency blocking, cross-mission and transitive-cycle rejection, and
+  deterministic priority/creation/id next-task selection.
+- Mission revision checks that reject stale writes, transaction rollback for
+  failed multi-record writes, and atomic one-time permission consumption.
+- Mission-control tests covering persistence, lifecycle, dependency, revision,
+  rollback, audit, and permission boundaries, in addition to the runtime
+  boundary tests.
+- Developer CLI commands for `mission-create` and `mission-status` alongside
+  the runtime health and smoke commands.
 - A pinned Hermes container definition.
 - A locked Hermes commit, Python base-image digest, uv version, and license
   record.
 - A successful Hermes ACP health check inside a read-only container with
   ephemeral runtime state.
+
+The mission package intentionally has no dependency on Hermes. Kora's mission,
+authority, evidence, and stop state remain authoritative even when the runtime
+harness is replaced.
 
 ## Configured locally, not owned by Kora
 
@@ -44,12 +59,14 @@ route models invisibly at runtime.
 
 ## Documented but not implemented
 
-- Persistent mission state and next-task planning.
+- The headless loop that reconciles mission/task state with RuntimeAdapter
+  jobs, evaluates results, and records evidence for a real development mission.
 - Context OS and versioned knowledge graph.
 - Context ingestion, reconciliation, provenance, and conflict resolution.
 - Kora identity persistence and personalized skill compilation.
-- Authority and permission broker outside Hermes.
-- Evaluation and evidence engine.
+- The full Kora-owned semantic authority/permission broker beyond the current
+  mission permission records.
+- The independent evaluation and evidence workflow for real artifacts.
 - Persistent cloud workspace provisioning.
 - Elastic worker or VM orchestration.
 - Restricted Mac bridge.
@@ -65,27 +82,38 @@ route models invisibly at runtime.
 - Production authentication, billing, monthly allowances, or model routing.
 - Agent-to-agent communication, external AI identity, appointments, or
   purchasing.
+- Runtime hardening against a tagged Hermes release plus an immutable container
+  image digest; OpenHands evaluation is permitted only as a gated fallback if
+  Hermes fails the concrete vertical-slice gates.
 
 ## What Kora can do today
 
-A developer can run health checks and safe runtime smoke tests. Kora can submit
-one mission-scoped prompt to Hermes, constrain the requested capabilities, use
-a persistent ACP session, deny permission by default, and interpret a
-structured result.
+A developer can create and inspect Kora-owned mission records, exercise their
+explicit lifecycle and dependency rules, select the deterministic next task,
+and run health checks and safe runtime smoke tests. Kora can submit one
+mission-scoped prompt to Hermes, constrain the requested capabilities, use a
+persistent ACP session, deny permission by default, and interpret a structured
+result. Hermes memory, scheduler, approvals, and self-improvement state are
+never authoritative.
 
 Kora cannot yet take a real PRD and independently run a company or produce a
-complete deployed MVP. The repository is a product specification plus a
-validated execution-boundary spike.
+complete deployed MVP. The repository is a product specification plus
+validated runtime and mission-control slices; the autonomous loop and broader
+product surfaces remain unimplemented.
 
 ## Recommended next engineering slice
 
-1. Add a persistent mission-state store.
-2. Add a Kora-owned semantic permission broker.
-3. Define one disposable sample product mission and authority envelope.
-4. Run the pinned container against a writable disposable repository.
-5. Have Kora choose and implement the next task.
-6. Attach diff, tests, artifacts, decisions, and unresolved risks as evidence.
-7. Stop or escalate on a deliberately ambiguous requirement.
+1. Connect the persistent mission/task store to the existing `RuntimeAdapter`
+   boundary and add Kora-owned authority preflight.
+2. Define one disposable sample product mission and authority envelope.
+3. Run the current pinned container against a writable disposable repository.
+4. Have Kora choose and implement the next task, then attach diffs, tests,
+   artifacts, decisions, and unresolved risks as evidence.
+5. Stop or escalate on a deliberately ambiguous requirement and evaluate the
+   result independently.
+6. Later, validate a tagged Hermes release plus an immutable container image
+   digest; consider OpenHands only if Hermes fails the concrete vertical-slice
+   gates and only through the same adapter contract.
 
 That slice should prove the core magical moment before desktop, iMessage, or
 large connector work begins.

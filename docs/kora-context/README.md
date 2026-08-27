@@ -30,6 +30,10 @@ Historical context can explain a decision. It cannot approve spending,
 publishing, outreach, account changes, destructive computer actions, or a new
 mission.
 
+Any runtime-harness memory, scheduler, approval, or self-improvement state is
+also non-authoritative; it cannot outrank Kora's mission, context, permission,
+evidence, or stop-condition records.
+
 ## Contents
 
 - [`KORA_IDENTITY.md`](./KORA_IDENTITY.md): who Kora is and is not.

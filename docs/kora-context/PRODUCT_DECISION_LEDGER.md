@@ -39,11 +39,12 @@ Statuses:
 | K-023 | Support approve-once and approve-indefinitely. | Consequential actions require consent without forcing repeated low-value approval forever. |
 | K-024 | Require approval for money, publishing, outreach, consequential messages, providers, accounts, production changes, destructive actions, and unlearned taste. | These boundaries contain the highest user and reputational risk. |
 | K-025 | Use one logical cloud computer and invisible elastic workers. | Keeps the laptop closed and hides infrastructure complexity. |
-| K-026 | Use proven open source, beginning with Hermes Agent. | Speeds development and avoids rebuilding commodity harness infrastructure. |
+| K-026 | Use Hermes Agent as Kora's replaceable initial execution harness behind `RuntimeAdapter`; keep Kora's control plane independent. | Speeds development without making an execution harness the source of truth for Kora's identity, relationship, mission, authority, context, evidence, or cloud-workspace policy. |
 | K-027 | Keep Kora model-agnostic. | Quality, cost, and model leadership will change; Kora's relationship and context should persist. |
 | K-028 | Launch with a unified premium monthly allowance around $250–$300. | Hide models and tokens, prioritize quality, and match the complete coworker value. |
 | K-029 | Preserve a candid, human, non-condescending personality. | The relationship should feel like a coworker, not an aligned corporate chatbot. |
 | K-030 | Retain strong consent and safety despite natural language. | Human tone cannot become a route around permission, truth, or computer safety. |
+| K-031 | Treat a tagged Hermes release plus an immutable container image digest as the planned runtime-hardening pin; evaluate OpenHands only as a gated fallback if Hermes fails concrete vertical-slice gates. | Reproducibility and a credible replacement path are both required without broadening the current technology decision or coupling mission state to a harness. |
 
 ## Rejected initial directions
 
@@ -95,3 +96,8 @@ Statuses:
 - **2026-08-26:** Initial ledger created from the startup and product-discovery
   conversation. No historical brainstorm was promoted into an active direction
   unless it was explicitly accepted in the PRD or later product decisions.
+- **2026-08-26:** Aligned the Hermes decision with the replaceable
+  `RuntimeAdapter` boundary. Kora owns durable product and control-plane state;
+  Hermes runtime memory, scheduling, approvals, and self-improvement state are
+  never authoritative. Added the later tagged-release/digest hardening target
+  and gated OpenHands fallback condition.

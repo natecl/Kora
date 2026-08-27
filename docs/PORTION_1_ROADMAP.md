@@ -153,7 +153,9 @@ Selecting and validating a tagged Hermes release together with an immutable
 container digest is a later runtime-hardening task. It is separate from the
 Portion 1 mission-store implementation: the mission store must be designed and
 tested against the replaceable `RuntimeAdapter` boundary, not coupled to a
-particular Hermes release or container image.
+particular Hermes release or container image. OpenHands is only a gated
+fallback if Hermes fails concrete vertical-slice gates, and must satisfy the
+same Kora-owned adapter and authority contract.
 
 ## Governing constraints for every phase
 

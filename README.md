@@ -6,8 +6,9 @@ deployed MVP and approved initial customer outreach while the founder works on
 something else.
 
 Kora owns intent fidelity, mission control, authority, memory, evidence, and
-the coworker relationship. Proven open-source runtimes such as Hermes Agent
-provide invisible model, tool, skill, and worker infrastructure underneath.
+the coworker relationship. Hermes Agent is the replaceable initial execution
+harness behind Kora's runtime adapter; it provides invisible commodity model,
+tool, skill, and worker execution underneath.
 
 ## Current status
 
@@ -42,3 +43,11 @@ implementation snapshot.
 The normative product and system specifications remain
 [KORA_V1_PRD.md](./KORA_V1_PRD.md) and
 [KORA_TECHNICAL_ARCHITECTURE.md](./KORA_TECHNICAL_ARCHITECTURE.md).
+
+## Next engineering slice
+
+The approved sequence starts by proving a headless autonomous development loop,
+then productizes desktop/context UI, cloud/phone continuity, and finally
+deployment/outreach. See the [Portion 1 roadmap](./docs/PORTION_1_ROADMAP.md)
+and the [mission control-plane design](./docs/PORTION_1_MISSION_CONTROL_PLANE.md)
+for the current scope and acceptance boundary.

@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
+from kora._workspace import WorkspaceIdentity, WorkspaceIdentityError
 from kora.execution.errors import (
     ExecutionError,
     ExecutionValidationError,
@@ -1097,6 +1098,9 @@ class ExecutionCoordinator:
         _validate_spec_for_task(spec, task)
         if not self._workspace_authority_matches(spec):
             return self._invalid_task_result(mission_id, task.task_id)
+        workspace_identity = self._capture_workspace_identity(spec)
+        if workspace_identity is None:
+            return self._invalid_task_result(mission_id, task.task_id)
         try:
             _normalize_evidence_requirements(spec.profile.evidence_requirements)
         except ExecutionValidationError:
@@ -1130,6 +1134,7 @@ class ExecutionCoordinator:
             _persisted_nonnegative_int(attempt.total_tokens),
             _persisted_nonnegative_float(attempt.estimated_cost_usd),
             _persisted_nonnegative_int(attempt.latency_ms),
+            workspace_identity=workspace_identity,
             resume_verifying=True,
         )
 
@@ -1193,6 +1198,9 @@ class ExecutionCoordinator:
         _validate_spec_for_task(spec, task)
         if not self._workspace_authority_matches(spec):
             return self._invalid_task_result(mission_id, task.task_id)
+        workspace_identity = self._capture_workspace_identity(spec)
+        if workspace_identity is None:
+            return self._invalid_task_result(mission_id, task.task_id)
         try:
             _normalize_evidence_requirements(spec.profile.evidence_requirements)
         except ExecutionValidationError:
@@ -1241,6 +1249,7 @@ class ExecutionCoordinator:
             attempt,
             runtime,
             reservation,
+            workspace_identity=workspace_identity,
         )
 
     def _stranded_tasks(self, mission_id: str) -> list[Task]:
@@ -1263,6 +1272,9 @@ class ExecutionCoordinator:
         _validate_spec_for_task(spec, task)
 
         if not self._workspace_authority_matches(spec):
+            return self._invalid_task_result(mission_id, task.task_id)
+        workspace_identity = self._capture_workspace_identity(spec)
+        if workspace_identity is None:
             return self._invalid_task_result(mission_id, task.task_id)
         try:
             _normalize_evidence_requirements(spec.profile.evidence_requirements)
@@ -1387,6 +1399,7 @@ class ExecutionCoordinator:
                 claimed,
                 runtime,
                 reservation,
+                workspace_identity=workspace_identity,
             )
             if outcome is not None:
                 return outcome
@@ -1422,6 +1435,20 @@ class ExecutionCoordinator:
             except (OSError, RuntimeError, TypeError, ValueError):
                 return False
         return True
+
+    @staticmethod
+    def _capture_workspace_identity(
+        spec: TaskExecutionSpec,
+    ) -> WorkspaceIdentity | None:
+        """Freeze the authorized workspace before any runtime or verifier work."""
+
+        try:
+            identity = WorkspaceIdentity.capture(spec.workspace)
+        except WorkspaceIdentityError:
+            return None
+        if identity.canonical_path != spec.workspace:
+            return None
+        return identity
 
     def _invalid_task_result(
         self,
@@ -1812,6 +1839,8 @@ class ExecutionCoordinator:
         attempt: TaskAttempt,
         runtime: Runtime,
         reservation: RouteReservation | None,
+        *,
+        workspace_identity: WorkspaceIdentity,
     ) -> CoordinatorResult | None:
         """Run one claimed attempt and return ``None`` only for safe fallback."""
 
@@ -1869,6 +1898,7 @@ class ExecutionCoordinator:
                 live_fence_validator=lambda candidate_ticket: self._validate_fence(
                     current_attempt, candidate_ticket
                 ),
+                _workspace_identity=workspace_identity,
             )
             # The controller validates the durable fence immediately before
             # dispatch; adapters independently validate the same job at their
@@ -2006,6 +2036,7 @@ class ExecutionCoordinator:
             total_tokens,
             estimated_cost,
             latency_ms,
+            workspace_identity=workspace_identity,
         )
 
     def _resolve_runtime(self, route_id: str) -> Runtime:
@@ -2032,6 +2063,7 @@ class ExecutionCoordinator:
         estimated_cost: float,
         latency_ms: int,
         *,
+        workspace_identity: WorkspaceIdentity,
         resume_verifying: bool = False,
     ) -> CoordinatorResult | None:
         verification_durable = False
@@ -2079,6 +2111,7 @@ class ExecutionCoordinator:
                     live_fence_validator=lambda: self._validate_fence(
                         current_attempt, fence_ticket
                     ),
+                    _workspace_identity=workspace_identity,
                 )
             )
             # A verifier cannot turn a stale runtime result into accepted

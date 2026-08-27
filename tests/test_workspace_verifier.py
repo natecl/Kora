@@ -59,6 +59,24 @@ class WorkspaceVerifierTests(unittest.TestCase):
             timeout_seconds=timeout_seconds,
         )
 
+    @staticmethod
+    def _authorized_request(
+        workspace: Path,
+        commands: tuple[VerificationCommand, ...],
+        *,
+        require_changes: bool = True,
+    ) -> WorkspaceVerificationRequest:
+        return WorkspaceVerificationRequest(
+            workspace=workspace,
+            commands=commands,
+            require_changes=require_changes,
+            execution_authorized=True,
+            execution_capability=True,
+            execution_granted=True,
+            require_execution_authority=True,
+            live_fence_validator=lambda: True,
+        )
+
     def test_accepts_changed_workspace_and_returns_candidate_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -66,11 +84,9 @@ class WorkspaceVerifierTests(unittest.TestCase):
             (workspace / "README.md").write_text("changed\n", encoding="utf-8")
 
             result = WorkspaceVerifier(cloud_root=root).verify(
-                WorkspaceVerificationRequest(
-                    workspace=workspace,
-                    commands=(
-                        self._python_command("smoke", "print('verification passed')"),
-                    ),
+                self._authorized_request(
+                    workspace,
+                    (self._python_command("smoke", "print('verification passed')"),),
                 )
             )
 
@@ -96,9 +112,9 @@ class WorkspaceVerifierTests(unittest.TestCase):
             should_not_run = workspace / "should-not-run"
 
             result = WorkspaceVerifier(cloud_root=root).verify(
-                WorkspaceVerificationRequest(
-                    workspace=workspace,
-                    commands=(
+                self._authorized_request(
+                    workspace,
+                    (
                         self._python_command("first", "print('ok')"),
                         self._python_command(
                             "failing",
@@ -131,9 +147,9 @@ class WorkspaceVerifierTests(unittest.TestCase):
             marker = workspace / "should-not-run"
 
             result = WorkspaceVerifier(cloud_root=root).verify(
-                WorkspaceVerificationRequest(
-                    workspace=workspace,
-                    commands=(
+                self._authorized_request(
+                    workspace,
+                    (
                         self._python_command(
                             "unexpected",
                             f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
@@ -155,10 +171,10 @@ class WorkspaceVerifierTests(unittest.TestCase):
             workspace = self._repository(root)
 
             result = WorkspaceVerifier(cloud_root=root).verify(
-                WorkspaceVerificationRequest(
-                    workspace=workspace,
+                self._authorized_request(
+                    workspace,
+                    (self._python_command("clean-check", "print('ok')"),),
                     require_changes=False,
-                    commands=(self._python_command("clean-check", "print('ok')"),),
                 )
             )
 
@@ -191,10 +207,10 @@ class WorkspaceVerifierTests(unittest.TestCase):
             workspace.mkdir()
 
             result = WorkspaceVerifier(cloud_root=root).verify(
-                WorkspaceVerificationRequest(
-                    workspace=workspace,
+                self._authorized_request(
+                    workspace,
+                    (self._python_command("unexpected", "raise SystemExit"),),
                     require_changes=False,
-                    commands=(self._python_command("unexpected", "raise SystemExit"),),
                 )
             )
 
@@ -220,7 +236,7 @@ class WorkspaceVerifierTests(unittest.TestCase):
                 clear=False,
             ):
                 result = WorkspaceVerifier(cloud_root=root).verify(
-                    WorkspaceVerificationRequest(workspace=workspace, commands=(command,))
+                    self._authorized_request(workspace, (command,))
                 )
 
             self.assertTrue(result.accepted)
@@ -240,7 +256,7 @@ class WorkspaceVerifierTests(unittest.TestCase):
             result = WorkspaceVerifier(
                 cloud_root=root,
                 environment={"KORA_EXPLICIT_VALUE": "passed-explicitly"},
-            ).verify(WorkspaceVerificationRequest(workspace, (command,)))
+            ).verify(self._authorized_request(workspace, (command,)))
 
             self.assertTrue(result.accepted)
             self.assertIn("passed-explicitly", result.checks[0].summary)
@@ -263,7 +279,7 @@ class WorkspaceVerifierTests(unittest.TestCase):
             )
 
             result = WorkspaceVerifier(cloud_root=root).verify(
-                WorkspaceVerificationRequest(workspace, (command,))
+                self._authorized_request(workspace, (command,))
             )
 
             self.assertTrue(result.accepted)
@@ -281,7 +297,7 @@ class WorkspaceVerifierTests(unittest.TestCase):
             )
 
             result = WorkspaceVerifier(cloud_root=root).verify(
-                WorkspaceVerificationRequest(workspace, (command,))
+                self._authorized_request(workspace, (command,))
             )
 
             summary = result.checks[0].summary

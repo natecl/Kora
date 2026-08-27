@@ -15,13 +15,19 @@ import subprocess
 import threading
 import time
 import unicodedata
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping
 from urllib.parse import quote
 
+from kora._workspace import (
+    WorkspaceIdentity,
+    WorkspaceIdentityError,
+    _directory_open_flags,
+    descriptor_cwd_kwargs,
+)
 from kora.mission.domain import ArtifactKind, EvidenceKind
 from kora.mission.errors import ValidationError
 from kora._process_local import attach as attach_process_local
@@ -213,14 +219,20 @@ class WorkspaceVerificationRequest:
     commands: tuple[VerificationCommand, ...]
     require_changes: bool = True
     baseline_ref: str = "HEAD"
-    # These authority fields are populated by ExecutionCoordinator.  The
-    # unmarked legacy mode keeps direct read-only verifier callers source
-    # compatible; production coordinator requests set the required flag.
+    # These authority fields are populated by ExecutionCoordinator.  Direct
+    # commandless inspection remains source compatible; command execution
+    # always requires all explicit authority fields and a live fence.
     execution_authorized: bool | None = None
     execution_capability: bool | None = None
     execution_granted: bool | None = None
     require_execution_authority: bool = False
     live_fence_validator: InitVar[Callable[..., object] | None] = None
+    _workspace_identity: WorkspaceIdentity | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
 
     def __post_init__(
         self,
@@ -237,6 +249,25 @@ class WorkspaceVerificationRequest:
                 f"workspace is not a directory: {workspace}"
             )
         object.__setattr__(self, "workspace", workspace)
+
+        provided_identity = self._workspace_identity
+        if provided_identity is not None and not isinstance(
+            provided_identity, WorkspaceIdentity
+        ):
+            raise WorkspaceVerificationError(
+                "_workspace_identity must be a WorkspaceIdentity or None"
+            )
+        try:
+            if provided_identity is None:
+                identity = WorkspaceIdentity.capture(workspace)
+            else:
+                provided_identity.assert_path(workspace)
+                identity = provided_identity
+        except WorkspaceIdentityError as exc:
+            raise WorkspaceVerificationError(
+                "workspace identity could not be carried safely"
+            ) from exc
+        object.__setattr__(self, "_workspace_identity", identity)
 
         if isinstance(self.commands, (str, bytes)):
             raise WorkspaceVerificationError(
@@ -449,19 +480,19 @@ class WorkspaceVerifier:
                 "request must be a WorkspaceVerificationRequest"
             )
 
-        workspace, relative_workspace = self._validate_workspace(request.workspace)
+        workspace, relative_workspace, workspace_identity = self._validate_workspace(
+            request.workspace,
+            request._workspace_identity,
+        )
         environment = self._build_environment()
         live_fence_validator = request.live_fence_validator
 
-        if request.authority_is_explicit:
+        if request.commands:
             if (
                 request.execution_authorized is not True
-                or live_fence_validator is None
-            ):
-                return self._authority_rejection()
-            if request.commands and (
-                request.execution_capability is not True
+                or request.execution_capability is not True
                 or request.execution_granted is not True
+                or live_fence_validator is None
             ):
                 return self._authority_rejection()
         try:
@@ -474,6 +505,7 @@ class WorkspaceVerifier:
             relative_workspace,
             request.baseline_ref,
             environment,
+            workspace_identity,
             live_fence_validator,
         )
         if pre_snapshot is None:
@@ -509,6 +541,7 @@ class WorkspaceVerifier:
                 timeout_seconds=command.timeout_seconds,
                 stdout_limit=_COMMAND_CAPTURE_LIMIT,
                 stderr_limit=_COMMAND_CAPTURE_LIMIT,
+                workspace_identity=workspace_identity,
                 live_fence_validator=live_fence_validator,
             )
             passed = process_result.exit_code == 0 and not process_result.timed_out
@@ -531,6 +564,7 @@ class WorkspaceVerifier:
             relative_workspace,
             request.baseline_ref,
             environment,
+            workspace_identity,
             live_fence_validator,
         )
         if post_snapshot is None:
@@ -655,6 +689,7 @@ class WorkspaceVerifier:
         relative_workspace: Path,
         baseline_ref: str,
         environment: Mapping[str, str],
+        workspace_identity: WorkspaceIdentity,
         live_fence_validator: Callable[..., object] | None,
     ) -> tuple[_WorkspaceSnapshot | None, str | None]:
         """Capture tracked git state and untracked content in bounded memory."""
@@ -668,6 +703,7 @@ class WorkspaceVerifier:
             stdout_limit=_GIT_CAPTURE_LIMIT,
             stderr_limit=_COMMAND_CAPTURE_LIMIT,
             stream_digest=digest,
+            workspace_identity=workspace_identity,
             live_fence_validator=live_fence_validator,
         )
         if not self._process_succeeded(status_result):
@@ -686,6 +722,7 @@ class WorkspaceVerifier:
             stdout_limit=_GIT_CAPTURE_LIMIT,
             stderr_limit=_COMMAND_CAPTURE_LIMIT,
             stream_digest=digest,
+            workspace_identity=workspace_identity,
             live_fence_validator=live_fence_validator,
         )
         if not self._process_succeeded(diff_result):
@@ -702,6 +739,7 @@ class WorkspaceVerifier:
             timeout_seconds=_GIT_TIMEOUT_SECONDS,
             stdout_limit=_UNTRACKED_PATH_CAPTURE_LIMIT,
             stderr_limit=_COMMAND_CAPTURE_LIMIT,
+            workspace_identity=workspace_identity,
             live_fence_validator=live_fence_validator,
         )
         if not self._process_succeeded(untracked_result):
@@ -713,22 +751,74 @@ class WorkspaceVerifier:
         if untracked_result.stdout_truncated:
             return None, "workspace contains too many untracked paths to inspect safely."
 
-        try:
-            untracked_paths = tuple(
-                sorted(
-                    {
-                        Path(os.fsdecode(path))
-                        for path in untracked_result.stdout_bytes.split(b"\0")
-                        if path
-                    },
-                    key=lambda path: path.as_posix().encode(
-                        "utf-8", errors="surrogateescape"
-                    ),
-                )
+        ignored_result = self._run_process(
+            (
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ),
+            workspace=workspace,
+            environment=environment,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            stdout_limit=_UNTRACKED_PATH_CAPTURE_LIMIT,
+            stderr_limit=_COMMAND_CAPTURE_LIMIT,
+            workspace_identity=workspace_identity,
+            live_fence_validator=live_fence_validator,
+        )
+        if not self._process_succeeded(ignored_result):
+            return None, (
+                "git ignored-file inspection failed ("
+                + self._process_failure_detail(ignored_result)
+                + ")."
             )
-            for path in untracked_paths:
-                self._hash_untracked_entry(digest, workspace, path)
-        except WorkspaceVerificationError as exc:
+        if ignored_result.stdout_truncated:
+            return None, "workspace contains too many ignored paths to inspect safely."
+
+        ignored_directory_result = self._run_process(
+            (
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ),
+            workspace=workspace,
+            environment=environment,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
+            stdout_limit=_UNTRACKED_PATH_CAPTURE_LIMIT,
+            stderr_limit=_COMMAND_CAPTURE_LIMIT,
+            workspace_identity=workspace_identity,
+            live_fence_validator=live_fence_validator,
+        )
+        if not self._process_succeeded(ignored_directory_result):
+            return None, (
+                "git ignored-directory inspection failed ("
+                + self._process_failure_detail(ignored_directory_result)
+                + ")."
+            )
+        if ignored_directory_result.stdout_truncated:
+            return None, "workspace contains too many ignored paths to inspect safely."
+
+        try:
+            untracked_paths = self._parse_untracked_paths(
+                untracked_result.stdout_bytes,
+                ignored_result.stdout_bytes,
+                ignored_directory_result.stdout_bytes,
+            )
+            with workspace_identity.open_descriptor() as workspace_descriptor:
+                for path in untracked_paths:
+                    self._hash_untracked_entry(
+                        digest,
+                        workspace,
+                        path,
+                        workspace_descriptor=workspace_descriptor,
+                    )
+        except (OSError, TypeError, ValueError) as exc:
             return None, str(exc)
 
         return (
@@ -738,6 +828,52 @@ class WorkspaceVerifier:
                 relative_workspace=relative_workspace,
             ),
             None,
+        )
+
+    @staticmethod
+    def _parse_untracked_paths(*outputs: bytes) -> tuple[Path, ...]:
+        """Decode, deduplicate, and deterministically sort Git path output."""
+
+        paths: set[Path] = set()
+        for output in outputs:
+            for path_bytes in output.split(b"\0"):
+                if not path_bytes:
+                    continue
+                path_text = os.fsdecode(path_bytes)
+                # ``--directory`` marks directory entries with a trailing
+                # slash.  Git otherwise emits canonical relative paths; do
+                # not normalize malformed output into a different path.
+                path_text = path_text.rstrip("/")
+                if not path_text:
+                    raise WorkspaceVerificationError(
+                        "untracked path is not a safe workspace-relative entry"
+                    )
+                path = Path(path_text)
+                if (
+                    path.is_absolute()
+                    or path.as_posix() != path_text
+                    or not path.parts
+                    or any(part in {"", ".", "..", ".git"} for part in path.parts)
+                    or "\0" in path_text
+                ):
+                    raise WorkspaceVerificationError(
+                        "untracked path is not a safe workspace-relative entry"
+                    )
+                paths.add(path)
+
+        # Git reports files, not their untracked parent directories.  Include
+        # those parents so their lstat type/mode is part of the same complete
+        # snapshot, while retaining a bounded set derived from bounded output.
+        for path in tuple(paths):
+            paths.update(parent for parent in path.parents if parent != Path("."))
+
+        return tuple(
+            sorted(
+                paths,
+                key=lambda path: path.as_posix().encode(
+                    "utf-8", errors="surrogateescape"
+                ),
+            )
         )
 
     @staticmethod
@@ -753,148 +889,227 @@ class WorkspaceVerifier:
         digest: Any,
         workspace: Path,
         relative_path: Path,
+        *,
+        workspace_descriptor: int | None = None,
     ) -> None:
         """Hash one untracked entry without following links or buffering files."""
+
+        if workspace_descriptor is None:
+            try:
+                identity = WorkspaceIdentity.capture(workspace)
+            except WorkspaceIdentityError as exc:
+                raise WorkspaceVerificationError(
+                    "workspace could not be opened safely for untracked inspection"
+                ) from exc
+            with identity.open_descriptor() as descriptor:
+                return WorkspaceVerifier._hash_untracked_entry(
+                    digest,
+                    identity.canonical_path,
+                    relative_path,
+                    workspace_descriptor=descriptor,
+                )
 
         if (
             relative_path.is_absolute()
             or not relative_path.parts
             or any(part in {"", ".", ".."} for part in relative_path.parts)
-            or relative_path.parts[0] == ".git"
+            or any(part == ".git" for part in relative_path.parts)
+            or any("\0" in part for part in relative_path.parts)
         ):
             raise WorkspaceVerificationError(
                 "untracked path is not a safe workspace-relative entry"
             )
-        candidate = workspace.joinpath(*relative_path.parts)
-        lexical_candidate = Path(os.path.abspath(os.fspath(candidate)))
+
+        # Walk from the already verified workspace descriptor.  Every parent
+        # is opened as a real directory without following links, so the path
+        # can never escape through a renamed or substituted component.
         try:
-            lexical_candidate.relative_to(workspace)
-        except ValueError as exc:
+            parent_descriptor = os.dup(workspace_descriptor)
+        except (OSError, TypeError, ValueError) as exc:
             raise WorkspaceVerificationError(
-                "untracked path escapes the canonical workspace"
+                "workspace descriptor could not be duplicated safely"
             ) from exc
-
-        # Do not follow a symlink or special entry in any parent component.
-        # The final component is inspected with lstat below so a symlink itself
-        # can be fingerprinted by its link target without dereferencing it.
-        parent = workspace
-        for part in relative_path.parts[:-1]:
-            parent = parent / part
-            try:
-                parent_stat = os.lstat(parent)
-            except OSError as exc:
-                raise WorkspaceVerificationError(
-                    "untracked workspace parent could not be inspected safely"
-                ) from exc
-            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
-                parent_stat.st_mode
-            ):
-                raise WorkspaceVerificationError(
-                    "untracked workspace path contains an unsafe parent entry"
-                )
-
         try:
-            entry_stat = os.lstat(candidate)
-        except OSError as exc:
+            for part in relative_path.parts[:-1]:
+                try:
+                    next_descriptor = os.open(
+                        part,
+                        _directory_open_flags(),
+                        dir_fd=parent_descriptor,
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    raise WorkspaceVerificationError(
+                        "untracked workspace parent could not be inspected safely"
+                    ) from exc
+                try:
+                    os.close(parent_descriptor)
+                except OSError as exc:
+                    try:
+                        os.close(next_descriptor)
+                    except OSError:
+                        pass
+                    raise WorkspaceVerificationError(
+                        "workspace parent descriptor could not be closed safely"
+                    ) from exc
+                parent_descriptor = next_descriptor
+
+            name = relative_path.parts[-1]
+            try:
+                entry_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise WorkspaceVerificationError(
+                    "untracked workspace entry could not be inspected safely"
+                ) from exc
+
+            path_bytes = relative_path.as_posix().encode(
+                "utf-8", errors="surrogateescape"
+            )
+            mode = entry_stat.st_mode
+            digest.update(b"\0KORA-UNTRACKED\0")
+            digest.update(len(path_bytes).to_bytes(8, "big"))
+            digest.update(path_bytes)
+            digest.update(stat.S_IFMT(mode).to_bytes(4, "big"))
+            digest.update((mode & 0o7777).to_bytes(4, "big"))
+
+            if stat.S_ISREG(mode):
+                digest.update(b"F")
+                digest.update(entry_stat.st_size.to_bytes(8, "big", signed=False))
+                nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+                if not isinstance(nofollow_flag, int):
+                    raise WorkspaceVerificationError(
+                        "untracked files cannot be opened safely on this platform"
+                    )
+                flags = os.O_RDONLY | nofollow_flag
+                try:
+                    descriptor = os.open(
+                        name,
+                        flags,
+                        dir_fd=parent_descriptor,
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    raise WorkspaceVerificationError(
+                        "untracked file could not be opened without following links"
+                    ) from exc
+                try:
+                    opened_stat = os.fstat(descriptor)
+                    if not WorkspaceVerifier._same_entry(entry_stat, opened_stat):
+                        raise WorkspaceVerificationError(
+                            "untracked file changed while it was being inspected"
+                        )
+                    with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                        while True:
+                            chunk = stream.read(_PIPE_READ_SIZE)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                        descriptor = -1
+                    final_stat = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not WorkspaceVerifier._same_entry(entry_stat, final_stat):
+                        raise WorkspaceVerificationError(
+                            "untracked file changed while it was being inspected"
+                        )
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                return
+
+            if stat.S_ISLNK(mode):
+                digest.update(b"L")
+                try:
+                    target = os.readlink(name, dir_fd=parent_descriptor)
+                    target_again = os.readlink(name, dir_fd=parent_descriptor)
+                    final_stat = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except (OSError, TypeError, ValueError) as exc:
+                    raise WorkspaceVerificationError(
+                        "untracked symlink could not be inspected safely"
+                    ) from exc
+                if target != target_again or not WorkspaceVerifier._same_entry(
+                    entry_stat, final_stat
+                ):
+                    raise WorkspaceVerificationError(
+                        "untracked symlink changed while it was being inspected"
+                    )
+                if isinstance(target, str):
+                    target = target.encode("utf-8", errors="surrogateescape")
+                digest.update(len(target).to_bytes(8, "big"))
+                digest.update(target)
+                return
+
+            if stat.S_ISDIR(mode):
+                digest.update(b"D")
+                final_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if not WorkspaceVerifier._same_entry(entry_stat, final_stat):
+                    raise WorkspaceVerificationError(
+                        "untracked directory changed while it was being inspected"
+                    )
+                return
+
+            raise WorkspaceVerificationError(
+                "special untracked workspace entries are not permitted"
+            )
+        except WorkspaceVerificationError:
+            raise
+        except (OSError, TypeError, ValueError) as exc:
             raise WorkspaceVerificationError(
                 "untracked workspace entry could not be inspected safely"
             ) from exc
-
-        path_bytes = relative_path.as_posix().encode(
-            "utf-8", errors="surrogateescape"
-        )
-        mode = entry_stat.st_mode
-        digest.update(b"\0KORA-UNTRACKED\0")
-        digest.update(len(path_bytes).to_bytes(8, "big"))
-        digest.update(path_bytes)
-        digest.update(stat.S_IFMT(mode).to_bytes(4, "big"))
-        digest.update((mode & 0o7777).to_bytes(4, "big"))
-
-        if stat.S_ISREG(mode):
-            digest.update(b"F")
-            digest.update(entry_stat.st_size.to_bytes(8, "big", signed=False))
-            flags = os.O_RDONLY
-            flags |= getattr(os, "O_NOFOLLOW", 0)
+        finally:
             try:
-                descriptor = os.open(candidate, flags)
+                os.close(parent_descriptor)
             except OSError as exc:
                 raise WorkspaceVerificationError(
-                    "untracked file could not be opened without following links"
+                    "workspace descriptor could not be closed safely"
                 ) from exc
-            try:
-                opened_stat = os.fstat(descriptor)
-                if (
-                    opened_stat.st_dev != entry_stat.st_dev
-                    or opened_stat.st_ino != entry_stat.st_ino
-                    or opened_stat.st_size != entry_stat.st_size
-                    or stat.S_IFMT(opened_stat.st_mode) != stat.S_IFMT(mode)
-                    or (opened_stat.st_mode & 0o7777) != (mode & 0o7777)
-                ):
-                    raise WorkspaceVerificationError(
-                        "untracked file changed while it was being inspected"
-                    )
-                with os.fdopen(descriptor, "rb", closefd=True) as stream:
-                    while True:
-                        chunk = stream.read(_PIPE_READ_SIZE)
-                        if not chunk:
-                            break
-                        digest.update(chunk)
-                    descriptor = -1
-                final_stat = os.stat(candidate, follow_symlinks=False)
-                if (
-                    final_stat.st_dev != entry_stat.st_dev
-                    or final_stat.st_ino != entry_stat.st_ino
-                    or final_stat.st_size != entry_stat.st_size
-                    or (final_stat.st_mode & 0o7777) != (mode & 0o7777)
-                ):
-                    raise WorkspaceVerificationError(
-                        "untracked file changed while it was being inspected"
-                    )
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-            return
 
-        if stat.S_ISLNK(mode):
-            digest.update(b"L")
-            try:
-                target = os.readlink(os.fsencode(candidate))
-            except OSError as exc:
-                raise WorkspaceVerificationError(
-                    "untracked symlink could not be inspected safely"
-                ) from exc
-            if isinstance(target, str):
-                target = target.encode("utf-8", errors="surrogateescape")
-            digest.update(len(target).to_bytes(8, "big"))
-            digest.update(target)
-            return
-
-        if stat.S_ISDIR(mode):
-            digest.update(b"D")
-            return
-
-        raise WorkspaceVerificationError(
-            "special untracked workspace entries are not permitted"
+    @staticmethod
+    def _same_entry(first: os.stat_result, second: os.stat_result) -> bool:
+        return (
+            first.st_dev == second.st_dev
+            and first.st_ino == second.st_ino
+            and stat.S_IFMT(first.st_mode) == stat.S_IFMT(second.st_mode)
+            and (first.st_mode & 0o7777) == (second.st_mode & 0o7777)
+            and first.st_size == second.st_size
         )
 
-    def _validate_workspace(self, workspace_value: Path) -> tuple[Path, Path]:
-        try:
-            workspace = Path(workspace_value).expanduser().resolve(strict=True)
-        except (TypeError, OSError, RuntimeError, ValueError) as exc:
+    def _validate_workspace(
+        self,
+        workspace_value: Path,
+        workspace_identity: WorkspaceIdentity | None,
+    ) -> tuple[Path, Path, WorkspaceIdentity]:
+        if not isinstance(workspace_identity, WorkspaceIdentity):
             raise WorkspaceVerificationError(
-                "workspace must resolve to an existing directory"
-            ) from exc
-        if not workspace.is_dir():
-            raise WorkspaceVerificationError(
-                f"workspace is not a directory: {workspace}"
+                "workspace identity is required for safe verification"
             )
+        try:
+            workspace_identity.assert_path(workspace_value)
+        except WorkspaceIdentityError as exc:
+            raise WorkspaceVerificationError(
+                "workspace no longer resolves to its authorized identity"
+            ) from exc
+        workspace = workspace_identity.canonical_path
         try:
             relative_workspace = workspace.relative_to(self.cloud_root)
         except ValueError as exc:
             raise WorkspaceVerificationError(
                 f"workspace is outside Kora cloud root: {workspace}"
             ) from exc
-        return workspace, relative_workspace
+        return workspace, relative_workspace, workspace_identity
 
     def _run_process(
         self,
@@ -906,21 +1121,27 @@ class WorkspaceVerifier:
         stdout_limit: int | None,
         stderr_limit: int | None,
         stream_digest: Any = None,
+        workspace_identity: WorkspaceIdentity,
         live_fence_validator: Callable[..., object] | None = None,
     ) -> _ProcessResult:
         started = time.monotonic()
         try:
-            self._validate_live_fence(live_fence_validator)
-            process = subprocess.Popen(
-                list(argv),
-                cwd=workspace,
-                env=dict(environment),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-            )
-        except (OSError, ValueError, WorkspaceVerificationError) as exc:
+            with workspace_identity.open_descriptor() as descriptor:
+                spawn_kwargs = descriptor_cwd_kwargs(descriptor)
+                # This validation is deliberately the last operation before
+                # the subprocess spawn.  The descriptor is already bound and
+                # verified, so no pathname lookup remains in the effect path.
+                self._validate_live_fence(live_fence_validator)
+                process = subprocess.Popen(
+                    list(argv),
+                    env=dict(environment),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    **spawn_kwargs,
+                )
+        except (OSError, ValueError, WorkspaceVerificationError, WorkspaceIdentityError) as exc:
             return _ProcessResult(
                 exit_code=None,
                 stdout="",

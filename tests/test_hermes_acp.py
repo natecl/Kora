@@ -10,8 +10,13 @@ from unittest.mock import AsyncMock, patch
 
 import acp.schema as schema
 
+from kora._workspace import WorkspaceIdentity
 from kora.runtime import Capability, HermesACPRuntimeAdapter, RuntimeJob
-from kora.runtime.hermes_acp import ACPPermissionRequest, _KoraACPClient
+from kora.runtime.hermes_acp import (
+    ACPPermissionRequest,
+    _KoraACPClient,
+    _spawn_descriptor_bound_agent_process,
+)
 
 
 def _job(workspace: Path, **overrides: object) -> RuntimeJob:
@@ -135,6 +140,58 @@ class KoraACPClientTests(unittest.TestCase):
 
 
 class HermesACPRuntimeAdapterTests(unittest.TestCase):
+    def test_spawn_helper_binds_cwd_to_verified_descriptor(self) -> None:
+        class FakeStdin:
+            def __init__(self) -> None:
+                self.write_eof = unittest.mock.Mock()
+                self.drain = AsyncMock()
+                self.close = unittest.mock.Mock()
+                self.wait_closed = AsyncMock()
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdin = FakeStdin()
+                self.stdout = object()
+                self.wait = AsyncMock(return_value=None)
+                self.kill = unittest.mock.Mock()
+                self.terminate = unittest.mock.Mock()
+
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            identity = WorkspaceIdentity.capture(root)
+            process = FakeProcess()
+            connection = SimpleNamespace(close=AsyncMock())
+            fence_calls: list[str] = []
+
+            async def exercise() -> None:
+                async with _spawn_descriptor_bound_agent_process(
+                    object(),
+                    "/usr/bin/true",
+                    "acp",
+                    workspace_identity=identity,
+                    environment={},
+                    before_spawn=lambda: fence_calls.append("validated"),
+                ) as (actual_connection, actual_process):
+                    self.assertIs(actual_connection, connection)
+                    self.assertIs(actual_process, process)
+
+            with patch(
+                "kora.runtime.hermes_acp.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=process),
+            ) as spawn, patch(
+                "kora.runtime.hermes_acp.acp.connect_to_agent",
+                return_value=connection,
+            ):
+                asyncio.run(exercise())
+
+            self.assertEqual(fence_calls, ["validated"])
+            kwargs = spawn.await_args.kwargs
+            self.assertIsNone(kwargs["cwd"])
+            self.assertEqual(len(kwargs["pass_fds"]), 1)
+            self.assertTrue(callable(kwargs["preexec_fn"]))
+            process.wait.assert_awaited_once()
+            connection.close.assert_awaited_once()
+
     def test_uses_new_session_and_returns_server_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as root_dir:
             root = Path(root_dir)
@@ -144,7 +201,7 @@ class HermesACPRuntimeAdapterTests(unittest.TestCase):
                 hermes_executable="/usr/bin/true",
             )
             with patch(
-                "kora.runtime.hermes_acp.acp.spawn_agent_process",
+                "kora.runtime.hermes_acp._spawn_descriptor_bound_agent_process",
                 return_value=_FakeACPContext(connection),
             ) as spawn:
                 result = asyncio.run(adapter.run_async(_job(root)))
@@ -171,7 +228,7 @@ class HermesACPRuntimeAdapterTests(unittest.TestCase):
                 hermes_executable="/usr/bin/true",
             )
             with patch(
-                "kora.runtime.hermes_acp.acp.spawn_agent_process",
+                "kora.runtime.hermes_acp._spawn_descriptor_bound_agent_process",
                 return_value=_FakeACPContext(connection),
             ):
                 result = asyncio.run(
@@ -210,12 +267,12 @@ class HermesACPRuntimeAdapterTests(unittest.TestCase):
                 clear=False,
             ):
                 with patch(
-                    "kora.runtime.hermes_acp.acp.spawn_agent_process",
+                    "kora.runtime.hermes_acp._spawn_descriptor_bound_agent_process",
                     return_value=_FakeACPContext(connection),
                 ) as spawn:
                     asyncio.run(adapter.run_async(_job(root)))
 
-            environment = spawn.call_args.kwargs["env"]
+            environment = spawn.call_args.kwargs["environment"]
             self.assertNotIn("KORA_HOST_SECRET", environment)
             self.assertEqual(environment["HERMES_API_KEY"], "explicit-secret")
             self.assertEqual(

@@ -14,6 +14,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from kora._workspace import WorkspaceIdentity, WorkspaceIdentityError
 from kora._process_local import attach as attach_process_local
 from kora._process_local import get as get_process_local
 from kora._process_local import invoke as invoke_process_local
@@ -196,6 +197,12 @@ class RuntimeJob:
     session_id: str | None = None
     execution_fence: ExecutionFenceTicket | None = None
     live_fence_validator: InitVar[Callable[..., object] | None] = None
+    _workspace_identity: WorkspaceIdentity | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
 
     def __post_init__(
         self,
@@ -209,19 +216,40 @@ class RuntimeJob:
             )
         if live_fence_validator is not None:
             attach_process_local(self, live_fence_validator)
+        provided_identity = self._workspace_identity
+        if provided_identity is not None and not isinstance(
+            provided_identity, WorkspaceIdentity
+        ):
+            raise RuntimeContractError(
+                "_workspace_identity must be a WorkspaceIdentity or None"
+            )
         try:
-            workspace = Path(self.workspace).expanduser()
-            if workspace.exists():
-                object.__setattr__(
-                    self,
-                    "workspace",
-                    workspace.resolve(strict=True),
-                )
-        except (OSError, RuntimeError, TypeError, ValueError):
+            if provided_identity is None:
+                identity = WorkspaceIdentity.capture(self.workspace)
+            else:
+                provided_identity.assert_path(self.workspace)
+                identity = provided_identity
+        except WorkspaceIdentityError as exc:
+            if provided_identity is not None:
+                raise RuntimeContractError(
+                    "workspace identity could not be carried safely"
+                ) from exc
             # The adapter owns the final error for a missing/non-directory
             # workspace.  Existing directories are bound to their real target
-            # here so a later alias retarget cannot redirect this job.
-            pass
+            # here when the private descriptor primitive is available.
+            try:
+                workspace = Path(self.workspace).expanduser()
+                if workspace.exists():
+                    object.__setattr__(
+                        self,
+                        "workspace",
+                        workspace.resolve(strict=True),
+                    )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+        else:
+            object.__setattr__(self, "workspace", identity.canonical_path)
+            object.__setattr__(self, "_workspace_identity", identity)
         if isinstance(self.timeout_seconds, bool) or not isinstance(
             self.timeout_seconds, (int, float)
         ):

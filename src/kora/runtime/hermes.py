@@ -22,6 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from kora._workspace import (
+    WorkspaceIdentity,
+    WorkspaceIdentityError,
+    descriptor_cwd_kwargs,
+)
 from kora.runtime.contracts import (
     Capability,
     IsolationMode,
@@ -144,7 +149,12 @@ class HermesRuntimeAdapter:
     def run(self, job: RuntimeJob) -> RuntimeResult:
         """Run one task after Kora validates workspace and authority scope."""
 
-        workspace = self._validate_job(job)
+        self._validate_job(job)
+        workspace_identity = job._workspace_identity
+        if workspace_identity is None:
+            raise HermesRuntimeError(
+                "Workspace identity is unavailable for effect-bearing execution"
+            )
         executable = self._resolve_executable()
         envelope = self._build_prompt(job)
 
@@ -168,24 +178,33 @@ class HermesRuntimeAdapter:
             # stop/wait and lease-expiry window immediately before Hermes can
             # create effects.
             try:
-                job.validate_execution_fence()
+                with workspace_identity.open_descriptor() as descriptor:
+                    spawn_kwargs = descriptor_cwd_kwargs(descriptor)
+                    # Keep the process-local fence check immediately before
+                    # the descriptor-bound spawn; no workspace pathname is
+                    # resolved by the effect-bearing subprocess.
+                    job.validate_execution_fence()
+                    completed = subprocess.run(
+                        command,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=job.timeout_seconds,
+                        check=False,
+                        **spawn_kwargs,
+                    )
+            except WorkspaceIdentityError as exc:
+                raise HermesRuntimeError(
+                    "Workspace identity changed before Hermes launch"
+                ) from exc
             except Exception as exc:  # noqa: BLE001 - adapter boundary
                 if isinstance(exc, HermesRuntimeError):
                     raise
                 raise HermesRuntimeError(
                     "Kora execution fence rejected Hermes launch"
                 ) from exc
-            completed = subprocess.run(
-                command,
-                cwd=workspace,
-                env=environment,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=job.timeout_seconds,
-                check=False,
-            )
             usage = self._read_usage(usage_path)
 
         response = completed.stdout.strip()
@@ -241,10 +260,25 @@ class HermesRuntimeAdapter:
 
         try:
             workspace = job.workspace.expanduser().resolve(strict=True)
-        except (OSError, RuntimeError, TypeError) as exc:
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
             raise HermesRuntimeError("Workspace must resolve to an existing directory") from exc
         if not workspace.is_dir():
             raise HermesRuntimeError(f"Workspace is not a directory: {workspace}")
+        workspace_identity = job._workspace_identity
+        if not isinstance(workspace_identity, WorkspaceIdentity):
+            raise HermesRuntimeError(
+                "Workspace identity is unavailable for effect-bearing execution"
+            )
+        try:
+            workspace_identity.assert_path(workspace)
+        except WorkspaceIdentityError as exc:
+            raise HermesRuntimeError(
+                "Workspace no longer resolves to its authorized identity"
+            ) from exc
+        if workspace_identity.canonical_path != workspace:
+            raise HermesRuntimeError(
+                "Workspace no longer resolves to its authorized identity"
+            )
         try:
             workspace.relative_to(self.cloud_root)
         except ValueError as exc:

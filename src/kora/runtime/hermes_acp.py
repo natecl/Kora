@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, AsyncIterator, Mapping
 
 import acp
 import acp.schema as schema
 
 from kora import __version__
+from kora._workspace import (
+    WorkspaceIdentity,
+    descriptor_cwd_kwargs,
+)
 from kora.runtime.contracts import (
     RuntimeContractError,
     RuntimeJob,
@@ -39,6 +44,71 @@ class ACPPermissionRequest:
 
 
 PermissionResolver = Callable[[ACPPermissionRequest], str | None]
+
+
+@asynccontextmanager
+async def _spawn_descriptor_bound_agent_process(
+    client: Any,
+    executable: str,
+    *arguments: str,
+    workspace_identity: WorkspaceIdentity,
+    environment: Mapping[str, str],
+    before_spawn: Callable[[], object] | None = None,
+) -> AsyncIterator[tuple[Any, asyncio.subprocess.Process]]:
+    """Spawn ACP with a descriptor-bound cwd and bounded handle lifetime."""
+
+    with workspace_identity.open_descriptor() as descriptor:
+        spawn_kwargs = descriptor_cwd_kwargs(descriptor)
+        if before_spawn is not None:
+            before_spawn()
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            *arguments,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=dict(environment),
+            **spawn_kwargs,
+        )
+
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("descriptor-bound ACP launch requires stdio pipes")
+
+    connection: Any | None = None
+    try:
+        connection = acp.connect_to_agent(
+            client,
+            process.stdin,
+            process.stdout,
+            use_unstable_protocol=True,
+        )
+        yield connection, process
+    finally:
+        if connection is not None:
+            with suppress(Exception):
+                await connection.close()
+        if process.stdin is not None:
+            try:
+                process.stdin.write_eof()
+            except (AttributeError, OSError, RuntimeError):
+                process.stdin.close()
+            with suppress(Exception):
+                await process.stdin.drain()
+            with suppress(Exception):
+                process.stdin.close()
+            with suppress(Exception):
+                await process.stdin.wait_closed()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
 
 
 class _KoraACPClient:
@@ -200,6 +270,9 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
 
     async def run_async(self, job: RuntimeJob) -> RuntimeResult:
         workspace = self._validate_job(job)
+        workspace_identity = job._workspace_identity
+        if not isinstance(workspace_identity, WorkspaceIdentity):
+            raise RuntimeError("Workspace identity is unavailable for ACP launch")
         executable = self._resolve_executable()
         prompt = self._build_prompt(job)
         client = _KoraACPClient(
@@ -216,14 +289,13 @@ class HermesACPRuntimeAdapter(HermesRuntimeAdapter):
             # creation; setup-time validation cannot close a stop/wait race.
             job.validate_execution_fence()
             async with asyncio.timeout(job.timeout_seconds):
-                async with acp.spawn_agent_process(
+                async with _spawn_descriptor_bound_agent_process(
                     client,
                     executable,
                     "acp",
-                    cwd=workspace,
-                    env=environment,
-                    transport_kwargs={"stderr": asyncio.subprocess.DEVNULL},
-                    use_unstable_protocol=True,
+                    workspace_identity=workspace_identity,
+                    environment=environment,
+                    before_spawn=job.validate_execution_fence,
                 ) as (connection, _process):
                     job.validate_execution_fence()
                     await connection.initialize(

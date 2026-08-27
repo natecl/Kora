@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Iterable, Mapping
 from uuid import uuid4
@@ -11,6 +12,7 @@ from uuid import uuid4
 from kora.mission.domain import (
     Artifact,
     ArtifactKind,
+    AttemptStatus,
     Assumption,
     AssumptionStatus,
     Checkpoint,
@@ -28,6 +30,7 @@ from kora.mission.domain import (
     PermissionGrant,
     PermissionMode,
     Task,
+    TaskAttempt,
     TaskDependency,
     TaskStatus,
     normalize_timestamp,
@@ -122,6 +125,42 @@ TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
 }
 
 
+ATTEMPT_TRANSITIONS: Mapping[AttemptStatus, frozenset[AttemptStatus]] = {
+    AttemptStatus.CREATED: frozenset(
+        {AttemptStatus.RUNNING, AttemptStatus.INTERRUPTED}
+    ),
+    AttemptStatus.RUNNING: frozenset(
+        {
+            AttemptStatus.VERIFYING,
+            AttemptStatus.FAILED,
+            AttemptStatus.INTERRUPTED,
+            AttemptStatus.UNKNOWN,
+        }
+    ),
+    AttemptStatus.VERIFYING: frozenset(
+        {
+            AttemptStatus.SUCCEEDED,
+            AttemptStatus.FAILED,
+            AttemptStatus.INTERRUPTED,
+            AttemptStatus.UNKNOWN,
+        }
+    ),
+    AttemptStatus.SUCCEEDED: frozenset(),
+    AttemptStatus.FAILED: frozenset(),
+    AttemptStatus.INTERRUPTED: frozenset(),
+    AttemptStatus.UNKNOWN: frozenset(
+        {
+            AttemptStatus.VERIFYING,
+            AttemptStatus.FAILED,
+            AttemptStatus.INTERRUPTED,
+        }
+    ),
+}
+
+
+_DEFAULT_ATTEMPT_LEASE_SECONDS = 60.0
+
+
 @dataclass(frozen=True, slots=True)
 class MissionStatusReport:
     """A semantic, deterministic snapshot suitable for a headless caller."""
@@ -148,6 +187,15 @@ def _coerce_task_status(value: TaskStatus | str) -> TaskStatus:
         return TaskStatus(value)
     except (TypeError, ValueError) as exc:
         raise ValidationError(f"unknown task status: {value!r}") from exc
+
+
+def _coerce_attempt_status(value: AttemptStatus | str) -> AttemptStatus:
+    if isinstance(value, AttemptStatus):
+        return value
+    try:
+        return AttemptStatus(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"unknown attempt status: {value!r}") from exc
 
 
 def _coerce_escalation_status(value: EscalationStatus | str) -> EscalationStatus:
@@ -283,9 +331,34 @@ class MissionService:
         return self.transition_mission(mission_id, MissionState.WAITING_FOR_USER, at=at)
 
     def begin_verification(
-        self, mission_id: str, *, at: datetime | None = None
-    ) -> Mission:
-        return self.transition_mission(mission_id, MissionState.VERIFYING, at=at)
+        self,
+        mission_id: str,
+        *,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> Mission | TaskAttempt:
+        # The mission API historically owns this name.  Attempt verification
+        # uses the same domain vocabulary, so dispatch an attempt ID to the
+        # explicit attempt operation while preserving existing mission calls.
+        if (
+            self.store.get_mission(mission_id) is None
+            and self.store.get_attempt(mission_id) is not None
+        ):
+            return self.begin_attempt_verification(
+                mission_id,
+                lease_owner=lease_owner,
+                fencing_token=fencing_token,
+                expected_revision=expected_revision,
+                at=at,
+            )
+        return self.transition_mission(
+            mission_id,
+            MissionState.VERIFYING,
+            expected_revision=expected_revision,
+            at=at,
+        )
 
     def complete_mission(
         self, mission_id: str, *, at: datetime | None = None
@@ -338,6 +411,540 @@ class MissionService:
         task = self.store.require_task(task_id)
         self._require_owned_mission(task.mission_id)
         return task
+
+    # Durable execution attempts ------------------------------------------
+
+    def create_attempt(
+        self,
+        mission_id: str,
+        task_id: str,
+        idempotency_key: str,
+        *,
+        worker_role_id: str,
+        route_id: str,
+        quality_floor: float = 0.0,
+        attempt_id: str | None = None,
+        created_at: datetime | None = None,
+    ) -> TaskAttempt:
+        """Create or idempotently retrieve one attempt for a task.
+
+        The role and route values are opaque private identifiers.  They are
+        persisted for the coordinator but are intentionally absent from the
+        semantic mission status projection and attempt audit payloads.
+        """
+
+        timestamp = normalize_timestamp(created_at or utc_now())
+        with self.store.transaction(immediate=True):
+            mission = self._require_owned_mission(mission_id)
+            self._ensure_mission_accepts_work(mission)
+            task = self.store.require_task(task_id)
+            if task.mission_id != mission_id:
+                raise ConflictError("attempt task belongs to another mission")
+            requested = TaskAttempt(
+                attempt_id=attempt_id or self._new_id("attempt"),
+                mission_id=mission_id,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+                worker_role_id=worker_role_id,
+                route_id=route_id,
+                quality_floor=quality_floor,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            existing = self.store.get_attempt_by_idempotency(
+                mission_id, task_id, idempotency_key
+            )
+            if existing is not None:
+                if attempt_id is not None and existing.attempt_id != attempt_id:
+                    raise ConflictError(
+                        "attempt idempotency key is bound to another attempt ID"
+                    )
+                self._ensure_attempt_scope_matches(existing, requested)
+                return existing
+            self.store.create_attempt(requested)
+            self._record_event(
+                mission_id=mission_id,
+                event_type=EventType.ATTEMPT_CREATED,
+                entity_id=requested.attempt_id,
+                payload={
+                    "status": requested.status.value,
+                    "quality_floor": requested.quality_floor,
+                },
+                created_at=timestamp,
+            )
+            return requested
+
+    def get_attempt(self, attempt_id: str) -> TaskAttempt:
+        return self._require_owned_attempt(attempt_id)
+
+    def list_attempts(
+        self,
+        mission_id: str,
+        task_id: str | None = None,
+        status: AttemptStatus | str | None = None,
+    ) -> list[TaskAttempt]:
+        self._require_owned_mission(mission_id)
+        if task_id is not None:
+            self._ensure_task_belongs_to_mission(task_id, mission_id)
+        attempt_status = (
+            _coerce_attempt_status(status) if status is not None else None
+        )
+        return self.store.list_attempts(mission_id, task_id, attempt_status)
+
+    def claim_attempt(
+        self,
+        attempt_id: str,
+        lease_owner: str,
+        *,
+        lease_expires_at: datetime | None = None,
+        lease_ttl_seconds: float | int | None = None,
+        lease_seconds: float | int | None = None,
+        lease_duration_seconds: float | int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        """Claim a created attempt or reclaim an expired running lease."""
+
+        timestamp = normalize_timestamp(at or utc_now())
+        owner = self._validate_lease_owner(lease_owner)
+        expiry = self._resolve_lease_expiry(
+            timestamp,
+            lease_expires_at=lease_expires_at,
+            lease_ttl_seconds=lease_ttl_seconds,
+            lease_seconds=lease_seconds,
+            lease_duration_seconds=lease_duration_seconds,
+        )
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            self._check_expected_attempt_revision(current, expected_revision)
+            reclaimed = False
+            if current.status is AttemptStatus.CREATED:
+                if current.lease_owner is not None:
+                    raise ConflictError(
+                        f"created attempt already has a lease: {attempt_id}"
+                    )
+            elif current.status is AttemptStatus.RUNNING:
+                if current.lease_expires_at is None:
+                    raise ConflictError(
+                        f"running attempt has no lease expiry: {attempt_id}"
+                    )
+                if current.lease_expires_at > timestamp:
+                    raise ConflictError(f"attempt lease is still active: {attempt_id}")
+                reclaimed = True
+            else:
+                self._validate_attempt_transition(
+                    current.status, AttemptStatus.RUNNING
+                )
+            competing = self.store.get_live_attempt(current.task_id)
+            if competing is not None and competing.attempt_id != current.attempt_id:
+                if competing.has_active_lease(timestamp):
+                    raise ConflictError(
+                        f"task has an active competing attempt lease: {current.task_id}"
+                    )
+                raise ConflictError(
+                    f"task already has a competing live attempt: {current.task_id}"
+                )
+            updated = self.store.update_attempt(
+                replace(
+                    current,
+                    status=AttemptStatus.RUNNING,
+                    lease_owner=owner,
+                    lease_expires_at=expiry,
+                    fencing_token=current.fencing_token + 1,
+                    updated_at=timestamp,
+                    started_at=current.started_at or timestamp,
+                    finished_at=None,
+                ),
+                expected_revision=current.revision,
+                _allow_status_change=True,
+            )
+            self._record_event(
+                mission_id=updated.mission_id,
+                event_type=EventType.ATTEMPT_TRANSITIONED,
+                entity_id=updated.attempt_id,
+                payload={
+                    "from": current.status.value,
+                    "to": updated.status.value,
+                    "reclaimed": reclaimed,
+                    "revision": updated.revision,
+                },
+                created_at=timestamp,
+            )
+            return updated
+
+    def renew_lease(
+        self,
+        attempt_id: str,
+        lease_owner: str,
+        fencing_token: int,
+        *,
+        lease_expires_at: datetime | None = None,
+        lease_ttl_seconds: float | int | None = None,
+        lease_seconds: float | int | None = None,
+        lease_duration_seconds: float | int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        """Extend a running lease only when owner and fencing token match."""
+
+        timestamp = normalize_timestamp(at or utc_now())
+        owner = self._validate_lease_owner(lease_owner)
+        token = self._validate_fencing_token(fencing_token)
+        expiry = self._resolve_lease_expiry(
+            timestamp,
+            lease_expires_at=lease_expires_at,
+            lease_ttl_seconds=lease_ttl_seconds,
+            lease_seconds=lease_seconds,
+            lease_duration_seconds=lease_duration_seconds,
+        )
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            self._check_expected_attempt_revision(current, expected_revision)
+            if current.status is not AttemptStatus.RUNNING:
+                raise InvalidTransitionError(
+                    f"only running attempts can renew a lease: {attempt_id}"
+                )
+            self._check_attempt_fence(
+                current,
+                owner,
+                token,
+                at=timestamp,
+                require_active_lease=True,
+            )
+            updated = self.store.update_attempt(
+                replace(current, lease_expires_at=expiry, updated_at=timestamp),
+                expected_revision=current.revision,
+            )
+            self._record_event(
+                mission_id=updated.mission_id,
+                event_type=EventType.ATTEMPT_LEASE_RENEWED,
+                entity_id=updated.attempt_id,
+                payload={"revision": updated.revision},
+                created_at=timestamp,
+            )
+            return updated
+
+    def begin_attempt_verification(
+        self,
+        attempt_id: str,
+        *,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        timestamp = normalize_timestamp(at or utc_now())
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            if current.status is not AttemptStatus.RUNNING:
+                raise InvalidTransitionError(
+                    f"only running attempts can begin verification: {attempt_id}"
+                )
+            if current.status is AttemptStatus.RUNNING and not current.has_active_lease(
+                timestamp
+            ):
+                raise ConflictError(
+                    f"attempt lease is no longer active: {current.attempt_id}"
+                )
+            self._check_attempt_fence(
+                current,
+                lease_owner,
+                fencing_token,
+                at=timestamp,
+                require_active_lease=current.status is AttemptStatus.RUNNING,
+            )
+            return self._transition_attempt_in_transaction(
+                current,
+                AttemptStatus.VERIFYING,
+                at=timestamp,
+                expected_revision=expected_revision,
+            )
+
+    def succeed_attempt(
+        self,
+        attempt_id: str,
+        *,
+        result_summary: str | None = None,
+        total_tokens: int | None = None,
+        estimated_cost_usd: float | None = None,
+        latency_ms: int | None = None,
+        accepted: bool = True,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        if accepted is not True:
+            raise ValidationError("succeeded attempts require accepted=True")
+        timestamp = normalize_timestamp(at or utc_now())
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            if current.status is not AttemptStatus.VERIFYING:
+                raise InvalidTransitionError(
+                    f"only verifying attempts can succeed: {attempt_id}"
+                )
+            self._check_attempt_fence(
+                current,
+                lease_owner,
+                fencing_token,
+                at=timestamp,
+                require_active_lease=current.status is AttemptStatus.RUNNING,
+            )
+            return self._transition_attempt_in_transaction(
+                current,
+                AttemptStatus.SUCCEEDED,
+                at=timestamp,
+                expected_revision=expected_revision,
+                result_summary=(
+                    current.result_summary
+                    if result_summary is None
+                    else result_summary
+                ),
+                total_tokens=(
+                    current.total_tokens if total_tokens is None else total_tokens
+                ),
+                estimated_cost_usd=(
+                    current.estimated_cost_usd
+                    if estimated_cost_usd is None
+                    else estimated_cost_usd
+                ),
+                latency_ms=current.latency_ms if latency_ms is None else latency_ms,
+                accepted=True,
+                lease_owner=None,
+                lease_expires_at=None,
+                finished_at=timestamp,
+            )
+
+    def fail_attempt(
+        self,
+        attempt_id: str,
+        *,
+        error_summary: str | None = None,
+        result_summary: str | None = None,
+        total_tokens: int | None = None,
+        estimated_cost_usd: float | None = None,
+        latency_ms: int | None = None,
+        accepted: bool = False,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        if accepted is not False:
+            raise ValidationError("failed attempts require accepted=False")
+        timestamp = normalize_timestamp(at or utc_now())
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            if current.status not in {
+                AttemptStatus.RUNNING,
+                AttemptStatus.VERIFYING,
+            }:
+                raise InvalidTransitionError(
+                    f"only running or verifying attempts can fail: {attempt_id}"
+                )
+            if current.status is AttemptStatus.RUNNING and not current.has_active_lease(
+                timestamp
+            ):
+                raise ConflictError(
+                    f"attempt lease is no longer active: {current.attempt_id}"
+                )
+            self._check_attempt_fence(
+                current,
+                lease_owner,
+                fencing_token,
+                at=timestamp,
+                require_active_lease=current.status is AttemptStatus.RUNNING,
+            )
+            return self._transition_attempt_in_transaction(
+                current,
+                AttemptStatus.FAILED,
+                at=timestamp,
+                expected_revision=expected_revision,
+                result_summary=(
+                    current.result_summary
+                    if result_summary is None
+                    else result_summary
+                ),
+                error_summary=(
+                    current.error_summary
+                    if error_summary is None
+                    else error_summary
+                ),
+                total_tokens=(
+                    current.total_tokens if total_tokens is None else total_tokens
+                ),
+                estimated_cost_usd=(
+                    current.estimated_cost_usd
+                    if estimated_cost_usd is None
+                    else estimated_cost_usd
+                ),
+                latency_ms=current.latency_ms if latency_ms is None else latency_ms,
+                accepted=False,
+                lease_owner=None,
+                lease_expires_at=None,
+                finished_at=timestamp,
+            )
+
+    def interrupt_attempt(
+        self,
+        attempt_id: str,
+        *,
+        reason: str | None = None,
+        error_summary: str | None = None,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        if reason is not None and error_summary is not None and reason != error_summary:
+            raise ValidationError("reason and error_summary must match when both given")
+        timestamp = normalize_timestamp(at or utc_now())
+        summary = error_summary if error_summary is not None else reason
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            self._check_attempt_fence(
+                current,
+                lease_owner,
+                fencing_token,
+                at=timestamp,
+                require_active_lease=current.status is AttemptStatus.RUNNING,
+            )
+            return self._transition_attempt_in_transaction(
+                current,
+                AttemptStatus.INTERRUPTED,
+                at=timestamp,
+                expected_revision=expected_revision,
+                error_summary=(
+                    current.error_summary if summary is None else summary
+                ),
+                accepted=None,
+                lease_owner=None,
+                lease_expires_at=None,
+                finished_at=timestamp,
+            )
+
+    def mark_expired_attempt_unknown(
+        self,
+        attempt_id: str,
+        *,
+        reason: str | None = None,
+        error_summary: str | None = None,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        if reason is not None and error_summary is not None and reason != error_summary:
+            raise ValidationError("reason and error_summary must match when both given")
+        timestamp = normalize_timestamp(at or utc_now())
+        summary = error_summary if error_summary is not None else reason
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            self._check_expected_attempt_revision(current, expected_revision)
+            if current.status not in {
+                AttemptStatus.RUNNING,
+                AttemptStatus.VERIFYING,
+            }:
+                raise InvalidTransitionError(
+                    f"only running or verifying attempts can expire to unknown: "
+                    f"{attempt_id}"
+                )
+            if current.lease_expires_at is None:
+                raise ConflictError(f"running attempt has no lease expiry: {attempt_id}")
+            if current.lease_expires_at > timestamp:
+                raise ConflictError(f"attempt lease is still active: {attempt_id}")
+            self._check_attempt_fence(
+                current,
+                lease_owner,
+                fencing_token,
+                at=timestamp,
+                require_active_lease=False,
+            )
+            return self._transition_attempt_in_transaction(
+                current,
+                AttemptStatus.UNKNOWN,
+                at=timestamp,
+                expected_revision=current.revision,
+                error_summary=(
+                    current.error_summary
+                    if summary is None
+                    else summary
+                ),
+                lease_owner=None,
+                lease_expires_at=None,
+            )
+
+    def reconcile_unknown(
+        self,
+        attempt_id: str,
+        target: AttemptStatus | str | None = None,
+        *,
+        status: AttemptStatus | str | None = None,
+        reason: str | None = None,
+        error_summary: str | None = None,
+        result_summary: str | None = None,
+        total_tokens: int | None = None,
+        estimated_cost_usd: float | None = None,
+        latency_ms: int | None = None,
+        expected_revision: int | None = None,
+        at: datetime | None = None,
+    ) -> TaskAttempt:
+        if target is not None and status is not None:
+            if _coerce_attempt_status(target) is not _coerce_attempt_status(status):
+                raise ValidationError("target and status must match when both given")
+        target_value = target if target is not None else status
+        if target_value is None:
+            raise ValidationError("reconcile_unknown requires a target status")
+        target_status = _coerce_attempt_status(target_value)
+        allowed = {
+            AttemptStatus.VERIFYING,
+            AttemptStatus.FAILED,
+            AttemptStatus.INTERRUPTED,
+        }
+        if target_status not in allowed:
+            raise InvalidTransitionError(
+                "unknown attempts can reconcile only to verifying, failed, or interrupted"
+            )
+        if reason is not None and error_summary is not None and reason != error_summary:
+            raise ValidationError("reason and error_summary must match when both given")
+        timestamp = normalize_timestamp(at or utc_now())
+        summary = error_summary if error_summary is not None else reason
+        changes: dict[str, object] = {
+            "lease_owner": None,
+            "lease_expires_at": None,
+        }
+        if result_summary is not None:
+            changes["result_summary"] = result_summary
+        if summary is not None:
+            changes["error_summary"] = summary
+        if total_tokens is not None:
+            changes["total_tokens"] = total_tokens
+        if estimated_cost_usd is not None:
+            changes["estimated_cost_usd"] = estimated_cost_usd
+        if latency_ms is not None:
+            changes["latency_ms"] = latency_ms
+        if target_status is AttemptStatus.VERIFYING:
+            changes["accepted"] = None
+            changes["finished_at"] = None
+        elif target_status is AttemptStatus.FAILED:
+            changes["accepted"] = False
+            changes["finished_at"] = timestamp
+        else:
+            changes["accepted"] = None
+            changes["finished_at"] = timestamp
+        with self.store.transaction(immediate=True):
+            current = self._require_owned_attempt(attempt_id)
+            if current.status is not AttemptStatus.UNKNOWN:
+                raise InvalidTransitionError(
+                    f"only unknown attempts can be reconciled: {attempt_id}"
+                )
+            return self._transition_attempt_in_transaction(
+                current,
+                target_status,
+                at=timestamp,
+                expected_revision=expected_revision,
+                **changes,
+            )
 
     # Task graph -----------------------------------------------------------
 
@@ -1165,6 +1772,161 @@ class MissionService:
 
     # Internal transaction helpers ----------------------------------------
 
+    def _transition_attempt_in_transaction(
+        self,
+        current: TaskAttempt,
+        target: AttemptStatus,
+        *,
+        at: datetime,
+        expected_revision: int | None,
+        **changes: object,
+    ) -> TaskAttempt:
+        self._check_expected_attempt_revision(current, expected_revision)
+        self._validate_attempt_transition(current.status, target)
+        updated = self.store.update_attempt(
+            replace(current, status=target, updated_at=at, **changes),
+            expected_revision=current.revision,
+            _allow_status_change=True,
+        )
+        self._record_event(
+            mission_id=updated.mission_id,
+            event_type=EventType.ATTEMPT_TRANSITIONED,
+            entity_id=updated.attempt_id,
+            payload={
+                "from": current.status.value,
+                "to": updated.status.value,
+                "revision": updated.revision,
+            },
+            created_at=at,
+        )
+        return updated
+
+    @staticmethod
+    def _ensure_attempt_scope_matches(
+        existing: TaskAttempt, requested: TaskAttempt
+    ) -> None:
+        for field_name in (
+            "mission_id",
+            "task_id",
+            "idempotency_key",
+            "worker_role_id",
+            "route_id",
+            "quality_floor",
+        ):
+            if getattr(existing, field_name) != getattr(requested, field_name):
+                raise ConflictError(
+                    "attempt idempotency key conflicts with immutable attempt scope"
+                )
+
+    @staticmethod
+    def _check_expected_attempt_revision(
+        current: TaskAttempt, expected_revision: int | None
+    ) -> None:
+        if expected_revision is None:
+            return
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValidationError("expected_revision must be a non-negative integer")
+        if expected_revision != current.revision:
+            raise ConflictError(
+                f"stale attempt revision for {current.attempt_id}: expected "
+                f"{expected_revision}, current {current.revision}"
+            )
+
+    @staticmethod
+    def _validate_lease_owner(lease_owner: str) -> str:
+        if not isinstance(lease_owner, str) or not lease_owner.strip():
+            raise ValidationError("lease_owner must be a non-empty string")
+        return lease_owner
+
+    @staticmethod
+    def _validate_fencing_token(fencing_token: int) -> int:
+        if (
+            isinstance(fencing_token, bool)
+            or not isinstance(fencing_token, int)
+            or fencing_token < 0
+        ):
+            raise ValidationError("fencing_token must be a non-negative integer")
+        return fencing_token
+
+    @classmethod
+    def _resolve_lease_expiry(
+        cls,
+        at: datetime,
+        *,
+        lease_expires_at: datetime | None,
+        lease_ttl_seconds: float | int | None,
+        lease_seconds: float | int | None,
+        lease_duration_seconds: float | int | None,
+    ) -> datetime:
+        ttl_values = tuple(
+            value
+            for value in (
+                lease_ttl_seconds,
+                lease_seconds,
+                lease_duration_seconds,
+            )
+            if value is not None
+        )
+        if lease_expires_at is not None and ttl_values:
+            raise ValidationError(
+                "lease_expires_at cannot be combined with a lease TTL"
+            )
+        if ttl_values and any(value != ttl_values[0] for value in ttl_values[1:]):
+            raise ValidationError("lease TTL aliases must have the same value")
+        if lease_expires_at is not None:
+            expiry = normalize_timestamp(lease_expires_at)
+        else:
+            raw_ttl = (
+                ttl_values[0]
+                if ttl_values
+                else _DEFAULT_ATTEMPT_LEASE_SECONDS
+            )
+            if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, (int, float)):
+                raise ValidationError(
+                    "lease TTL must be a finite positive number"
+                )
+            ttl = float(raw_ttl)
+            if not isfinite(ttl) or ttl <= 0.0:
+                raise ValidationError("lease TTL must be a finite positive number")
+            expiry = at + timedelta(seconds=ttl)
+        if expiry <= at:
+            raise ValidationError("lease expiry must be after the operation time")
+        return expiry
+
+    @classmethod
+    def _check_attempt_fence(
+        cls,
+        current: TaskAttempt,
+        lease_owner: str | None,
+        fencing_token: int | None,
+        *,
+        at: datetime,
+        require_active_lease: bool,
+    ) -> None:
+        if lease_owner is None and fencing_token is None:
+            return
+        if lease_owner is None or fencing_token is None:
+            raise ValidationError(
+                "lease_owner and fencing_token must be provided together"
+            )
+        owner = cls._validate_lease_owner(lease_owner)
+        token = cls._validate_fencing_token(fencing_token)
+        if current.lease_owner != owner or current.fencing_token != token:
+            raise ConflictError(
+                f"attempt fence does not match current lease: {current.attempt_id}"
+            )
+        if require_active_lease and not current.has_active_lease(at):
+            raise ConflictError(f"attempt lease is no longer active: {current.attempt_id}")
+
+    def _require_owned_attempt(self, attempt_id: str) -> TaskAttempt:
+        attempt = self.store.require_attempt(attempt_id)
+        self._require_owned_mission(attempt.mission_id)
+        return attempt
+
     def _transition_mission_in_transaction(
         self,
         current: Mission,
@@ -1390,6 +2152,15 @@ class MissionService:
         if target not in TASK_TRANSITIONS[current]:
             raise InvalidTransitionError(
                 f"invalid task transition: {current.value} -> {target.value}"
+            )
+
+    @staticmethod
+    def _validate_attempt_transition(
+        current: AttemptStatus, target: AttemptStatus
+    ) -> None:
+        if target not in ATTEMPT_TRANSITIONS[current]:
+            raise InvalidTransitionError(
+                f"invalid attempt transition: {current.value} -> {target.value}"
             )
 
     @staticmethod

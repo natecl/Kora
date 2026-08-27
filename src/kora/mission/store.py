@@ -21,6 +21,7 @@ from uuid import uuid4
 from kora.mission.domain import (
     Artifact,
     ArtifactKind,
+    AttemptStatus,
     Assumption,
     AssumptionStatus,
     Checkpoint,
@@ -38,6 +39,7 @@ from kora.mission.domain import (
     PermissionGrant,
     PermissionMode,
     Task,
+    TaskAttempt,
     TaskDependency,
     TaskStatus,
     normalize_timestamp,
@@ -52,7 +54,7 @@ from kora.mission.errors import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _timestamp(value: datetime) -> str:
@@ -216,6 +218,55 @@ class SQLiteMissionStore:
                     UNIQUE (mission_id, task_id),
                     FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
                         ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS task_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    mission_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    worker_role_id TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN (
+                        'created', 'running', 'verifying', 'succeeded',
+                        'failed', 'interrupted', 'unknown'
+                    )),
+                    quality_floor REAL NOT NULL CHECK (
+                        quality_floor >= 0.0 AND quality_floor <= 1.0
+                    ),
+                    lease_owner TEXT,
+                    fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (
+                        fencing_token >= 0
+                    ),
+                    lease_expires_at TEXT,
+                    result_summary TEXT NOT NULL DEFAULT '',
+                    error_summary TEXT NOT NULL DEFAULT '',
+                    total_tokens INTEGER CHECK (
+                        total_tokens IS NULL OR total_tokens >= 0
+                    ),
+                    estimated_cost_usd REAL CHECK (
+                        estimated_cost_usd IS NULL OR estimated_cost_usd >= 0.0
+                    ),
+                    latency_ms INTEGER CHECK (
+                        latency_ms IS NULL OR latency_ms >= 0
+                    ),
+                    accepted INTEGER CHECK (
+                        accepted IS NULL OR accepted IN (0, 1)
+                    ),
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    UNIQUE (mission_id, task_id, idempotency_key),
+                    CHECK (
+                        (lease_owner IS NULL AND lease_expires_at IS NULL)
+                        OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+                    ),
+                    FOREIGN KEY (mission_id) REFERENCES missions(mission_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (mission_id, task_id)
+                        REFERENCES tasks(mission_id, task_id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -390,7 +441,8 @@ class SQLiteMissionStore:
                         'permission_granted', 'permission_consumed',
                         'permission_used', 'permission_revoked',
                         'artifact_recorded', 'evidence_recorded',
-                        'evidence_verified'
+                        'evidence_verified', 'attempt_created',
+                        'attempt_transitioned', 'attempt_lease_renewed'
                     )),
                     entity_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
@@ -474,7 +526,26 @@ class SQLiteMissionStore:
             event_table = self._connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mission_events'"
             ).fetchone()
-            if event_table is not None and "permission_used" not in (event_table[0] or ""):
+            event_schema = event_table[0] if event_table is not None else ""
+            event_schema = event_schema or ""
+            required_event_types = (
+                "permission_used",
+                "attempt_created",
+                "attempt_transitioned",
+                "attempt_lease_renewed",
+            )
+            if event_table is not None and any(
+                event_type not in event_schema for event_type in required_event_types
+            ):
+                # SQLite keeps trigger names when a table is renamed.  Drop
+                # the old-table triggers so the append-only guards are
+                # recreated for the migrated table below.
+                self._connection.execute(
+                    "DROP TRIGGER IF EXISTS mission_events_append_only_update"
+                )
+                self._connection.execute(
+                    "DROP TRIGGER IF EXISTS mission_events_append_only_delete"
+                )
                 self._connection.execute("DROP INDEX IF EXISTS idx_events_order")
                 self._connection.execute(
                     "ALTER TABLE mission_events RENAME TO mission_events_legacy"
@@ -492,7 +563,8 @@ class SQLiteMissionStore:
                             'permission_granted', 'permission_consumed',
                             'permission_used', 'permission_revoked',
                             'artifact_recorded', 'evidence_recorded',
-                            'evidence_verified'
+                            'evidence_verified', 'attempt_created',
+                            'attempt_transitioned', 'attempt_lease_renewed'
                         )),
                         entity_id TEXT NOT NULL,
                         payload_json TEXT NOT NULL,
@@ -550,6 +622,19 @@ class SQLiteMissionStore:
                 CREATE INDEX IF NOT EXISTS idx_tasks_selection
                     ON tasks (mission_id, state, critical_path DESC,
                               priority DESC, created_at, task_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_attempts_lookup
+                    ON task_attempts (mission_id, task_id, created_at, attempt_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_live_attempt_per_task
+                    ON task_attempts (task_id)
+                    WHERE status IN ('created', 'running', 'verifying', 'unknown')
                 """
             )
             self._connection.execute(
@@ -896,6 +981,276 @@ class SQLiteMissionStore:
         with self._lock:
             rows = self._connection.execute(query, tuple(params)).fetchall()
         return [self._task_from_row(row) for row in rows]
+
+    # Task attempts --------------------------------------------------------
+
+    def create_attempt(self, attempt: TaskAttempt) -> TaskAttempt:
+        """Persist a newly-created attempt.
+
+        Idempotent lookup belongs to ``MissionService.create_attempt`` so the
+        service can compare the requested immutable scope before returning an
+        existing record.  The repository still enforces the database-level
+        uniqueness and one-live-attempt guard for direct callers.
+        """
+
+        if attempt.status is not AttemptStatus.CREATED:
+            raise InvalidTransitionError(
+                "an attempt must be created in the created state"
+            )
+        if attempt.revision != 0:
+            raise ValidationError("a new attempt must start at revision zero")
+        if attempt.lease_owner is not None or attempt.lease_expires_at is not None:
+            raise ValidationError("a new attempt cannot already have a lease")
+        if attempt.started_at is not None or attempt.finished_at is not None:
+            raise ValidationError("a new attempt cannot already have lifecycle times")
+        with self.transaction(immediate=True):
+            mission = self._connection.execute(
+                "SELECT 1 FROM missions WHERE mission_id = ?",
+                (attempt.mission_id,),
+            ).fetchone()
+            if mission is None:
+                raise NotFoundError(f"mission not found: {attempt.mission_id}")
+            task = self._connection.execute(
+                "SELECT mission_id FROM tasks WHERE task_id = ?",
+                (attempt.task_id,),
+            ).fetchone()
+            if task is None:
+                raise NotFoundError(f"task not found: {attempt.task_id}")
+            if task["mission_id"] != attempt.mission_id:
+                raise ConflictError("attempt task belongs to another mission")
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO task_attempts(
+                        attempt_id, mission_id, task_id, idempotency_key,
+                        worker_role_id, route_id, status, quality_floor,
+                        lease_owner, fencing_token, lease_expires_at,
+                        result_summary, error_summary, total_tokens,
+                        estimated_cost_usd, latency_ms, accepted, revision,
+                        created_at, updated_at, started_at, finished_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt.attempt_id,
+                        attempt.mission_id,
+                        attempt.task_id,
+                        attempt.idempotency_key,
+                        attempt.worker_role_id,
+                        attempt.route_id,
+                        attempt.status.value,
+                        attempt.quality_floor,
+                        attempt.lease_owner,
+                        attempt.fencing_token,
+                        _timestamp(attempt.lease_expires_at)
+                        if attempt.lease_expires_at
+                        else None,
+                        attempt.result_summary,
+                        attempt.error_summary,
+                        attempt.total_tokens,
+                        attempt.estimated_cost_usd,
+                        attempt.latency_ms,
+                        None if attempt.accepted is None else int(attempt.accepted),
+                        attempt.revision,
+                        _timestamp(attempt.created_at),
+                        _timestamp(attempt.updated_at),
+                        _timestamp(attempt.started_at) if attempt.started_at else None,
+                        _timestamp(attempt.finished_at)
+                        if attempt.finished_at
+                        else None,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if self.get_attempt(attempt.attempt_id) is not None:
+                    raise ConflictError(
+                        f"attempt already exists: {attempt.attempt_id}"
+                    ) from exc
+                existing_key = self._connection.execute(
+                    """
+                    SELECT attempt_id
+                    FROM task_attempts
+                    WHERE mission_id = ? AND task_id = ? AND idempotency_key = ?
+                    """,
+                    (
+                        attempt.mission_id,
+                        attempt.task_id,
+                        attempt.idempotency_key,
+                    ),
+                ).fetchone()
+                if existing_key is not None:
+                    raise ConflictError(
+                        "attempt idempotency key already exists: "
+                        f"{attempt.idempotency_key}"
+                    ) from exc
+                live = self.get_live_attempt(attempt.task_id)
+                if live is not None:
+                    raise ConflictError(
+                        f"task already has a live attempt: {attempt.task_id}"
+                    ) from exc
+                raise ConflictError("attempt violates a persistence constraint") from exc
+        return attempt
+
+    add_attempt = create_attempt
+
+    def get_attempt(self, attempt_id: str) -> TaskAttempt | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM task_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return self._attempt_from_row(row) if row is not None else None
+
+    get_task_attempt = get_attempt
+
+    def require_attempt(self, attempt_id: str) -> TaskAttempt:
+        attempt = self.get_attempt(attempt_id)
+        if attempt is None:
+            raise NotFoundError(f"attempt not found: {attempt_id}")
+        return attempt
+
+    require_task_attempt = require_attempt
+
+    def get_attempt_by_idempotency(
+        self,
+        mission_id: str,
+        task_id: str,
+        idempotency_key: str,
+    ) -> TaskAttempt | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM task_attempts
+                WHERE mission_id = ? AND task_id = ? AND idempotency_key = ?
+                """,
+                (mission_id, task_id, idempotency_key),
+            ).fetchone()
+        return self._attempt_from_row(row) if row is not None else None
+
+    def list_attempts(
+        self,
+        mission_id: str,
+        task_id: str | None = None,
+        status: AttemptStatus | None = None,
+    ) -> list[TaskAttempt]:
+        query = "SELECT * FROM task_attempts WHERE mission_id = ?"
+        params: list[Any] = [mission_id]
+        if task_id is not None:
+            query += " AND task_id = ?"
+            params.append(task_id)
+        if status is not None:
+            if not isinstance(status, AttemptStatus):
+                status = AttemptStatus(status)
+            query += " AND status = ?"
+            params.append(status.value)
+        query += " ORDER BY created_at ASC, attempt_id ASC"
+        with self._lock:
+            rows = self._connection.execute(query, tuple(params)).fetchall()
+        return [self._attempt_from_row(row) for row in rows]
+
+    def list_task_attempts(
+        self,
+        task_id: str,
+        status: AttemptStatus | None = None,
+    ) -> list[TaskAttempt]:
+        task = self.require_task(task_id)
+        return self.list_attempts(task.mission_id, task_id, status)
+
+    def get_live_attempt(self, task_id: str) -> TaskAttempt | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM task_attempts
+                WHERE task_id = ?
+                  AND status IN ('created', 'running', 'verifying', 'unknown')
+                ORDER BY created_at ASC, attempt_id ASC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        return self._attempt_from_row(row) if row is not None else None
+
+    def update_attempt(
+        self,
+        attempt: TaskAttempt,
+        *,
+        expected_revision: int | None = None,
+        _allow_status_change: bool = False,
+    ) -> TaskAttempt:
+        with self.transaction():
+            current = self.require_attempt(attempt.attempt_id)
+            if (
+                current.mission_id != attempt.mission_id
+                or current.task_id != attempt.task_id
+                or current.idempotency_key != attempt.idempotency_key
+                or current.worker_role_id != attempt.worker_role_id
+                or current.route_id != attempt.route_id
+                or current.quality_floor != attempt.quality_floor
+                or current.created_at != attempt.created_at
+            ):
+                raise ConflictError("attempt identity and scope are immutable")
+            if expected_revision is None:
+                expected_revision = attempt.revision
+            if expected_revision != current.revision:
+                raise ConflictError(
+                    f"stale attempt revision for {attempt.attempt_id}: "
+                    f"expected {expected_revision}, current {current.revision}"
+                )
+            if attempt.status != current.status and not _allow_status_change:
+                raise InvalidTransitionError(
+                    "attempt state changes must go through MissionService"
+                )
+            persisted = replace(attempt, revision=current.revision + 1)
+            try:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE task_attempts
+                    SET status = ?, quality_floor = ?, lease_owner = ?,
+                        fencing_token = ?, lease_expires_at = ?,
+                        result_summary = ?, error_summary = ?, total_tokens = ?,
+                        estimated_cost_usd = ?, latency_ms = ?, accepted = ?,
+                        revision = ?, updated_at = ?, started_at = ?,
+                        finished_at = ?
+                    WHERE attempt_id = ? AND revision = ?
+                    """,
+                    (
+                        persisted.status.value,
+                        persisted.quality_floor,
+                        persisted.lease_owner,
+                        persisted.fencing_token,
+                        _timestamp(persisted.lease_expires_at)
+                        if persisted.lease_expires_at
+                        else None,
+                        persisted.result_summary,
+                        persisted.error_summary,
+                        persisted.total_tokens,
+                        persisted.estimated_cost_usd,
+                        persisted.latency_ms,
+                        None
+                        if persisted.accepted is None
+                        else int(persisted.accepted),
+                        persisted.revision,
+                        _timestamp(persisted.updated_at),
+                        _timestamp(persisted.started_at)
+                        if persisted.started_at
+                        else None,
+                        _timestamp(persisted.finished_at)
+                        if persisted.finished_at
+                        else None,
+                        persisted.attempt_id,
+                        expected_revision,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError(
+                    f"attempt update violates a persistence constraint: "
+                    f"{attempt.attempt_id}"
+                ) from exc
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"stale attempt revision for {attempt.attempt_id}: "
+                    f"expected {expected_revision}"
+                )
+        return persisted
 
     def create_dependency(self, dependency: TaskDependency) -> TaskDependency:
         with self.transaction():
@@ -1787,6 +2142,40 @@ class SQLiteMissionStore:
             if row["finished_at"]
             else None,
             revision=row["revision"],
+        )
+
+    @staticmethod
+    def _attempt_from_row(row: sqlite3.Row) -> TaskAttempt:
+        accepted = row["accepted"]
+        return TaskAttempt(
+            attempt_id=row["attempt_id"],
+            mission_id=row["mission_id"],
+            task_id=row["task_id"],
+            idempotency_key=row["idempotency_key"],
+            worker_role_id=row["worker_role_id"],
+            route_id=row["route_id"],
+            status=AttemptStatus(row["status"]),
+            quality_floor=row["quality_floor"],
+            lease_owner=row["lease_owner"],
+            fencing_token=row["fencing_token"],
+            lease_expires_at=_parse_timestamp(row["lease_expires_at"])
+            if row["lease_expires_at"]
+            else None,
+            result_summary=row["result_summary"],
+            error_summary=row["error_summary"],
+            total_tokens=row["total_tokens"],
+            estimated_cost_usd=row["estimated_cost_usd"],
+            latency_ms=row["latency_ms"],
+            accepted=None if accepted is None else bool(accepted),
+            revision=row["revision"],
+            created_at=_parse_timestamp(row["created_at"]),
+            updated_at=_parse_timestamp(row["updated_at"]),
+            started_at=_parse_timestamp(row["started_at"])
+            if row["started_at"]
+            else None,
+            finished_at=_parse_timestamp(row["finished_at"])
+            if row["finished_at"]
+            else None,
         )
 
     @staticmethod

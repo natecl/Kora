@@ -8,6 +8,10 @@ dependency on the Hermes execution runtime.
 from kora.mission.domain import (
     Artifact,
     ArtifactKind,
+    AttemptLifecycleStatus,
+    AttemptLifecycleState,
+    AttemptState,
+    AttemptStatus,
     Assumption,
     AssumptionStatus,
     Checkpoint,
@@ -27,6 +31,7 @@ from kora.mission.domain import (
     PermissionGrant,
     PermissionMode,
     Task,
+    TaskAttempt,
     TaskDependency,
     TaskState,
     TaskStatus,
@@ -43,6 +48,7 @@ from kora.mission.errors import (
     ValidationError,
 )
 from kora.mission.service import (
+    ATTEMPT_TRANSITIONS,
     MISSION_TRANSITIONS,
     TASK_TRANSITIONS,
     MissionControlPlane,
@@ -61,6 +67,10 @@ MissionStore = SQLiteMissionStore
 __all__ = [
     "Artifact",
     "ArtifactKind",
+    "AttemptLifecycleStatus",
+    "AttemptLifecycleState",
+    "AttemptState",
+    "AttemptStatus",
     "Assumption",
     "AssumptionStatus",
     "Checkpoint",
@@ -76,6 +86,7 @@ __all__ = [
     "EvidenceKind",
     "EventType",
     "InvalidTransitionError",
+    "ATTEMPT_TRANSITIONS",
     "MISSION_TRANSITIONS",
     "Mission",
     "MissionControlError",
@@ -98,6 +109,7 @@ __all__ = [
     "SQLiteMissionStore",
     "TASK_TRANSITIONS",
     "Task",
+    "TaskAttempt",
     "TaskDependency",
     "TaskLifecycleState",
     "TaskState",

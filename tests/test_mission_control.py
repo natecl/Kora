@@ -4,12 +4,13 @@ import tempfile
 import unittest
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from kora.mission import (
     ArtifactKind,
+    AttemptStatus,
     AssumptionStatus,
     CheckpointType,
     ConflictError,
@@ -310,6 +311,338 @@ class MissionControlTests(unittest.TestCase):
         self.assertEqual(
             self.store.require_task(task.task_id).title, "Updated title"
         )
+
+    def test_task_attempt_lifecycle_and_metrics_are_durable(self) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Execute slice", task_id="attempt-task")
+        started = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        created = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "execution-1",
+            worker_role_id="role-private",
+            route_id="route-private",
+            quality_floor=0.8,
+            attempt_id="attempt-1",
+            created_at=started,
+        )
+        claimed = self.service.claim_attempt(
+            created.attempt_id,
+            "controller-a",
+            lease_expires_at=started + timedelta(seconds=30),
+            at=started + timedelta(seconds=1),
+        )
+        renewed = self.service.renew_lease(
+            claimed.attempt_id,
+            "controller-a",
+            claimed.fencing_token,
+            lease_expires_at=started + timedelta(seconds=60),
+            expected_revision=claimed.revision,
+            at=started + timedelta(seconds=5),
+        )
+        verifying = self.service.begin_verification(
+            renewed.attempt_id,
+            lease_owner="controller-a",
+            fencing_token=renewed.fencing_token,
+            expected_revision=renewed.revision,
+            at=started + timedelta(seconds=6),
+        )
+        succeeded = self.service.succeed_attempt(
+            verifying.attempt_id,
+            result_summary="The approved slice passed its checks.",
+            total_tokens=1234,
+            estimated_cost_usd=0.42,
+            latency_ms=875,
+            lease_owner="controller-a",
+            fencing_token=verifying.fencing_token,
+            expected_revision=verifying.revision,
+            at=started + timedelta(seconds=8),
+        )
+
+        self.assertEqual(succeeded.status, AttemptStatus.SUCCEEDED)
+        self.assertTrue(succeeded.accepted)
+        self.assertEqual(
+            (succeeded.total_tokens, succeeded.estimated_cost_usd, succeeded.latency_ms),
+            (1234, 0.42, 875),
+        )
+        self.assertEqual(succeeded.attempt_id, "attempt-1")
+        self.assertEqual(succeeded.started_at, started + timedelta(seconds=1))
+        self.assertEqual(succeeded.finished_at, started + timedelta(seconds=8))
+        self.assertIsNone(succeeded.lease_owner)
+        self.assertIsNone(succeeded.lease_expires_at)
+        persisted = self.store.get_attempt("attempt-1")
+        self.assertEqual(persisted, succeeded)
+        attempt_events = [
+            event
+            for event in self.store.list_events("mission-1")
+            if event.entity_id == succeeded.attempt_id
+        ]
+        self.assertEqual(
+            [event.event_type for event in attempt_events],
+            [
+                EventType.ATTEMPT_CREATED,
+                EventType.ATTEMPT_TRANSITIONED,
+                EventType.ATTEMPT_LEASE_RENEWED,
+                EventType.ATTEMPT_TRANSITIONED,
+                EventType.ATTEMPT_TRANSITIONED,
+            ],
+        )
+
+    def test_attempt_transition_guards_and_terminal_outcomes(self) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Guarded execution", task_id="guarded")
+        attempt = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "guarded-1",
+            worker_role_id="role",
+            route_id="route",
+        )
+        with self.assertRaises(InvalidTransitionError):
+            self.service.begin_attempt_verification(attempt.attempt_id)
+        with self.assertRaises(InvalidTransitionError):
+            self.service.fail_attempt(attempt.attempt_id, error_summary="not started")
+
+        claimed = self.service.claim_attempt(attempt.attempt_id, "worker")
+        with self.assertRaises(InvalidTransitionError):
+            self.service.succeed_attempt(attempt.attempt_id)
+        verifying = self.service.begin_attempt_verification(
+            claimed.attempt_id,
+            lease_owner="worker",
+            fencing_token=claimed.fencing_token,
+        )
+        succeeded = self.service.succeed_attempt(verifying.attempt_id)
+        self.assertEqual(succeeded.status, AttemptStatus.SUCCEEDED)
+        with self.assertRaises(InvalidTransitionError):
+            self.service.fail_attempt(succeeded.attempt_id, error_summary="too late")
+        with self.assertRaises(InvalidTransitionError):
+            self.service.interrupt_attempt(succeeded.attempt_id)
+
+    def test_attempt_creation_is_idempotent_and_only_one_live_attempt_is_allowed(
+        self,
+    ) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Idempotent execution", task_id="idem")
+        first = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "same-key",
+            worker_role_id="role-a",
+            route_id="route-a",
+            quality_floor=0.5,
+            attempt_id="idem-1",
+        )
+        repeated = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "same-key",
+            worker_role_id="role-a",
+            route_id="route-a",
+            quality_floor=0.5,
+        )
+        self.assertEqual(repeated, first)
+        with self.assertRaises(ConflictError):
+            self.service.create_attempt(
+                "mission-1",
+                task.task_id,
+                "same-key",
+                worker_role_id="different-role",
+                route_id="route-a",
+                quality_floor=0.5,
+            )
+        with self.assertRaises(ConflictError):
+            self.service.create_attempt(
+                "mission-1",
+                task.task_id,
+                "different-key",
+                worker_role_id="role-a",
+                route_id="route-a",
+            )
+        interrupted = self.service.interrupt_attempt(first.attempt_id, reason="stopped")
+        self.assertEqual(interrupted.status, AttemptStatus.INTERRUPTED)
+        retry = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "different-key",
+            worker_role_id="role-a",
+            route_id="route-a",
+            attempt_id="idem-2",
+        )
+        self.assertEqual(retry.status, AttemptStatus.CREATED)
+
+    def test_attempt_claims_use_fencing_and_reject_stale_or_competing_writers(
+        self,
+    ) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Fenced execution", task_id="fenced")
+        at = datetime(2026, 1, 3, tzinfo=UTC)
+        attempt = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "fenced-1",
+            worker_role_id="role",
+            route_id="route",
+            created_at=at,
+        )
+        claimed = self.service.claim_attempt(
+            attempt.attempt_id,
+            "worker-a",
+            lease_expires_at=at + timedelta(seconds=5),
+            at=at,
+        )
+        with self.assertRaises(ConflictError):
+            self.service.claim_attempt(
+                attempt.attempt_id,
+                "worker-b",
+                at=at + timedelta(seconds=1),
+            )
+        with self.assertRaises(ConflictError):
+            self.service.renew_lease(
+                attempt.attempt_id,
+                "worker-b",
+                claimed.fencing_token,
+                at=at + timedelta(seconds=1),
+            )
+        with self.assertRaises(ConflictError):
+            self.service.renew_lease(
+                attempt.attempt_id,
+                "worker-a",
+                claimed.fencing_token,
+                expected_revision=claimed.revision - 1,
+                at=at + timedelta(seconds=1),
+            )
+
+        reclaimed = self.service.claim_attempt(
+            attempt.attempt_id,
+            "worker-b",
+            lease_expires_at=at + timedelta(seconds=15),
+            at=at + timedelta(seconds=6),
+        )
+        self.assertEqual(reclaimed.fencing_token, claimed.fencing_token + 1)
+        with self.assertRaises(ConflictError):
+            self.service.begin_attempt_verification(
+                attempt.attempt_id,
+                lease_owner="worker-a",
+                fencing_token=claimed.fencing_token,
+            )
+        with self.assertRaises(ConflictError):
+            self.store.update_attempt(replace(claimed, result_summary="stale"))
+
+    def test_unknown_attempt_requires_reconciliation_and_survives_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "attempt-recovery.sqlite3"
+            first = MissionService(path)
+            mission = first.create_mission("Recovery", "Recover", "Recovered", mission_id="recovery")
+            first.align_mission(mission.mission_id)
+            first.activate_mission(mission.mission_id)
+            task = first.add_task(mission.mission_id, "Recover task", task_id="recover-task")
+            at = datetime(2026, 1, 4, tzinfo=UTC)
+            attempt = first.create_attempt(
+                mission.mission_id,
+                task.task_id,
+                "recovery-1",
+                worker_role_id="role",
+                route_id="route",
+                attempt_id="recover-attempt",
+                created_at=at,
+            )
+            claimed = first.claim_attempt(
+                attempt.attempt_id,
+                "worker",
+                lease_expires_at=at + timedelta(seconds=2),
+                at=at,
+            )
+            unknown = first.mark_expired_attempt_unknown(
+                claimed.attempt_id,
+                reason="The worker outcome could not be observed.",
+                expected_revision=claimed.revision,
+                at=at + timedelta(seconds=3),
+            )
+            first.close()
+
+            reopened = MissionService(path)
+            try:
+                persisted = reopened.get_attempt(unknown.attempt_id)
+                self.assertEqual(persisted.status, AttemptStatus.UNKNOWN)
+                with self.assertRaises(ConflictError):
+                    reopened.create_attempt(
+                        mission.mission_id,
+                        task.task_id,
+                        "recovery-2",
+                        worker_role_id="role",
+                        route_id="route",
+                    )
+                with self.assertRaises(InvalidTransitionError):
+                    reopened.claim_attempt(persisted.attempt_id, "worker-again")
+                failed = reopened.reconcile_unknown(
+                    persisted.attempt_id,
+                    AttemptStatus.FAILED,
+                    error_summary="Recovery reconciliation rejected the unknown result.",
+                    total_tokens=10,
+                    estimated_cost_usd=0.01,
+                    latency_ms=100,
+                    expected_revision=persisted.revision,
+                    at=at + timedelta(seconds=4),
+                )
+                self.assertEqual(failed.status, AttemptStatus.FAILED)
+                self.assertFalse(failed.accepted)
+                self.assertEqual(
+                    (failed.total_tokens, failed.estimated_cost_usd, failed.latency_ms),
+                    (10, 0.01, 100),
+                )
+                with self.assertRaises(InvalidTransitionError):
+                    reopened.reconcile_unknown(failed.attempt_id, AttemptStatus.VERIFYING)
+                retry = reopened.create_attempt(
+                    mission.mission_id,
+                    task.task_id,
+                    "recovery-2",
+                    worker_role_id="role",
+                    route_id="route",
+                    attempt_id="recover-retry",
+                )
+                self.assertEqual(retry.status, AttemptStatus.CREATED)
+                self.assertEqual(
+                    sum(
+                        event.event_type is EventType.ATTEMPT_TRANSITIONED
+                        for event in reopened.store.list_events(mission.mission_id)
+                    ),
+                    3,
+                )
+            finally:
+                reopened.close()
+
+    def test_attempt_validation_and_audit_failure_roll_back(self) -> None:
+        self._activate()
+        task = self.service.add_task("mission-1", "Validated execution", task_id="valid")
+        with self.assertRaises(ValidationError):
+            self.service.create_attempt(
+                "mission-1",
+                task.task_id,
+                "bad-quality",
+                worker_role_id="role",
+                route_id="route",
+                quality_floor=1.1,
+            )
+        attempt = self.service.create_attempt(
+            "mission-1",
+            task.task_id,
+            "valid-1",
+            worker_role_id="role",
+            route_id="route",
+            attempt_id="valid-attempt",
+        )
+        with patch.object(
+            self.store, "create_event", side_effect=RuntimeError("audit unavailable")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                self.service.claim_attempt(attempt.attempt_id, "worker")
+        self.assertEqual(self.store.get_attempt(attempt.attempt_id), attempt)
+        with self.assertRaises(ValidationError):
+            self.service.claim_attempt(
+                attempt.attempt_id,
+                "worker",
+                lease_seconds=0,
+            )
 
     def test_invalid_multi_write_escalation_rolls_back_everything(self) -> None:
         self._activate()
